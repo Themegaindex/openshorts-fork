@@ -33,13 +33,13 @@ const HIGHLIGHT_PRESETS = [
 const CAPTION_PRESETS = [
     { id: 'tiktok',  label: 'TikTok',    style: 'karaoke', effect: 'none', highlightColor: '#FE2C55', baseOpacity: 0.75, uppercase: false, fontName: 'Verdana', borderWidth: 2 },
     { id: 'reels',   label: 'Reels',     style: 'karaoke', effect: 'none', highlightColor: '#E1306C', baseOpacity: 0.7,  uppercase: false, fontName: 'Verdana', borderWidth: 2 },
-    { id: 'shorts',  label: 'Shorts Pop', style: 'karaoke', effect: 'pop',  highlightColor: '#FF0000', baseOpacity: 0.7,  uppercase: false, fontName: 'Verdana', borderWidth: 2 },
+    { id: 'shorts',  label: 'Shorts Pop', style: 'karaoke', effect: 'bounce', highlightColor: '#FF0000', baseOpacity: 0.7,  uppercase: false, fontName: 'Verdana', borderWidth: 2 },
     { id: 'gold',    label: 'Gold Glow', style: 'karaoke', effect: 'glow', highlightColor: '#FFD700', baseOpacity: 0.6,  uppercase: false, fontName: 'Verdana', borderWidth: 2 },
     { id: 'neon',    label: 'Neon',      style: 'karaoke', effect: 'glow', highlightColor: '#00FF88', baseOpacity: 0.55, uppercase: false, fontName: 'Verdana', borderWidth: 2 },
     { id: 'cyber',   label: 'Cyber',     style: 'karaoke', effect: 'glow', highlightColor: '#00FFFF', baseOpacity: 0.5,  uppercase: false, fontName: 'Verdana', borderWidth: 2 },
     { id: 'karaoke', label: 'Karaoke',   style: 'karaoke', effect: 'none', highlightColor: '#FF6B6B', baseOpacity: 0.6,  uppercase: false, fontName: 'Verdana', borderWidth: 2 },
     { id: 'minimal', label: 'Minimal',   style: 'karaoke', effect: 'none', highlightColor: '#FFFFFF', baseOpacity: 0.65, uppercase: false, fontName: 'Verdana', borderWidth: 1 },
-    { id: 'beast',   label: 'Beast',     style: 'karaoke', effect: 'pop',  highlightColor: '#FFD700', baseOpacity: 1.0,  uppercase: true,  fontName: 'Impact',  borderWidth: 3 },
+    { id: 'beast',   label: 'Beast',     style: 'karaoke', effect: 'bounce', highlightColor: '#FFD700', baseOpacity: 1.0,  uppercase: true,  fontName: 'Impact',  borderWidth: 3 },
     { id: 'boxed',   label: 'Boxed',     style: 'karaoke', effect: 'box',  highlightColor: '#7C3AED', baseOpacity: 0.85, uppercase: false, fontName: 'Verdana', borderWidth: 2 },
     { id: 'classic', label: 'Classic',   style: 'classic', effect: 'none', highlightColor: '#FFD700', baseOpacity: 1.0,  uppercase: false, fontName: 'Verdana', borderWidth: 2 },
 ];
@@ -147,6 +147,7 @@ export default function SubtitleModal({ isOpen, onClose, onGenerate, isProcessin
                                         color: effect === 'glow' || effect === 'box' ? '#FFFFFF' : highlightColor,
                                         textShadow: effectShadow(effect, highlightColor),
                                         ...(effect === 'pop' ? { display: 'inline-block', transform: 'scale(1.12)' } : {}),
+                                        ...(effect === 'bounce' ? { display: 'inline-block', animation: 'subtitle-bounce 1.6s ease-out infinite' } : {}),
                                         ...(effect === 'box' ? { backgroundColor: highlightColor, borderRadius: '4px', padding: '0 4px' } : {}),
                                     }}>how</span>
                                     <span style={{ color: dimmedWhite(baseOpacity) }}> your subtitles<br/>will appear on the video</span>
@@ -191,7 +192,7 @@ export default function SubtitleModal({ isOpen, onClose, onGenerate, isProcessin
                                                     textShadow: effectShadow(p.effect, p.highlightColor) !== 'none'
                                                         ? effectShadow(p.effect, p.highlightColor)
                                                         : '0 1px 2px rgba(0,0,0,0.9)',
-                                                    ...(p.effect === 'pop' ? { display: 'inline-block', transform: 'scale(1.15)' } : {}),
+                                                    ...(p.effect === 'pop' || p.effect === 'bounce' ? { display: 'inline-block', transform: 'scale(1.15)' } : {}),
                                                     ...(p.effect === 'box' ? { backgroundColor: p.highlightColor, borderRadius: '4px', padding: '0 3px' } : {}),
                                                 }}>gut</span>
                                             </span>
@@ -225,11 +226,12 @@ export default function SubtitleModal({ isOpen, onClose, onGenerate, isProcessin
                         {style === 'karaoke' && (
                             <div className="animate-[fadeIn_0.2s_ease-out]">
                                 <label className="text-xs font-bold text-zinc-400 uppercase tracking-wider mb-2 block">Effect</label>
-                                <div className="grid grid-cols-4 gap-2">
+                                <div className="grid grid-cols-5 gap-2">
                                     {[
                                         { id: 'none', label: 'None' },
                                         { id: 'glow', label: 'Glow' },
                                         { id: 'pop', label: 'Pop' },
+                                        { id: 'bounce', label: 'Bounce' },
                                         { id: 'box', label: 'Box' },
                                     ].map((e) => (
                                         <button

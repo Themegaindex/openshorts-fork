@@ -79,3 +79,20 @@ video:fullscreen {
 video:-webkit-full-screen {
   object-fit: contain !important;
 }
+
+/* Preview of the "bounce" caption effect: gentle overshoot, then settle —
+   mirrors the ASS \t scale chain (85% -> 108% -> 100%). */
+@keyframes subtitle-bounce {
+  0% {
+    transform: scale(0.85);
+  }
+
+  18% {
+    transform: scale(1.08);
+  }
+
+  36%,
+  100% {
+    transform: scale(1);
+  }
+}

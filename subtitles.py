@@ -288,7 +288,8 @@ def generate_ass(transcript, clip_start, clip_end, output_path,
     the highlight moves with the audio without flicker.
 
     effect: "none" | "glow" (neon shine around the active word) |
-            "pop" (active word scales up) | "box" (thick colored outline).
+            "pop" (active word scales up) | "box" (thick colored outline) |
+            "bounce" (subtle spring: overshoot past target, settle back).
     base_opacity: opacity of the non-active words — dimmed base text is the
     modern captioneer look (e.g. 0.4).
     """
@@ -337,6 +338,13 @@ def generate_ass(transcript, clip_start, clip_end, output_path,
     elif effect == "pop":
         active_prefix = (f"{{\\c{highlight_inline}"
                          f"\\fscx75\\fscy75\\t(0,120,\\fscx112\\fscy112)}}")
+    elif effect == "bounce":
+        # Subtle spring feel: one clean overshoot (85% -> 108%) that settles
+        # at 100%. Deliberately gentle — bigger swings read as jittery.
+        active_prefix = (f"{{\\c{highlight_inline}"
+                         f"\\fscx85\\fscy85"
+                         f"\\t(0,90,\\fscx108\\fscy108)"
+                         f"\\t(90,180,\\fscx100\\fscy100)}}")
     else:
         active_prefix = f"{{\\c{highlight_inline}}}"
 
@@ -508,11 +516,19 @@ def build_subtitle_filter(srt_path, alignment=2, fontsize=16,
     return f"subtitles='{safe_srt_path}':charenc=UTF-8:force_style='{style_string}'"
 
 
+# Hook entrance animation: gentle slide-up with ease-out plus a short
+# alpha fade-in. Deliberately subtle — fast/large moves read as cheap.
+HOOK_ENTRANCE_SECONDS = 0.5
+HOOK_ENTRANCE_FADE_SECONDS = 0.35
+HOOK_ENTRANCE_SLIDE_PX = 60
+
+
 def build_layer_command(video_path, output_path, subtitle_filter=None,
-                        hook_png=None, hook_x=0, hook_y=0):
+                        hook_png=None, hook_x=0, hook_y=0, hook_entrance=False):
     """Build ONE FFmpeg command that burns subtitles and/or a hook overlay in
     a single encode pass — chaining separate encodes would double the wait
-    and stack generation loss."""
+    and stack generation loss. hook_entrance animates the hook in (slide-up
+    with ease-out + fade) instead of having it pop into existence."""
     if not subtitle_filter and not hook_png:
         raise ValueError("At least one layer (subtitles or hook) is required")
 
@@ -520,16 +536,29 @@ def build_layer_command(video_path, output_path, subtitle_filter=None,
     if hook_png:
         cmd.extend(['-i', hook_png])
 
+    hook_src = "[1:v]"
+    hook_pre = ""
+    y_value = str(int(hook_y))
+    if hook_png and hook_entrance:
+        # Fade the PNG's alpha in, and ease the y position up into place:
+        # y(t) = target + slide * (1 - t/D)^2  -> starts slide px lower,
+        # decelerates into the final position (ease-out), then stays put.
+        hook_pre = (f"[1:v]format=rgba,fade=t=in:st=0"
+                    f":d={HOOK_ENTRANCE_FADE_SECONDS}:alpha=1[hk];")
+        hook_src = "[hk]"
+        y_value = (f"'{int(hook_y)}+{HOOK_ENTRANCE_SLIDE_PX}"
+                   f"*pow(1-min(t/{HOOK_ENTRANCE_SECONDS},1),2)'")
+
     if subtitle_filter and hook_png:
         cmd.extend([
             '-filter_complex',
-            f"[0:v]{subtitle_filter}[v0];[v0][1:v]overlay={int(hook_x)}:{int(hook_y)}[vout]",
+            f"{hook_pre}[0:v]{subtitle_filter}[v0];[v0]{hook_src}overlay={int(hook_x)}:{y_value}[vout]",
             '-map', '[vout]', '-map', '0:a?',
         ])
     elif hook_png:
         cmd.extend([
             '-filter_complex',
-            f"[0:v][1:v]overlay={int(hook_x)}:{int(hook_y)}[vout]",
+            f"{hook_pre}[0:v]{hook_src}overlay={int(hook_x)}:{y_value}[vout]",
             '-map', '[vout]', '-map', '0:a?',
         ])
     else:
@@ -545,7 +574,7 @@ def build_layer_command(video_path, output_path, subtitle_filter=None,
 
 
 def burn_layers(video_path, output_path, subtitle_path=None, burn_opts=None,
-                hook_png=None, hook_x=0, hook_y=0):
+                hook_png=None, hook_x=0, hook_y=0, hook_entrance=False):
     """Render subtitles and/or a hook overlay onto video_path in one pass."""
     subtitle_filter = None
     if subtitle_path:
@@ -553,7 +582,8 @@ def burn_layers(video_path, output_path, subtitle_path=None, burn_opts=None,
 
     cmd = build_layer_command(video_path, output_path,
                               subtitle_filter=subtitle_filter,
-                              hook_png=hook_png, hook_x=hook_x, hook_y=hook_y)
+                              hook_png=hook_png, hook_x=hook_x, hook_y=hook_y,
+                              hook_entrance=hook_entrance)
 
     _log(f"🎬 Burning layers (single pass): {' '.join(cmd)}")
     result = subprocess.run(cmd, stdout=subprocess.DEVNULL, stderr=subprocess.PIPE)

@@ -175,6 +175,16 @@ class TestGenerateAss:
         content = out.read_text(encoding="utf-8-sig")
         assert "\\t(0,120,\\fscx112\\fscy112)" in content
 
+    def test_bounce_effect_overshoots_and_settles(self, tmp_path):
+        from subtitles import generate_ass
+        out = tmp_path / "subs.ass"
+        words = [_w(" bounce", 0.0, 0.5)]
+        assert generate_ass(self._transcript(words), 0, 10, str(out), effect="bounce") is True
+        content = out.read_text(encoding="utf-8-sig")
+        assert "\\fscx85\\fscy85" in content  # starts slightly small
+        assert "\\t(0,90,\\fscx108\\fscy108)" in content  # gentle overshoot
+        assert "\\t(90,180,\\fscx100\\fscy100)" in content  # settles at 100%
+
     def test_uppercase_transform(self, tmp_path):
         from subtitles import generate_ass
         out = tmp_path / "subs.ass"

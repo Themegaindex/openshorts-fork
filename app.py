@@ -1655,7 +1655,8 @@ async def add_subtitles(req: SubtitleRequest):
             try:
                 burn_layers(input_path, output_path,
                             subtitle_path=srt_path, burn_opts=burn_opts,
-                            hook_png=hook_png, hook_x=hook_x, hook_y=hook_y)
+                            hook_png=hook_png, hook_x=hook_x, hook_y=hook_y,
+                            hook_entrance=True)
             finally:
                 if hook_png and os.path.exists(hook_png):
                     os.remove(hook_png)
@@ -1811,7 +1812,8 @@ async def add_hook(req: HookRequest):
             try:
                 burn_layers(input_path, output_path,
                             subtitle_path=subtitle_path, burn_opts=subtitle_burn_opts,
-                            hook_png=hook_png, hook_x=hook_x, hook_y=hook_y)
+                            hook_png=hook_png, hook_x=hook_x, hook_y=hook_y,
+                            hook_entrance=True)
             finally:
                 if hook_png and os.path.exists(hook_png):
                     os.remove(hook_png)
