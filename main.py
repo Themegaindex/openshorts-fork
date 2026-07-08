@@ -7,8 +7,18 @@ import glob
 import re
 import sys
 import math
-from scenedetect import VideoManager, SceneManager
+from scenedetect import SceneManager
 from scenedetect.detectors import ContentDetector
+# PySceneDetect 0.7 removed VideoManager; 0.6+ provides open_video. Support
+# both so fresh installs and existing venvs keep working.
+try:
+    from scenedetect import open_video
+except ImportError:
+    open_video = None
+try:
+    from scenedetect import VideoManager
+except ImportError:
+    VideoManager = None
 from ultralytics import YOLO
 import torch
 import os
@@ -1207,15 +1217,21 @@ def analyze_scenes_strategy(video_path, scenes):
     return strategies
 
 def detect_scenes(video_path):
-    video_manager = VideoManager([video_path])
     scene_manager = SceneManager()
     scene_manager.add_detector(ContentDetector())
-    video_manager.set_downscale_factor()
-    video_manager.start()
-    scene_manager.detect_scenes(frame_source=video_manager)
-    scene_list = scene_manager.get_scene_list()
-    fps = video_manager.get_framerate()
-    video_manager.release()
+    if open_video is not None:
+        video = open_video(video_path)
+        scene_manager.detect_scenes(video=video)
+        scene_list = scene_manager.get_scene_list()
+        fps = video.frame_rate
+    else:
+        video_manager = VideoManager([video_path])
+        video_manager.set_downscale_factor()
+        video_manager.start()
+        scene_manager.detect_scenes(frame_source=video_manager)
+        scene_list = scene_manager.get_scene_list()
+        fps = video_manager.get_framerate()
+        video_manager.release()
     return scene_list, fps
 
 def get_video_resolution(video_path):
@@ -1230,7 +1246,9 @@ def get_video_resolution(video_path):
 
 def sanitize_filename(filename):
     """Remove invalid characters from filename."""
-    filename = re.sub(r'[<>:"/\\|?*]', '', filename)
+    # '#' breaks clip URLs: the browser parses it as a fragment, so files
+    # named after hashtag-titles could never be requested by the frontend.
+    filename = re.sub(r'[<>:"/\\|?*#]', '', filename)
     filename = filename.replace(' ', '_')
     return filename[:100]
 
