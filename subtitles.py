@@ -439,12 +439,11 @@ def _sanitize_font_name(name):
     return cleaned or "Verdana"
 
 
-def burn_subtitles(video_path, srt_path, output_path, alignment=2, fontsize=16,
-                   font_name="Verdana", font_color="#FFFFFF",
-                   border_color="#000000", border_width=2,
-                   bg_color="#000000", bg_opacity=0.0):
-    """
-    Burns subtitles into the video using FFmpeg.
+def build_subtitle_filter(srt_path, alignment=2, fontsize=16,
+                          font_name="Verdana", font_color="#FFFFFF",
+                          border_color="#000000", border_width=2,
+                          bg_color="#000000", bg_opacity=0.0):
+    """Build the FFmpeg subtitle filter expression for an SRT or ASS file.
     Supports two modes:
     - Outline mode (bg_opacity=0): Text with colored outline/border
     - Box mode (bg_opacity>0): Text with semi-transparent background box
@@ -505,27 +504,79 @@ def burn_subtitles(video_path, srt_path, output_path, alignment=2, fontsize=16,
     if str(srt_path).lower().endswith('.ass'):
         # ASS files (karaoke style) carry their own styles; force_style would
         # override the per-word color tags.
-        vf = f"ass='{safe_srt_path}'"
-    else:
-        vf = f"subtitles='{safe_srt_path}':charenc=UTF-8:force_style='{style_string}'"
+        return f"ass='{safe_srt_path}'"
+    return f"subtitles='{safe_srt_path}':charenc=UTF-8:force_style='{style_string}'"
 
-    cmd = [
-        'ffmpeg', '-y',
-        '-i', video_path,
-        '-vf', vf,
+
+def build_layer_command(video_path, output_path, subtitle_filter=None,
+                        hook_png=None, hook_x=0, hook_y=0):
+    """Build ONE FFmpeg command that burns subtitles and/or a hook overlay in
+    a single encode pass — chaining separate encodes would double the wait
+    and stack generation loss."""
+    if not subtitle_filter and not hook_png:
+        raise ValueError("At least one layer (subtitles or hook) is required")
+
+    cmd = ['ffmpeg', '-y', '-i', video_path]
+    if hook_png:
+        cmd.extend(['-i', hook_png])
+
+    if subtitle_filter and hook_png:
+        cmd.extend([
+            '-filter_complex',
+            f"[0:v]{subtitle_filter}[v0];[v0][1:v]overlay={int(hook_x)}:{int(hook_y)}[vout]",
+            '-map', '[vout]', '-map', '0:a?',
+        ])
+    elif hook_png:
+        cmd.extend([
+            '-filter_complex',
+            f"[0:v][1:v]overlay={int(hook_x)}:{int(hook_y)}[vout]",
+            '-map', '[vout]', '-map', '0:a?',
+        ])
+    else:
+        cmd.extend(['-vf', subtitle_filter])
+
+    cmd.extend([
         '-c:a', 'copy',
         '-c:v', 'libx264', '-preset', 'fast', '-crf', '23',
         '-movflags', '+faststart',
         output_path
-    ]
+    ])
+    return cmd
 
-    _log(f"🎬 Burning subtitles: {' '.join(cmd)}")
+
+def burn_layers(video_path, output_path, subtitle_path=None, burn_opts=None,
+                hook_png=None, hook_x=0, hook_y=0):
+    """Render subtitles and/or a hook overlay onto video_path in one pass."""
+    subtitle_filter = None
+    if subtitle_path:
+        subtitle_filter = build_subtitle_filter(subtitle_path, **(burn_opts or {}))
+
+    cmd = build_layer_command(video_path, output_path,
+                              subtitle_filter=subtitle_filter,
+                              hook_png=hook_png, hook_x=hook_x, hook_y=hook_y)
+
+    _log(f"🎬 Burning layers (single pass): {' '.join(cmd)}")
     result = subprocess.run(cmd, stdout=subprocess.DEVNULL, stderr=subprocess.PIPE)
 
     if result.returncode != 0:
         stderr_text = result.stderr.decode(errors='replace')
-        _log(f"❌ FFmpeg Subtitle Error: {stderr_text}")
+        _log(f"❌ FFmpeg Layer Error: {stderr_text}")
         raise Exception(f"FFmpeg failed: {stderr_text}")
 
     return True
+
+
+def burn_subtitles(video_path, srt_path, output_path, alignment=2, fontsize=16,
+                   font_name="Verdana", font_color="#FFFFFF",
+                   border_color="#000000", border_width=2,
+                   bg_color="#000000", bg_opacity=0.0):
+    """Burns subtitles into the video using FFmpeg (single subtitle layer)."""
+    return burn_layers(
+        video_path, output_path,
+        subtitle_path=srt_path,
+        burn_opts=dict(alignment=alignment, fontsize=fontsize, font_name=font_name,
+                       font_color=font_color, border_color=border_color,
+                       border_width=border_width, bg_color=bg_color,
+                       bg_opacity=bg_opacity),
+    )
 

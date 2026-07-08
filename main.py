@@ -2071,7 +2071,7 @@ def _get_video_duration(video_path):
 
 def _find_source_video(resume_dir: str):
     """Locate the downloaded/uploaded source video in a job directory."""
-    skip_prefixes = ("temp_", "subtitled_", "hooked_", "edited_", "translated_")
+    skip_prefixes = ("temp_", "subtitled_", "hook_", "hooked_", "edited_", "translated_")
     candidates = []
     for path in sorted(glob.glob(os.path.join(resume_dir, "*.mp4"))):
         name = os.path.basename(path)

@@ -274,12 +274,10 @@ def create_hook_image(text, target_width, output_image_path="hook_overlay.png", 
     img.save(output_image_path)
     return output_image_path, canvas_w, canvas_h
 
-def add_hook_to_video(video_path, text, output_path, position="top", font_scale=1.0):
-    """
-    Overlays text hook onto video.
-    position: 'top', 'center', 'bottom'
-    font_scale: float multiplier (1.0 = default)
-    """
+def prepare_hook_overlay(video_path, text, position="top", font_scale=1.0):
+    """Render the hook text as a PNG sized for the video and compute where to
+    overlay it. Returns (png_path, overlay_x, overlay_y); the caller must
+    delete the PNG after encoding."""
     if not os.path.exists(video_path):
         raise FileNotFoundError(f"Video {video_path} not found")
 
@@ -295,32 +293,46 @@ def add_hook_to_video(video_path, text, output_path, position="top", font_scale=
         print(f"⚠️ FFprobe failed: {e}. Assuming 1080x1920")
         video_width = 1080
         video_height = 1920
-        
+
     # 2. Generate Image
     # Box check: Don't let it be wider than 90% of screen
     target_box_width = int(video_width * 0.9)
-    
+
     # Unique per invocation so parallel jobs can't overwrite each other's overlay.
     hook_filename = f"temp_hook_{uuid.uuid4().hex[:8]}_{os.path.basename(video_path)}.png"
-    
+
+    img_path, box_w, box_h = create_hook_image(text, target_box_width, hook_filename, font_scale=font_scale)
+
+    # 3. Calculate Overlay Position
+    overlay_x = (video_width - box_w) // 2
+
+    if position == "center":
+        overlay_y = (video_height - box_h) // 2
+    elif position == "bottom":
+        # Bottom 20% mark (approx)
+        overlay_y = int(video_height * 0.70)
+    else:
+        # Top 20% mark
+        overlay_y = int(video_height * 0.20)
+
+    return img_path, overlay_x, overlay_y
+
+
+def add_hook_to_video(video_path, text, output_path, position="top", font_scale=1.0):
+    """
+    Overlays text hook onto video.
+    position: 'top', 'center', 'bottom'
+    font_scale: float multiplier (1.0 = default)
+    """
+    hook_filename = None
     try:
-        img_path, box_w, box_h = create_hook_image(text, target_box_width, hook_filename, font_scale=font_scale)
-        
-        # 3. Calculate Overlay Position
-        overlay_x = (video_width - box_w) // 2
-        
-        if position == "center":
-            overlay_y = (video_height - box_h) // 2
-        elif position == "bottom":
-             # Bottom 20% mark (approx)
-             overlay_y = int(video_height * 0.70)
-        else:
-             # Top 20% mark
-             overlay_y = int(video_height * 0.20)
-        
+        img_path, overlay_x, overlay_y = prepare_hook_overlay(
+            video_path, text, position=position, font_scale=font_scale)
+        hook_filename = img_path
+
         # 4. FFmpeg Command
         print(f"🎬 Overlaying hook: '{text}' at {overlay_x},{overlay_y}")
-        
+
         ffmpeg_cmd = [
             'ffmpeg', '-y',
             '-i', video_path,
@@ -347,5 +359,5 @@ def add_hook_to_video(video_path, text, output_path, position="top", font_scale=
         raise e
     finally:
         # Cleanup temp image
-        if os.path.exists(hook_filename):
+        if hook_filename and os.path.exists(hook_filename):
             os.remove(hook_filename)

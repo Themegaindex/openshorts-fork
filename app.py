@@ -1332,8 +1332,8 @@ async def resume_job(job_id: str, request: Request, body: Optional[ResumeRequest
     return {"job_id": job_id, "status": "queued", "resume_count": job["resume_count"]}
 
 from editor import VideoEditor
-from subtitles import generate_srt, generate_ass, burn_subtitles, generate_srt_from_video
-from hooks import add_hook_to_video
+from subtitles import generate_srt, generate_ass, burn_layers, generate_srt_from_video
+from hooks import prepare_hook_overlay
 from translate import translate_video, get_supported_languages
 from thumbnail import analyze_video_for_titles, refine_titles, generate_thumbnail, generate_youtube_description
 
@@ -1423,7 +1423,7 @@ async def edit_clip(
                 # 3. Get Plan (Filter String)
                 # Burned-in captions/hooks must survive the edit: zooming would
                 # crop or shift them, so tell the editor to avoid zoom effects.
-                has_captions = ("subtitled_" in filename) or ("hooked_" in filename)
+                has_captions = ("subtitled_" in filename) or ("hook_" in filename)
                 filter_data = editor.get_ffmpeg_filter(vid_file, duration, fps=fps, width=width, height=height, transcript=transcript, has_captions=has_captions)
                 
                 # 4. Apply
@@ -1468,6 +1468,64 @@ async def edit_clip(
     except Exception as e:
         print(f"❌ Edit Error: {e}")
         raise HTTPException(status_code=500, detail=str(e))
+
+# --- Clip layer state: single-pass rendering for subtitles + hook ---------
+# Subtitle and hook settings are remembered per base clip (clip_layers.json in
+# the job folder). Every subtitle/hook request re-renders BOTH layers from the
+# base clip in ONE FFmpeg pass — no more encode-of-an-encode chains (double
+# wait time + stacked generation loss).
+
+CLIP_LAYERS_FILE = "clip_layers.json"
+HOOK_SIZE_SCALE = {"S": 0.8, "M": 1.0, "L": 1.3}
+
+
+def _load_clip_layers(output_dir: str) -> dict:
+    path = os.path.join(output_dir, CLIP_LAYERS_FILE)
+    if os.path.exists(path):
+        try:
+            with open(path, "r", encoding="utf-8") as f:
+                data = json.load(f)
+            if isinstance(data, dict):
+                return data
+        except Exception:
+            pass
+    return {}
+
+
+def _save_clip_layers(output_dir: str, layers: dict):
+    try:
+        with open(os.path.join(output_dir, CLIP_LAYERS_FILE), "w", encoding="utf-8") as f:
+            json.dump(layers, f, indent=2, ensure_ascii=False)
+    except Exception as e:
+        print(f"⚠️ Failed to persist clip layers: {e}")
+
+
+def _strip_layer_prefixes(filename: str, output_dir: str) -> str:
+    """Walk subtitled_<ts>_ / hook_[<ts>_] prefixes back to the base file so
+    layers are always re-rendered from the clean clip."""
+    while True:
+        m = re.match(r'^(?:subtitled_\d+_|hook_(?:\d+_)?)(.+)$', filename)
+        if not m or not os.path.exists(os.path.join(output_dir, m.group(1))):
+            break
+        filename = m.group(1)
+    return filename
+
+
+def _prepare_hook_layer(input_path: str, hook_layer: Optional[dict]):
+    """Best-effort PNG + position for a stored hook layer. Returns
+    (png_path_or_None, x, y); failures degrade to no hook instead of
+    failing the whole render."""
+    if not hook_layer or not hook_layer.get("text"):
+        return None, 0, 0
+    try:
+        scale = HOOK_SIZE_SCALE.get(hook_layer.get("size", "M"), 1.0)
+        return prepare_hook_overlay(
+            input_path, hook_layer["text"],
+            position=hook_layer.get("position", "top"), font_scale=scale)
+    except Exception as e:
+        print(f"⚠️ Hook layer skipped (render failed): {e}")
+        return None, 0, 0
+
 
 class SubtitleRequest(BaseModel):
     job_id: str
@@ -1527,16 +1585,12 @@ async def add_subtitles(req: SubtitleRequest):
              base_name = os.path.basename(json_files[0]).replace('_metadata.json', '')
              filename = f"{base_name}_clip_{req.clip_index+1}.mp4"
 
-    # Re-subtitling must replace previous subtitles instead of burning over
+    # Re-subtitling must replace previous layers instead of burning over
     # them — in BOTH paths (bulk picks the file itself, the single-clip modal
-    # sends its current, possibly already-subtitled file explicitly): walk
-    # subtitled_<ts>_ prefixes back to the pre-subtitle file.
-    while True:
-        m = re.match(r'^subtitled_\d+_(.+)$', filename)
-        if not m or not os.path.exists(os.path.join(output_dir, m.group(1))):
-            break
-        filename = m.group(1)
-         
+    # sends its current file explicitly): walk subtitled_/hook_ prefixes back
+    # to the base file, then re-render all stored layers in one pass.
+    filename = _strip_layer_prefixes(filename, output_dir)
+
     input_path = os.path.join(output_dir, filename)
     if not os.path.exists(input_path):
         # Try looking for edited version if url implied it?
@@ -1585,15 +1639,27 @@ async def add_subtitles(req: SubtitleRequest):
         if not success:
              raise HTTPException(status_code=400, detail="No words found for this clip range.")
 
-        # 2. Burn Subtitles
-        # Run in thread pool
+        # 2. Remember this subtitle layer for the base clip, then burn ALL
+        # stored layers (subtitles + existing hook) in ONE encode pass.
+        burn_opts = dict(alignment=req.position, fontsize=req.font_size,
+                         font_name=req.font_name, font_color=req.font_color,
+                         border_color=req.border_color, border_width=req.border_width,
+                         bg_color=req.bg_color, bg_opacity=req.bg_opacity)
+        layers = _load_clip_layers(output_dir)
+        layer_entry = layers.setdefault(filename, {})
+        layer_entry["subtitle"] = {"path": srt_filename, "burn_opts": burn_opts}
+        _save_clip_layers(output_dir, layers)
+
         def run_burn():
-             burn_subtitles(input_path, srt_path, output_path,
-                           alignment=req.position, fontsize=req.font_size,
-                           font_name=req.font_name, font_color=req.font_color,
-                           border_color=req.border_color, border_width=req.border_width,
-                           bg_color=req.bg_color, bg_opacity=req.bg_opacity)
-        
+            hook_png, hook_x, hook_y = _prepare_hook_layer(input_path, layer_entry.get("hook"))
+            try:
+                burn_layers(input_path, output_path,
+                            subtitle_path=srt_path, burn_opts=burn_opts,
+                            hook_png=hook_png, hook_x=hook_x, hook_y=hook_y)
+            finally:
+                if hook_png and os.path.exists(hook_png):
+                    os.remove(hook_png)
+
         loop = asyncio.get_event_loop()
         await loop.run_in_executor(None, run_burn)
         
@@ -1705,23 +1771,51 @@ async def add_hook(req: HookRequest):
              base_name = os.path.basename(json_files[0]).replace('_metadata.json', '')
              filename = f"{base_name}_clip_{req.clip_index+1}.mp4"
          
+    # Re-hooking or hooking a subtitled clip must not re-encode an encode:
+    # walk back to the base file and render all stored layers in one pass.
+    filename = _strip_layer_prefixes(filename, output_dir)
+
     input_path = os.path.join(output_dir, filename)
     if not os.path.exists(input_path):
         raise HTTPException(status_code=404, detail=f"Video file not found: {input_path}")
-        
+
     # Output video
-    output_filename = f"hook_{filename}"
+    generation_id = int(time.time())
+    output_filename = f"hook_{generation_id}_{filename}"
     output_path = os.path.join(output_dir, output_filename)
-    
-    # Map Size to Scale
-    size_map = {"S": 0.8, "M": 1.0, "L": 1.3}
-    font_scale = size_map.get(req.size, 1.0)
-    
+
+    font_scale = HOOK_SIZE_SCALE.get(req.size, 1.0)
+
+    # Remember this hook layer for the base clip.
+    layers = _load_clip_layers(output_dir)
+    layer_entry = layers.setdefault(filename, {})
+    layer_entry["hook"] = {"text": req.text, "position": req.position, "size": req.size}
+    _save_clip_layers(output_dir, layers)
+
+    # Reuse the stored subtitle layer (if its file still exists) so hook and
+    # subtitles land in the same single encode.
+    subtitle_path = None
+    subtitle_burn_opts = None
+    sub_layer = layer_entry.get("subtitle") or {}
+    if sub_layer.get("path"):
+        candidate = os.path.join(output_dir, os.path.basename(sub_layer["path"]))
+        if os.path.exists(candidate):
+            subtitle_path = candidate
+            subtitle_burn_opts = sub_layer.get("burn_opts")
+
     try:
         # Run in thread pool
         def run_hook():
-             add_hook_to_video(input_path, req.text, output_path, position=req.position, font_scale=font_scale)
-        
+            hook_png, hook_x, hook_y = prepare_hook_overlay(
+                input_path, req.text, position=req.position, font_scale=font_scale)
+            try:
+                burn_layers(input_path, output_path,
+                            subtitle_path=subtitle_path, burn_opts=subtitle_burn_opts,
+                            hook_png=hook_png, hook_x=hook_x, hook_y=hook_y)
+            finally:
+                if hook_png and os.path.exists(hook_png):
+                    os.remove(hook_png)
+
         loop = asyncio.get_event_loop()
         await loop.run_in_executor(None, run_hook)
         
