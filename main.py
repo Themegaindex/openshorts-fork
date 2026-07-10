@@ -149,6 +149,8 @@ class JobReporter:
         self.phase_durations = {}
         self.phase_factors = _load_phase_factors()
         self._estimate_announced = False
+        self._persisted_phases = set()
+        self._last_total_update = 0.0
 
     def _overall_progress(self, phase: Optional[str] = None, phase_progress_percent: Optional[float] = None) -> float:
         current_phase = phase or self.phase
@@ -241,6 +243,15 @@ class JobReporter:
         payload["eta_seconds"] = eta_seconds
         if message:
             payload["message"] = message
+        # Keep the announced total honest: refresh it every ~15s from the REAL
+        # elapsed time plus the live remaining estimate, so the dashboard total
+        # converges to reality instead of freezing at the initial guess.
+        if (self._estimate_announced and eta_seconds is not None
+                and "total_estimate_seconds" not in extra
+                and time.time() - self._last_total_update >= 15.0):
+            elapsed = sum(self.phase_durations.values()) + max(0.0, time.time() - self.phase_started_at)
+            payload["total_estimate_seconds"] = int(elapsed + eta_seconds)
+            self._last_total_update = time.time()
         payload.update(extra)
         # Leading newline: yt-dlp writes \r-progress into the same stdout, and
         # an event glued behind such a fragment would not be recognized by the
@@ -253,7 +264,13 @@ class JobReporter:
     def set_phase(self, phase: str, label: str, *, message: Optional[str] = None, phase_progress_percent: float = 0.0, **extra):
         # Record how long the finished phase actually took (feeds the ETA model).
         if self.phase in PHASE_ETA_ORDER:
-            self.phase_durations[self.phase] = time.time() - self.phase_started_at
+            duration = time.time() - self.phase_started_at
+            self.phase_durations[self.phase] = duration
+            # Learn each phase the moment it completes — even crashed or
+            # aborted jobs then calibrate the ETA model for this machine.
+            if self.phase not in self._persisted_phases and self.video_duration:
+                _record_phase_stats({self.phase: duration}, self.video_duration)
+                self._persisted_phases.add(self.phase)
         self.phase = phase
         self.phase_label = label
         self.phase_started_at = time.time()
@@ -306,10 +323,12 @@ class JobReporter:
     def summary(self, status: str, message: str, *, resumable: bool = False, **extra):
         if status == "completed":
             # Close the timing of the final phase and persist what we measured,
-            # so the next job's ETA is calibrated to THIS machine.
+            # so the next job's ETA is calibrated to THIS machine. Phases that
+            # were already recorded at their phase switch are skipped.
             if self.phase in PHASE_ETA_ORDER:
                 self.phase_durations[self.phase] = time.time() - self.phase_started_at
-            _record_phase_stats(self.phase_durations, self.video_duration)
+            leftover = {p: d for p, d in self.phase_durations.items() if p not in self._persisted_phases}
+            _record_phase_stats(leftover, self.video_duration)
         phase = "completed" if status == "completed" else self.phase
         progress_percent = 100.0 if status == "completed" else self.progress_percent
         self.emit(
