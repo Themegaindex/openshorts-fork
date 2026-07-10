@@ -9,6 +9,11 @@ from types import SimpleNamespace
 import pytest
 from pydantic import ValidationError
 
+# These tests exercise the FastAPI backend directly. On dev machines without
+# the full server stack installed, skip this module instead of aborting the
+# whole suite at collection time (CI installs fastapi and runs everything).
+pytest.importorskip("fastapi", reason="fastapi not installed — backend reliability tests run in CI")
+
 import app
 
 
