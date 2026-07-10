@@ -11,6 +11,7 @@ import time
 import asyncio
 import re
 import zipfile
+import hashlib
 from datetime import datetime, timezone
 from dotenv import load_dotenv
 from typing import Dict, Optional, List
@@ -21,7 +22,7 @@ from fastapi.middleware.gzip import GZipMiddleware
 from fastapi.staticfiles import StaticFiles
 from fastapi.responses import HTMLResponse, JSONResponse, FileResponse
 from starlette.background import BackgroundTask
-from pydantic import BaseModel
+from pydantic import BaseModel, Field
 from s3_uploader import upload_job_artifacts, list_all_clips, upload_actor_to_s3, list_actor_gallery, upload_video_to_gallery, list_video_gallery
 
 load_dotenv()
@@ -45,8 +46,14 @@ EVENT_PREFIX = "__JOB_EVENT__"
 JOB_STATE_FILENAME = "job_state.json"
 JOB_TOMBSTONE_DIR = os.path.join(OUTPUT_DIR, ".job_tombstones")
 ACTIVE_JOB_STATUSES = {"queued", "processing"}
-TERMINAL_JOB_STATUSES = {"completed", "failed", "stalled", "archived"}
+TERMINAL_JOB_STATUSES = {"completed", "failed", "archived"}
 os.makedirs(JOB_TOMBSTONE_DIR, exist_ok=True)
+
+THUMBNAIL_SESSION_STATE_DIR = os.path.join(OUTPUT_DIR, ".thumbnail_sessions")
+PUBLISH_JOB_STATE_DIR = os.path.join(OUTPUT_DIR, ".publish_jobs")
+SAAS_JOB_STATE_FILENAME = "saas_job_state.json"
+os.makedirs(THUMBNAIL_SESSION_STATE_DIR, exist_ok=True)
+os.makedirs(PUBLISH_JOB_STATE_DIR, exist_ok=True)
 
 # Application State
 job_queue = asyncio.Queue()
@@ -63,6 +70,11 @@ _state_write_lock = threading.Lock()
 # job_id -> set[subprocess.Popen]; guarded by job_processes_lock.
 job_processes: Dict[str, set] = {}
 job_processes_lock = threading.Lock()
+
+# Editing the same clip twice at once used to reuse temporary/output names and
+# could corrupt both results. Locks live only for the process lifetime; every
+# output name is unique as a second line of defense across restarts/workers.
+clip_operation_locks: Dict[tuple[str, int], asyncio.Lock] = {}
 
 # TTLs for in-memory dicts that would otherwise grow unbounded.
 THUMBNAIL_SESSION_TTL_SECONDS = int(os.environ.get("THUMBNAIL_SESSION_TTL_SECONDS", str(2 * 3600)))
@@ -150,6 +162,171 @@ def _read_json(path: str) -> Optional[dict]:
             return json.load(f)
     except Exception:
         return None
+
+
+def _hashed_state_path(directory: str, state_id: str) -> str:
+    """Return a traversal-safe state filename for an externally supplied id."""
+    digest = hashlib.sha256(str(state_id).encode("utf-8")).hexdigest()
+    return os.path.join(directory, f"{digest}.json")
+
+
+def _remove_state_file(directory: str, state_id: str) -> None:
+    path = _hashed_state_path(directory, state_id)
+    try:
+        if os.path.exists(path):
+            os.remove(path)
+    except OSError as e:
+        print(f"⚠️ Failed to remove state file {path}: {e}")
+
+
+def _persist_thumbnail_session(session_id: str) -> None:
+    session = thumbnail_sessions.get(session_id)
+    if not session:
+        return
+    payload = {
+        key: value
+        for key, value in session.items()
+        if key != "transcript_event"
+    }
+    payload["session_id"] = session_id
+    payload["updated_at"] = _now_ts()
+    try:
+        _safe_write_json(
+            _hashed_state_path(THUMBNAIL_SESSION_STATE_DIR, session_id),
+            payload,
+        )
+    except Exception as e:
+        print(f"⚠️ Failed to persist thumbnail session {session_id}: {e}")
+
+
+def _persist_publish_job(publish_id: str) -> None:
+    publish_job = publish_jobs.get(publish_id)
+    if not publish_job:
+        return
+    payload = dict(publish_job)
+    payload["publish_id"] = publish_id
+    payload["updated_at"] = _now_ts()
+    try:
+        _safe_write_json(
+            _hashed_state_path(PUBLISH_JOB_STATE_DIR, publish_id),
+            payload,
+        )
+    except Exception as e:
+        print(f"⚠️ Failed to persist publish job {publish_id}: {e}")
+
+
+def _persist_saas_job(job_id: str) -> None:
+    # saas_jobs is declared later in the module, before application startup.
+    job = globals().get("saas_jobs", {}).get(job_id)
+    if not job:
+        return
+    output_dir = job.get("output_dir")
+    if not output_dir:
+        return
+    payload = dict(job)
+    payload["job_id"] = job_id
+    payload["updated_at"] = _now_ts()
+    try:
+        _safe_write_json(os.path.join(output_dir, SAAS_JOB_STATE_FILENAME), payload)
+    except Exception as e:
+        print(f"⚠️ Failed to persist SaaS job {job_id}: {e}")
+
+
+def _recover_auxiliary_state() -> None:
+    """Recover thumbnail, publish and SaaS jobs after a server restart."""
+    for path in glob.glob(os.path.join(THUMBNAIL_SESSION_STATE_DIR, "*.json")):
+        payload = _read_json(path)
+        if not payload or not payload.get("session_id"):
+            continue
+        session_id = str(payload.pop("session_id"))
+        payload.pop("updated_at", None)
+        event = asyncio.Event()
+        if not payload.get("transcript_ready") and not payload.get("transcript_error"):
+            payload["transcript_error"] = (
+                "Server restarted before transcription completed. Please start the upload again."
+            )
+        event.set()
+        payload["transcript_event"] = event
+        thumbnail_sessions[session_id] = payload
+        _persist_thumbnail_session(session_id)
+
+    for path in glob.glob(os.path.join(PUBLISH_JOB_STATE_DIR, "*.json")):
+        payload = _read_json(path)
+        if not payload or not payload.get("publish_id"):
+            continue
+        publish_id = str(payload.pop("publish_id"))
+        payload.pop("updated_at", None)
+        if payload.get("status") == "uploading":
+            payload["status"] = "failed"
+            payload["error"] = "Server restarted before the upload status was confirmed."
+        publish_jobs[publish_id] = payload
+        _persist_publish_job(publish_id)
+
+    saas_state = globals().get("saas_jobs")
+    if saas_state is None:
+        return
+    for output_dir in glob.glob(os.path.join(OUTPUT_DIR, "saas_*")):
+        if not os.path.isdir(output_dir):
+            continue
+        payload = _read_json(os.path.join(output_dir, SAAS_JOB_STATE_FILENAME))
+        if not payload or not payload.get("job_id"):
+            continue
+        job_id = str(payload.pop("job_id"))
+        payload.pop("updated_at", None)
+        if payload.get("status") == "processing":
+            payload["status"] = "failed"
+            payload.setdefault("logs", []).append(
+                "Server restarted during generation. Retry to reuse cached assets."
+            )
+        payload["output_dir"] = output_dir
+        saas_state[job_id] = payload
+        _persist_saas_job(job_id)
+
+
+def _get_clip_operation_lock(job_id: str, clip_index: int) -> asyncio.Lock:
+    key = (job_id, clip_index)
+    lock = clip_operation_locks.get(key)
+    if lock is None:
+        lock = asyncio.Lock()
+        clip_operation_locks[key] = lock
+    return lock
+
+
+def _update_clip_version(
+    job_id: str,
+    clip_index: int,
+    video_url: str,
+    *,
+    metadata_path: Optional[str] = None,
+    metadata: Optional[dict] = None,
+) -> None:
+    """Atomically persist the selected derivative in memory and metadata."""
+    job = _get_job(job_id)
+    if not job or not isinstance(job.get("result"), dict):
+        raise HTTPException(status_code=400, detail="Job result not available")
+
+    result_clips = job["result"].get("clips")
+    if not isinstance(result_clips, list) or not 0 <= clip_index < len(result_clips):
+        raise HTTPException(status_code=404, detail="Clip not found")
+
+    if metadata_path is None:
+        metadata_files = glob.glob(
+            os.path.join(job.get("output_dir") or os.path.join(OUTPUT_DIR, job_id), "*_metadata.json")
+        )
+        metadata_path = metadata_files[0] if metadata_files else None
+    if not metadata_path:
+        raise HTTPException(status_code=404, detail="Metadata not found")
+
+    metadata = metadata if metadata is not None else _read_json(metadata_path)
+    metadata_clips = metadata.get("shorts") if isinstance(metadata, dict) else None
+    if not isinstance(metadata_clips, list) or not 0 <= clip_index < len(metadata_clips):
+        raise HTTPException(status_code=404, detail="Clip metadata not found")
+
+    metadata_clips[clip_index]["video_url"] = video_url
+    _safe_write_json(metadata_path, metadata)
+    result_clips[clip_index]["video_url"] = video_url
+    job["updated_at"] = _now_ts()
+    _persist_job_state(job_id)
 
 
 def _maybe_fix_mojibake_text(text: str) -> str:
@@ -378,8 +555,11 @@ def _apply_job_event(job_id: str, event: dict) -> None:
     elif event_type in {"heartbeat", "progress", "phase", "resume"}:
         job["stall_state"] = "healthy"
 
-    if event.get("status"):
-        job["status"] = event["status"]
+    event_status = event.get("status")
+    # A worker's final summary is advisory. The supervising process validates
+    # metadata/video artifacts before exposing "completed" to the frontend.
+    if event_status and not (event_type == "summary" and event_status == "completed"):
+        job["status"] = event_status
     if event.get("phase"):
         job["phase"] = event["phase"]
     if event.get("phase_label"):
@@ -426,8 +606,7 @@ def _apply_job_event(job_id: str, event: dict) -> None:
         job["is_resumable"] = True
 
     if event_type == "summary" and event.get("status") == "completed":
-        job["status"] = "completed"
-        job["is_resumable"] = False
+        job["worker_summary_received"] = True
 
     if message:
         _append_log(job_id, message, level=level, category=category, important=important, ts=now)
@@ -684,6 +863,7 @@ async def cleanup_jobs():
             now = time.time()
 
             protected_uploads = set()
+            stalled_job_ids = []
             for job_id, job in list(jobs.items()):
                 status = job.get("status")
                 input_path = job.get("input_path")
@@ -696,12 +876,21 @@ async def cleanup_jobs():
                     if heartbeat_age >= HEARTBEAT_STALLED_SECONDS:
                         job["status"] = "stalled"
                         job["stall_state"] = "stalled"
+                        job["stall_termination_requested"] = True
                         job["is_resumable"] = True
                         job["error_summary"] = job.get("error_summary") or "No heartbeat received for too long."
-                        _append_log(job_id, "Job heartbeat timed out. Marked as stalled.", level="warning", category="stall", important=True)
+                        _append_log(job_id, "Job heartbeat timed out. Stopping the old process before resume.", level="warning", category="stall", important=True)
+                        stalled_job_ids.append(job_id)
                     elif heartbeat_age >= HEARTBEAT_STALL_WARNING_SECONDS and job.get("stall_state") != "slow":
                         job["stall_state"] = "slow"
                         _append_log(job_id, "Job is slower than expected but still waiting for activity.", level="warning", category="stall", important=True)
+
+            # Never let a stalled worker keep its semaphore slot or write into
+            # the same output directory as a resumed worker.
+            for stalled_job_id in stalled_job_ids:
+                await asyncio.get_running_loop().run_in_executor(
+                    None, _terminate_job_processes, stalled_job_id
+                )
 
             for job_id in os.listdir(OUTPUT_DIR):
                 if job_id.startswith(".") or job_id == "thumbnails":
@@ -737,6 +926,8 @@ async def cleanup_jobs():
                     print(f"⚠️ Failed to write tombstone for {job_id}: {e}")
                 shutil.rmtree(job_path, ignore_errors=True)
                 jobs.pop(job_id, None)
+                for lock_key in [key for key in clip_operation_locks if key[0] == job_id]:
+                    clip_operation_locks.pop(lock_key, None)
 
             # Cleanup SaaSShorts jobs from memory
             try:
@@ -757,12 +948,14 @@ async def cleanup_jobs():
                 created = session.get("created_at") or 0
                 if now - float(created) > THUMBNAIL_SESSION_TTL_SECONDS:
                     thumbnail_sessions.pop(sid, None)
+                    _remove_state_file(THUMBNAIL_SESSION_STATE_DIR, sid)
 
             # Cleanup finished publish jobs (TTL-based).
             for pid, pjob in list(publish_jobs.items()):
                 created = pjob.get("created_at") or 0
                 if now - float(created) > PUBLISH_JOB_TTL_SECONDS:
                     publish_jobs.pop(pid, None)
+                    _remove_state_file(PUBLISH_JOB_STATE_DIR, pid)
 
             # Cleanup Uploads
             for filename in os.listdir(UPLOAD_DIR):
@@ -814,6 +1007,7 @@ async def run_job_wrapper(job_id):
 async def lifespan(app: FastAPI):
     # Start worker and cleanup
     _recover_jobs_from_disk()
+    _recover_auxiliary_state()
     worker_task = asyncio.create_task(process_queue())
     cleanup_task = asyncio.create_task(cleanup_jobs())
     yield
@@ -849,6 +1043,13 @@ class ProcessRequest(BaseModel):
 
 class ResumeRequest(BaseModel):
     phase: Optional[str] = None
+
+
+def _build_resume_command(job_id: str, output_dir: str, phase: Optional[str] = None) -> List[str]:
+    cmd = [sys.executable, "-u", "main.py", "--resume-dir", output_dir, "--job-id", job_id]
+    if phase:
+        cmd.extend(["--resume-phase", phase])
+    return cmd
 
 def enqueue_output(out, job_id):
     """Reads output from a subprocess and appends it to jobs logs."""
@@ -948,6 +1149,7 @@ async def run_job(job_id, job_data):
     cmd = job_data['cmd']
     env = job_data['env']
     output_dir = job_data['output_dir']
+    execution_id = job_data.get("execution_id")
 
     _mark_job_status(job_id, 'processing', resumable=True)
     jobs[job_id]['phase'] = 'queued'
@@ -964,6 +1166,7 @@ async def run_job(job_id, job_data):
         return
 
     process = None
+    t_log = None
     try:
         process = subprocess.Popen(
             cmd,
@@ -1007,23 +1210,47 @@ async def run_job(job_id, job_data):
                 # Ignore read errors during processing
                 pass
 
+        # A resume request installs a new execution id only after stopping this
+        # process. The old supervisor must then exit without overwriting the new
+        # queued state.
+        if jobs.get(job_id, {}).get("execution_id") != execution_id:
+            return
+
         # Cancellation path: kill the worker and mark the job accordingly.
         if jobs.get(job_id, {}).get("cancel_requested"):
             _stop_process(process)
+            if t_log:
+                await asyncio.get_running_loop().run_in_executor(None, t_log.join, 5)
             _mark_job_status(job_id, 'failed', error_summary="Cancelled by user", resumable=False)
             _append_log(job_id, "Job cancelled by user.", level="warning", category="cancel", important=True)
             return
 
+        # The heartbeat monitor stopped this exact process. Keep the resumable
+        # stalled state instead of converting the termination into a generic
+        # exit-code failure.
+        if jobs.get(job_id, {}).get("stall_termination_requested"):
+            _stop_process(process)
+            if t_log:
+                await asyncio.get_running_loop().run_in_executor(None, t_log.join, 5)
+            jobs[job_id].pop("stall_termination_requested", None)
+            _persist_job_state(job_id)
+            _append_log(
+                job_id,
+                "Old stalled process stopped. The job can now be resumed safely.",
+                level="warning",
+                category="stall",
+                important=True,
+            )
+            return
+
+        # Drain the worker's final structured events before deciding the public
+        # status. Otherwise a late error/summary can race with completion.
+        if t_log:
+            await asyncio.get_running_loop().run_in_executor(None, t_log.join, 5)
+
         returncode = process.returncode
 
         if returncode == 0:
-            _mark_job_status(job_id, 'completed', resumable=False)
-            _append_log(job_id, "Process finished successfully.", category="summary", important=True)
-
-            # Start S3 upload in background (silent, non-blocking)
-            loop = asyncio.get_event_loop()
-            loop.run_in_executor(None, upload_job_artifacts, output_dir, job_id)
-
             final_result = _refresh_job_result(job_id, output_dir)
             if final_result:
                 if final_result.get("analysis_status"):
@@ -1034,6 +1261,12 @@ async def run_job(job_id, job_data):
                     jobs[job_id]["processing_mode"] = final_result.get("processing_mode")
                 if final_result.get("processing_mode") == "full_video_fallback":
                     _append_log(job_id, "Metadata missing, but fallback video artifacts were recovered.", level="warning", category="fallback", important=True)
+                _mark_job_status(job_id, 'completed', resumable=False)
+                _append_log(job_id, "Process finished successfully.", category="summary", important=True)
+
+                # Start S3 upload only after local result validation succeeded.
+                loop = asyncio.get_event_loop()
+                loop.run_in_executor(None, upload_job_artifacts, output_dir, job_id)
             else:
                 _mark_job_status(job_id, 'failed', error_summary="No metadata file generated.", resumable=True)
                 _append_log(job_id, "No metadata file generated.", level="error", category="result", important=True)
@@ -1174,6 +1407,7 @@ async def process_endpoint(
     jobs[job_id].update({
         'cmd': cmd,
         'env': env,
+        'execution_id': uuid.uuid4().hex,
     })
     _append_log(job_id, f"Job {job_id} queued.", category="queue", important=True)
 
@@ -1303,14 +1537,19 @@ async def resume_job(job_id: str, request: Request, body: Optional[ResumeRequest
     if not os.path.isdir(output_dir):
         raise HTTPException(status_code=410, detail="Job artifacts are no longer available")
 
-    cmd = [sys.executable, "-u", "main.py", "--resume-dir", output_dir, "--job-id", job_id]
-    if body and body.phase:
-        cmd.extend(["--resume-phase", body.phase])
+    # A heartbeat-stalled process may still be registered for a few seconds.
+    # Stop and wait for it before another worker can touch the same artifacts.
+    await asyncio.get_running_loop().run_in_executor(None, _terminate_job_processes, job_id)
+
+    cmd = _build_resume_command(job_id, output_dir, body.phase if body else None)
 
     env = os.environ.copy()
     env["GEMINI_API_KEY"] = api_key
     job["cmd"] = cmd
     job["env"] = env
+    job["execution_id"] = uuid.uuid4().hex
+    job.pop("cancel_requested", None)
+    job.pop("stall_termination_requested", None)
     job["status"] = "queued"
     job["phase"] = "queued"
     job["phase_label"] = "Queued"
@@ -1339,7 +1578,7 @@ from thumbnail import analyze_video_for_titles, refine_titles, generate_thumbnai
 
 class EditRequest(BaseModel):
     job_id: str
-    clip_index: int
+    clip_index: int = Field(ge=0)
     api_key: Optional[str] = None
     input_filename: Optional[str] = None
 
@@ -1348,6 +1587,11 @@ async def edit_clip(
     req: EditRequest,
     x_gemini_key: Optional[str] = Header(None, alias="X-Gemini-Key")
 ):
+    async with _get_clip_operation_lock(req.job_id, req.clip_index):
+        return await _edit_clip_locked(req, x_gemini_key)
+
+
+async def _edit_clip_locked(req: EditRequest, x_gemini_key: Optional[str]):
     # Determine API Key
     final_api_key = req.api_key or x_gemini_key or os.environ.get("GEMINI_API_KEY")
     
@@ -1358,8 +1602,10 @@ async def edit_clip(
         raise HTTPException(status_code=404, detail="Job not found")
     
     job = jobs[req.job_id]
-    if 'result' not in job or 'clips' not in job['result']:
+    if not isinstance(job.get('result'), dict) or 'clips' not in job['result']:
         raise HTTPException(status_code=400, detail="Job result not available")
+    if req.clip_index >= len(job['result']['clips']):
+        raise HTTPException(status_code=404, detail="Clip not found")
         
     try:
         # Resolve Input Path: Prefer explict input_filename from frontend (chaining edits)
@@ -1378,7 +1624,8 @@ async def edit_clip(
              raise HTTPException(status_code=404, detail=f"Video file not found: {input_path}")
 
         # Define output path for edited video
-        edited_filename = f"edited_{filename}"
+        operation_id = uuid.uuid4().hex[:12]
+        edited_filename = f"edited_{operation_id}_{filename}"
         output_path = os.path.join(OUTPUT_DIR, req.job_id, edited_filename)
         
         # Run editing in a thread to avoid blocking main loop
@@ -1388,7 +1635,7 @@ async def edit_clip(
             
             # SAFE FILE RENAMING STRATEGY (Avoid UnicodeEncodeError in Docker)
             # Create a safe ASCII filename in the same directory
-            safe_filename = f"temp_input_{req.job_id}.mp4"
+            safe_filename = f"temp_input_{req.job_id}_{operation_id}.mp4"
             safe_input_path = os.path.join(OUTPUT_DIR, req.job_id, safe_filename)
             
             # Copy original file to safe path
@@ -1428,7 +1675,7 @@ async def edit_clip(
                 
                 # 4. Apply
                 # Use safe output name first
-                safe_output_path = os.path.join(OUTPUT_DIR, req.job_id, f"temp_output_{req.job_id}.mp4")
+                safe_output_path = os.path.join(OUTPUT_DIR, req.job_id, f"temp_output_{req.job_id}_{operation_id}.mp4")
                 editor.apply_edits(safe_input_path, safe_output_path, filter_data)
                 
                 # Move result to final destination (rename works even if dest name has unicode if filesystem supports it, 
@@ -1454,6 +1701,7 @@ async def edit_clip(
         # Updating job result allows persistence if page refreshes.
         
         new_video_url = f"/videos/{req.job_id}/{edited_filename}"
+        _update_clip_version(req.job_id, req.clip_index, new_video_url)
         
         # Start a new "edited" clip entry or just update the current one?
         # Let's update the current one's video_url but keep backup?
@@ -1465,9 +1713,11 @@ async def edit_clip(
             "edit_plan": plan
         }
 
+    except HTTPException:
+        raise
     except Exception as e:
         print(f"❌ Edit Error: {e}")
-        raise HTTPException(status_code=500, detail=str(e))
+        raise HTTPException(status_code=500, detail="Auto Edit failed. Check the server logs for details.")
 
 # --- Clip layer state: single-pass rendering for subtitles + hook ---------
 # Subtitle and hook settings are remembered per base clip (clip_layers.json in
@@ -1504,7 +1754,7 @@ def _strip_layer_prefixes(filename: str, output_dir: str) -> str:
     """Walk subtitled_<ts>_ / hook_[<ts>_] prefixes back to the base file so
     layers are always re-rendered from the clean clip."""
     while True:
-        m = re.match(r'^(?:subtitled_\d+_|hook_(?:\d+_)?)(.+)$', filename)
+        m = re.match(r'^(?:subtitled_[A-Za-z0-9-]+_|hook_(?:[A-Za-z0-9-]+_)?)(.+)$', filename)
         if not m or not os.path.exists(os.path.join(output_dir, m.group(1))):
             break
         filename = m.group(1)
@@ -1529,7 +1779,7 @@ def _prepare_hook_layer(input_path: str, hook_layer: Optional[dict]):
 
 class SubtitleRequest(BaseModel):
     job_id: str
-    clip_index: int
+    clip_index: int = Field(ge=0)
     position: str = "bottom" # top, middle, bottom
     font_size: int = 16
     font_name: str = "Verdana"
@@ -1547,6 +1797,11 @@ class SubtitleRequest(BaseModel):
 
 @app.post("/api/subtitle")
 async def add_subtitles(req: SubtitleRequest):
+    async with _get_clip_operation_lock(req.job_id, req.clip_index):
+        return await _add_subtitles_locked(req)
+
+
+async def _add_subtitles_locked(req: SubtitleRequest):
     if req.job_id not in jobs:
         raise HTTPException(status_code=404, detail="Job not found")
     
@@ -1598,7 +1853,7 @@ async def add_subtitles(req: SubtitleRequest):
         raise HTTPException(status_code=404, detail=f"Video file not found: {input_path}")
         
     # Define outputs
-    generation_id = int(time.time())
+    generation_id = uuid.uuid4().hex[:12]
     is_karaoke = req.style == "karaoke"
     srt_filename = f"subs_{req.clip_index}_{generation_id}.{'ass' if is_karaoke else 'srt'}"
     srt_path = os.path.join(output_dir, srt_filename)
@@ -1664,33 +1919,26 @@ async def add_subtitles(req: SubtitleRequest):
         loop = asyncio.get_event_loop()
         await loop.run_in_executor(None, run_burn)
         
+    except HTTPException:
+        raise
     except Exception as e:
         print(f"❌ Subtitle Error: {e}")
-        raise HTTPException(status_code=500, detail=str(e))
+        raise HTTPException(status_code=500, detail="Subtitle rendering failed. Check the server logs for details.")
         
-    # 3. Update Result and Metadata
-    # Update InMemory Jobs
-    if req.clip_index < len(job['result']['clips']):
-         job['result']['clips'][req.clip_index]['video_url'] = f"/videos/{req.job_id}/{output_filename}"
-    
-    # Update Metadata on Disk (Persistence)
-    try:
-        if req.clip_index < len(clips):
-            clips[req.clip_index]['video_url'] = f"/videos/{req.job_id}/{output_filename}"
-            # Update the main data structure
-            data['shorts'] = clips
-            
-            # Write back
-            with open(json_files[0], 'w', encoding='utf-8') as f:
-                json.dump(data, f, indent=4, ensure_ascii=False)
-                print(f"✅ Metadata updated with subtitled video for clip {req.clip_index}")
-    except Exception as e:
-        print(f"⚠️ Failed to update metadata.json: {e}")
-        # Non-critical, but good for persistence
+    # 3. Atomically persist the selected derivative for refresh, ZIP download,
+    # social posting and restart recovery.
+    new_video_url = f"/videos/{req.job_id}/{output_filename}"
+    _update_clip_version(
+        req.job_id,
+        req.clip_index,
+        new_video_url,
+        metadata_path=json_files[0],
+        metadata=data,
+    )
 
     return {
         "success": True,
-        "new_video_url": f"/videos/{req.job_id}/{output_filename}"
+        "new_video_url": new_video_url
     }
 
 
@@ -1736,7 +1984,7 @@ async def download_all_clips(job_id: str):
 
 class HookRequest(BaseModel):
     job_id: str
-    clip_index: int
+    clip_index: int = Field(ge=0)
     text: str
     input_filename: Optional[str] = None
     position: Optional[str] = "top" # top, center, bottom
@@ -1744,6 +1992,11 @@ class HookRequest(BaseModel):
 
 @app.post("/api/hook")
 async def add_hook(req: HookRequest):
+    async with _get_clip_operation_lock(req.job_id, req.clip_index):
+        return await _add_hook_locked(req)
+
+
+async def _add_hook_locked(req: HookRequest):
     if req.job_id not in jobs:
         raise HTTPException(status_code=404, detail="Job not found")
     
@@ -1781,7 +2034,7 @@ async def add_hook(req: HookRequest):
         raise HTTPException(status_code=404, detail=f"Video file not found: {input_path}")
 
     # Output video
-    generation_id = int(time.time())
+    generation_id = uuid.uuid4().hex[:12]
     output_filename = f"hook_{generation_id}_{filename}"
     output_path = os.path.join(output_dir, output_filename)
 
@@ -1821,36 +2074,31 @@ async def add_hook(req: HookRequest):
         loop = asyncio.get_event_loop()
         await loop.run_in_executor(None, run_hook)
         
+    except HTTPException:
+        raise
     except Exception as e:
         print(f"❌ Hook Error: {e}")
-        raise HTTPException(status_code=500, detail=str(e))
+        raise HTTPException(status_code=500, detail="Hook rendering failed. Check the server logs for details.")
         
-    # Update Persistence (Same logic as subtitles)
-    # Update InMemory Jobs
-    if req.clip_index < len(job['result']['clips']):
-         job['result']['clips'][req.clip_index]['video_url'] = f"/videos/{req.job_id}/{output_filename}"
-    
-    # Update Metadata on Disk
-    try:
-        if req.clip_index < len(clips):
-            clips[req.clip_index]['video_url'] = f"/videos/{req.job_id}/{output_filename}"
-            data['shorts'] = clips
-            with open(json_files[0], 'w', encoding='utf-8') as f:
-                json.dump(data, f, indent=4, ensure_ascii=False)
-                print(f"✅ Metadata updated with hook video for clip {req.clip_index}")
-    except Exception as e:
-        print(f"⚠️ Failed to update metadata.json: {e}")
+    new_video_url = f"/videos/{req.job_id}/{output_filename}"
+    _update_clip_version(
+        req.job_id,
+        req.clip_index,
+        new_video_url,
+        metadata_path=json_files[0],
+        metadata=data,
+    )
 
     return {
         "success": True,
-        "new_video_url": f"/videos/{req.job_id}/{output_filename}"
+        "new_video_url": new_video_url
     }
 
 class TranslateRequest(BaseModel):
     job_id: str
-    clip_index: int
-    target_language: str
-    source_language: Optional[str] = None
+    clip_index: int = Field(ge=0)
+    target_language: str = Field(min_length=2, max_length=20, pattern=r"^[A-Za-z-]+$")
+    source_language: Optional[str] = Field(default=None, min_length=2, max_length=20, pattern=r"^[A-Za-z-]+$")
     input_filename: Optional[str] = None
 
 @app.get("/api/translate/languages")
@@ -1863,6 +2111,11 @@ async def translate_clip(
     req: TranslateRequest,
     x_elevenlabs_key: Optional[str] = Header(None, alias="X-ElevenLabs-Key")
 ):
+    async with _get_clip_operation_lock(req.job_id, req.clip_index):
+        return await _translate_clip_locked(req, x_elevenlabs_key)
+
+
+async def _translate_clip_locked(req: TranslateRequest, x_elevenlabs_key: Optional[str]):
     """Translate a video clip to a different language using ElevenLabs dubbing."""
     if not x_elevenlabs_key:
         raise HTTPException(status_code=400, detail="Missing X-ElevenLabs-Key header")
@@ -1901,7 +2154,8 @@ async def translate_clip(
 
     # Output video with language suffix
     base, ext = os.path.splitext(filename)
-    output_filename = f"translated_{req.target_language}_{base}{ext}"
+    generation_id = uuid.uuid4().hex[:12]
+    output_filename = f"translated_{req.target_language}_{generation_id}_{base}{ext}"
     output_path = os.path.join(output_dir, output_filename)
 
     try:
@@ -1918,33 +2172,29 @@ async def translate_clip(
         loop = asyncio.get_event_loop()
         await loop.run_in_executor(None, run_translate)
 
+    except HTTPException:
+        raise
     except Exception as e:
         print(f"❌ Translation Error: {e}")
-        raise HTTPException(status_code=500, detail=str(e))
+        raise HTTPException(status_code=500, detail="Translation failed. Check the server logs for details.")
 
-    # Update InMemory Jobs
-    if req.clip_index < len(job['result']['clips']):
-         job['result']['clips'][req.clip_index]['video_url'] = f"/videos/{req.job_id}/{output_filename}"
-
-    # Update Metadata on Disk
-    try:
-        if req.clip_index < len(clips):
-            clips[req.clip_index]['video_url'] = f"/videos/{req.job_id}/{output_filename}"
-            data['shorts'] = clips
-            with open(json_files[0], 'w', encoding='utf-8') as f:
-                json.dump(data, f, indent=4, ensure_ascii=False)
-                print(f"✅ Metadata updated with translated video for clip {req.clip_index}")
-    except Exception as e:
-        print(f"⚠️ Failed to update metadata.json: {e}")
+    new_video_url = f"/videos/{req.job_id}/{output_filename}"
+    _update_clip_version(
+        req.job_id,
+        req.clip_index,
+        new_video_url,
+        metadata_path=json_files[0],
+        metadata=data,
+    )
 
     return {
         "success": True,
-        "new_video_url": f"/videos/{req.job_id}/{output_filename}"
+        "new_video_url": new_video_url
     }
 
 class SocialPostRequest(BaseModel):
     job_id: str
-    clip_index: int
+    clip_index: int = Field(ge=0)
     api_key: str
     user_id: str
     platforms: List[str] # ["tiktok", "instagram", "youtube"]
@@ -1962,8 +2212,10 @@ async def post_to_socials(req: SocialPostRequest):
         raise HTTPException(status_code=404, detail="Job not found")
     
     job = jobs[req.job_id]
-    if 'result' not in job or 'clips' not in job['result']:
+    if not isinstance(job.get('result'), dict) or 'clips' not in job['result']:
         raise HTTPException(status_code=400, detail="Job result not available")
+    if req.clip_index >= len(job['result']['clips']):
+        raise HTTPException(status_code=404, detail="Clip not found")
         
     try:
         clip = job['result']['clips'][req.clip_index]
@@ -2034,9 +2286,11 @@ async def post_to_socials(req: SocialPostRequest):
 
         return response.json()
 
+    except HTTPException:
+        raise
     except Exception as e:
         print(f"❌ Social Post Exception: {e}")
-        raise HTTPException(status_code=500, detail=str(e))
+        raise HTTPException(status_code=500, detail="Social publishing failed. Check the server logs for details.")
 
 @app.get("/api/social/user")
 async def get_social_user(api_key: str = Header(..., alias="X-Upload-Post-Key")):
@@ -2089,8 +2343,11 @@ async def get_social_user(api_key: str = Header(..., alias="X-Upload-Post-Key"))
             return {"profiles": profiles_list}
             
             
+        except HTTPException:
+             raise
         except Exception as e:
-             raise HTTPException(status_code=500, detail=str(e))
+             print(f"❌ Upload-Post user lookup failed: {e}")
+             raise HTTPException(status_code=500, detail="Could not load social profiles. Check the server logs for details.")
 
 # --- Thumbnail Studio Endpoints ---
 
@@ -2127,6 +2384,7 @@ async def thumbnail_upload(
         "conversation": [],
         "_url": url,  # Store URL for deferred download
     }
+    _persist_thumbnail_session(session_id)
 
     async def run_background_whisper():
         try:
@@ -2136,7 +2394,11 @@ async def thumbnail_upload(
                 from main import download_youtube_video
                 loop = asyncio.get_event_loop()
                 vpath, _ = await loop.run_in_executor(None, download_youtube_video, url, UPLOAD_DIR)
-                thumbnail_sessions[session_id]["video_path"] = vpath
+                session = thumbnail_sessions.get(session_id)
+                if session is None:
+                    return
+                session["video_path"] = vpath
+                _persist_thumbnail_session(session_id)
 
             from main import transcribe_video
             loop = asyncio.get_event_loop()
@@ -2144,17 +2406,24 @@ async def thumbnail_upload(
             segments = transcript.get("segments", [])
             duration = segments[-1]["end"] if segments else 0
 
-            thumbnail_sessions[session_id].update({
+            session = thumbnail_sessions.get(session_id)
+            if session is None:
+                return
+            session.update({
                 "transcript_ready": True,
                 "transcript": transcript,
                 "transcript_segments": segments,
                 "video_duration": duration,
                 "language": transcript.get("language", "en"),
             })
+            _persist_thumbnail_session(session_id)
             print(f"✅ [Thumbnail] Background Whisper complete for session {session_id}")
         except Exception as e:
             print(f"❌ [Thumbnail] Background Whisper failed: {e}")
-            thumbnail_sessions[session_id]["transcript_error"] = str(e)
+            session = thumbnail_sessions.get(session_id)
+            if session is not None:
+                session["transcript_error"] = str(e)
+                _persist_thumbnail_session(session_id)
         finally:
             transcript_event.set()
 
@@ -2206,7 +2475,10 @@ async def thumbnail_analyze(
 
         if url:
             from main import download_youtube_video
-            video_path, _ = download_youtube_video(url, UPLOAD_DIR)
+            loop = asyncio.get_running_loop()
+            video_path, _ = await loop.run_in_executor(
+                None, download_youtube_video, url, UPLOAD_DIR
+            )
         else:
             video_path = os.path.join(UPLOAD_DIR, f"thumb_{session_id}_{file.filename}")
             with open(video_path, "wb") as buffer:
@@ -2231,6 +2503,7 @@ async def thumbnail_analyze(
             "transcript_segments": result.get("segments", []),
             "video_duration": result.get("video_duration", 0)
         })
+        _persist_thumbnail_session(session_id)
 
         return {
             "session_id": session_id,
@@ -2240,9 +2513,11 @@ async def thumbnail_analyze(
             "recommended": result.get("recommended", [])
         }
 
+    except HTTPException:
+        raise
     except Exception as e:
         print(f"❌ Thumbnail Analyze Error: {e}")
-        raise HTTPException(status_code=500, detail=str(e))
+        raise HTTPException(status_code=500, detail="Thumbnail analysis failed. Check the server logs for details.")
 
 
 class ThumbnailTitlesRequest(BaseModel):
@@ -2271,6 +2546,7 @@ async def thumbnail_titles(
                 "language": "en",
                 "conversation": []
             }
+        _persist_thumbnail_session(session_id)
         return {"session_id": session_id, "titles": [req.title]}
 
     # Refinement mode
@@ -2299,12 +2575,13 @@ async def thumbnail_titles(
         new_titles = result.get("titles", [])
         session["titles"] = new_titles
         session["conversation"].append({"role": "assistant", "content": json.dumps(new_titles)})
+        _persist_thumbnail_session(req.session_id)
 
         return {"titles": new_titles}
 
     except Exception as e:
         print(f"❌ Thumbnail Titles Error: {e}")
-        raise HTTPException(status_code=500, detail=str(e))
+        raise HTTPException(status_code=500, detail="Title refinement failed. Check the server logs for details.")
 
 
 @app.post("/api/thumbnail/generate")
@@ -2372,7 +2649,7 @@ async def thumbnail_generate(
         raise
     except Exception as e:
         print(f"❌ Thumbnail Generate Error: {e}")
-        raise HTTPException(status_code=500, detail=str(e))
+        raise HTTPException(status_code=500, detail="Thumbnail generation failed. Check the server logs for details.")
 
 
 class ThumbnailDescribeRequest(BaseModel):
@@ -2412,7 +2689,7 @@ async def thumbnail_describe(
 
     except Exception as e:
         print(f"❌ Thumbnail Describe Error: {e}")
-        raise HTTPException(status_code=500, detail=str(e))
+        raise HTTPException(status_code=500, detail="Description generation failed. Check the server logs for details.")
 
 
 @app.post("/api/thumbnail/publish")
@@ -2447,6 +2724,7 @@ async def thumbnail_publish(
     # Generate a unique ID for this publish job so the frontend can poll
     publish_id = str(uuid.uuid4())
     publish_jobs[publish_id] = {"status": "uploading", "result": None, "error": None, "created_at": _now_ts()}
+    _persist_publish_job(publish_id)
 
     def do_upload():
         """Runs in a thread via BackgroundTasks — does the actual multipart upload."""
@@ -2481,16 +2759,19 @@ async def thumbnail_publish(
                 print(f"❌ {err}")
                 publish_jobs[publish_id]["status"] = "failed"
                 publish_jobs[publish_id]["error"] = err
+                _persist_publish_job(publish_id)
             else:
                 print(f"✅ [Thumbnail] Published successfully (publish_id={publish_id})")
                 publish_jobs[publish_id]["status"] = "done"
                 publish_jobs[publish_id]["result"] = response.json()
+                _persist_publish_job(publish_id)
 
         except Exception as e:
             err = str(e)
             print(f"❌ Thumbnail Publish Background Error: {err}")
             publish_jobs[publish_id]["status"] = "failed"
             publish_jobs[publish_id]["error"] = err
+            _persist_publish_job(publish_id)
 
     background_tasks.add_task(do_upload)
     return {"publish_id": publish_id, "status": "uploading"}
@@ -2611,7 +2892,8 @@ async def saasshorts_analyze(
         return result
 
     except Exception as e:
-        raise HTTPException(status_code=500, detail=str(e))
+        print(f"❌ SaaS analysis failed: {e}")
+        raise HTTPException(status_code=500, detail="SaaS analysis failed. Check the server logs for details.")
 
 
 class SaaSActorRequest(BaseModel):
@@ -2647,7 +2929,8 @@ async def saasshorts_actor_upload(file: UploadFile = File(...)):
     except HTTPException:
         raise
     except Exception as e:
-        raise HTTPException(status_code=500, detail=str(e))
+        print(f"❌ Actor upload failed: {e}")
+        raise HTTPException(status_code=500, detail="Actor upload failed. Check the server logs for details.")
 
 
 @app.post("/api/saasshorts/actor-options")
@@ -2692,7 +2975,8 @@ async def saasshorts_actor_options(
         return {"images": urls}
 
     except Exception as e:
-        raise HTTPException(status_code=500, detail=str(e))
+        print(f"❌ Actor generation failed: {e}")
+        raise HTTPException(status_code=500, detail="Actor generation failed. Check the server logs for details.")
 
 
 @app.get("/api/saasshorts/gallery")
@@ -2703,7 +2987,8 @@ async def saasshorts_video_gallery(limit: int = 50):
         videos = await loop.run_in_executor(None, list_video_gallery, limit)
         return {"videos": videos, "total": len(videos)}
     except Exception as e:
-        raise HTTPException(status_code=500, detail=str(e))
+        print(f"❌ SaaS gallery failed: {e}")
+        raise HTTPException(status_code=500, detail="Could not load the SaaS gallery. Check the server logs for details.")
 
 
 class SaaSPostRequest(BaseModel):
@@ -2789,7 +3074,7 @@ async def saasshorts_post_to_socials(req: SaaSPostRequest):
         raise
     except Exception as e:
         print(f"❌ [AI Shorts] Post Exception: {e}")
-        raise HTTPException(status_code=500, detail=str(e))
+        raise HTTPException(status_code=500, detail="AI Shorts publishing failed. Check the server logs for details.")
 
 
 @app.get("/gallery", response_class=HTMLResponse)
@@ -2953,7 +3238,8 @@ async def saasshorts_actor_gallery():
         images = await loop.run_in_executor(None, list_actor_gallery)
         return {"images": images}
     except Exception as e:
-        raise HTTPException(status_code=500, detail=str(e))
+        print(f"❌ Actor gallery failed: {e}")
+        raise HTTPException(status_code=500, detail="Could not load the actor gallery. Check the server logs for details.")
 
 
 class SaaSGenerateRequest(BaseModel):
@@ -3003,6 +3289,7 @@ async def saasshorts_generate(
                 "result": None,
                 "output_dir": job_output_dir,
             }
+            _persist_saas_job(job_id)
 
     if not reused:
         job_id = str(uuid.uuid4())
@@ -3014,6 +3301,7 @@ async def saasshorts_generate(
             "result": None,
             "output_dir": job_output_dir,
         }
+        _persist_saas_job(job_id)
 
     # If user selected a pre-generated actor, resolve it to a local path
     selected_actor_path = None
@@ -3059,6 +3347,7 @@ async def saasshorts_generate(
                 print(f"[SaaSShorts Job {job_id[:8]}] {msg}")
                 if job_id in saas_jobs:
                     saas_jobs[job_id]["logs"].append(msg)
+                    _persist_saas_job(job_id)
 
             def run():
                 return generate_full_video(req.script, config, job_output_dir, log_msg)
@@ -3076,6 +3365,7 @@ async def saasshorts_generate(
                     "script": req.script,
                 }
                 saas_jobs[job_id]["logs"].append("Video generation completed!")
+                _persist_saas_job(job_id)
 
                 # Upload to public gallery (non-blocking)
                 try:
@@ -3112,6 +3402,7 @@ async def saasshorts_generate(
             if job_id in saas_jobs:
                 saas_jobs[job_id]["status"] = "failed"
                 saas_jobs[job_id]["logs"].append(f"Error: {str(e)}")
+                _persist_saas_job(job_id)
         finally:
             concurrency_semaphore.release()
 

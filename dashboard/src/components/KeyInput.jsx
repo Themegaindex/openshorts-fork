@@ -1,13 +1,14 @@
 import React, { useState, useEffect } from 'react';
-import { Key, Eye, EyeOff, Check } from 'lucide-react';
+import { Key, Eye, EyeOff, Check, Trash2 } from 'lucide-react';
 
-export default function KeyInput({ onKeySet, savedKey }) {
+export default function KeyInput({ onKeySet, onDelete, savedKey }) {
     const [key, setKey] = useState(savedKey || '');
     const [isVisible, setIsVisible] = useState(false);
     const [isSaved, setIsSaved] = useState(!!savedKey);
 
-    useEffect(() => {
-        if (savedKey) setKey(savedKey);
+  useEffect(() => {
+        setKey(savedKey || '');
+        setIsSaved(!!savedKey);
     }, [savedKey]);
 
     const handleSave = () => {
@@ -55,6 +56,20 @@ export default function KeyInput({ onKeySet, savedKey }) {
                 >
                     {isSaved ? <><Check size={18} /> Ready</> : 'Set Key'}
                 </button>
+                {savedKey && (
+                    <button
+                        onClick={() => {
+                            setKey('');
+                            setIsSaved(false);
+                            onDelete?.();
+                        }}
+                        className="px-4 rounded-xl bg-red-500/10 border border-red-500/20 text-red-300 hover:bg-red-500/20 transition-colors"
+                        title="Delete saved Gemini API key"
+                        aria-label="Delete saved Gemini API key"
+                    >
+                        <Trash2 size={18} />
+                    </button>
+                )}
             </div>
             <p className="mt-3 text-xs text-zinc-500">
                 Your key is stored locally in your browser for convenience.

@@ -139,7 +139,11 @@ const pollJob = async (jobId, signal) => {
   const res = await fetch(getApiUrl(`/api/status/${jobId}`), { signal });
   const data = await res.json().catch(() => ({}));
   if (res.status === 410) return { ...data, archived: true, httpStatus: 410 };
-  if (!res.ok) throw new Error(data?.detail || 'Status check failed');
+  if (!res.ok) {
+    const error = new Error(data?.detail || 'Status check failed');
+    error.httpStatus = res.status;
+    throw error;
+  }
   return { ...data, httpStatus: res.status };
 };
 
@@ -292,6 +296,7 @@ function App() {
   const [logMode, setLogMode] = useState('important');
   const [jobMeta, setJobMeta] = useState(null);
   const [supportCopied, setSupportCopied] = useState(false);
+  const [connectionIssue, setConnectionIssue] = useState(null);
   const [processingMedia, setProcessingMedia] = useState(null);
   const [activeTab, setActiveTab] = useState('dashboard'); // dashboard, settings
 
@@ -317,6 +322,40 @@ function App() {
 
   const handleClipPause = () => {
     setIsSyncedPlaying(false);
+  };
+
+  const handleClipVersionChange = (clipIndex, newVideoUrl) => {
+    setResults((current) => {
+      if (!current?.clips?.[clipIndex]) return current;
+      const clips = current.clips.map((clip, index) => (
+        index === clipIndex ? { ...clip, video_url: newVideoUrl } : clip
+      ));
+      return { ...current, clips };
+    });
+  };
+
+  const deleteGeminiKey = () => {
+    setApiKey('');
+    localStorage.removeItem('gemini_key');
+  };
+
+  const deleteUploadPostKey = () => {
+    setUploadPostKey('');
+    setUploadUserId('');
+    setUserProfiles([]);
+    localStorage.removeItem('uploadPostKey_v3');
+    localStorage.removeItem('uploadUserId');
+    localStorage.removeItem('uploadpost_no_profiles_notice');
+  };
+
+  const deleteElevenLabsKey = () => {
+    setElevenLabsKey('');
+    localStorage.removeItem('elevenLabsKey_v1');
+  };
+
+  const deleteFalKey = () => {
+    setFalKey('');
+    localStorage.removeItem('falKey_v1');
   };
 
   // Session Recovery: Restore on mount
@@ -374,27 +413,28 @@ function App() {
     // Encrypt Gemini Key too for consistency if desired, but user asked specifically about Social integration not saving well.
     // For now keeping gemini plain for compatibility unless requested.
     if (apiKey) localStorage.setItem('gemini_key', apiKey);
+    else localStorage.removeItem('gemini_key');
   }, [apiKey]);
 
   useEffect(() => {
     if (uploadPostKey) {
       localStorage.setItem('uploadPostKey_v3', encrypt(uploadPostKey));
-    }
+    } else localStorage.removeItem('uploadPostKey_v3');
     if (uploadUserId) {
       localStorage.setItem('uploadUserId', uploadUserId);
-    }
+    } else localStorage.removeItem('uploadUserId');
   }, [uploadPostKey, uploadUserId]);
 
   useEffect(() => {
     if (elevenLabsKey) {
       localStorage.setItem('elevenLabsKey_v1', encrypt(elevenLabsKey));
-    }
+    } else localStorage.removeItem('elevenLabsKey_v1');
   }, [elevenLabsKey]);
 
   useEffect(() => {
     if (falKey) {
       localStorage.setItem('falKey_v1', encrypt(falKey));
-    }
+    } else localStorage.removeItem('falKey_v1');
   }, [falKey]);
 
   useEffect(() => {
@@ -417,13 +457,16 @@ function App() {
     // cleaned up (job switch, reset, unmount) so stale data can't clobber state.
     const controller = new AbortController();
     let cancelled = false;
+    let timer = null;
     let consecutiveErrors = 0;
 
-    const interval = setInterval(async () => {
+    const poll = async () => {
+      let terminal = false;
       try {
         const data = await pollJob(jobId, controller.signal);
         if (cancelled) return;
         consecutiveErrors = 0;
+        setConnectionIssue(null);
         console.log("Job status:", data);
         setJobMeta(data);
 
@@ -434,16 +477,16 @@ function App() {
 
         if (data.archived || data.status === 'archived') {
           setStatus('archived');
-          clearInterval(interval);
+          terminal = true;
         } else if (data.status === 'completed') {
           setStatus('complete');
           if (data.logs) setLogs(data.logs);
-          clearInterval(interval);
+          terminal = true;
         } else if (data.status === 'failed') {
           setStatus('error');
           const errorMsg = data.error || (data.logs && data.logs.length > 0 ? data.logs[data.logs.length - 1] : "Process failed");
           setLogs(prev => [...prev, "Error: " + errorMsg]);
-          clearInterval(interval);
+          terminal = true;
         } else if (data.status === 'stalled') {
           setStatus('stalled');
           if (data.logs) setLogs(data.logs);
@@ -455,22 +498,58 @@ function App() {
       } catch (e) {
         if (cancelled || e.name === 'AbortError') return;
         console.error("Polling error", e);
-        // A single transient failure shouldn't kill the poll; repeated
-        // failures surface as an error instead of an endless spinner.
-        consecutiveErrors += 1;
-        if (consecutiveErrors >= 5) {
-          clearInterval(interval);
+        if (e.httpStatus === 404) {
           setStatus('error');
-          setLogs(prev => [...prev, `Error: Lost connection to server (${consecutiveErrors} failed status checks): ${e.message}`]);
+          setConnectionIssue(null);
+          setLogs(prev => [...prev, `Error: Job no longer exists on the server: ${e.message}`]);
+          terminal = true;
+        } else {
+          // A lost network connection is not a failed server job. Keep polling
+          // with backoff so Reset can still cancel the active job and the UI
+          // automatically recovers when the server returns.
+          consecutiveErrors += 1;
+          if (consecutiveErrors === 5) {
+            const message = `Connection to the server is interrupted (${e.message}). The job may still be running; retrying automatically.`;
+            setConnectionIssue(message);
+            setLogs(prev => [...prev, `Warning: ${message}`]);
+          }
+        }
+      } finally {
+        if (!cancelled && !terminal) {
+          const retryDelay = consecutiveErrors > 0
+            ? Math.min(10000, 2000 * consecutiveErrors)
+            : 2000;
+          timer = setTimeout(poll, retryDelay);
         }
       }
-    }, 2000);
+    };
+
+    // Poll immediately, then schedule one request at a time. This avoids
+    // overlapping status responses arriving out of order.
+    poll();
 
     return () => {
       cancelled = true;
       controller.abort();
-      clearInterval(interval);
+      if (timer) clearTimeout(timer);
     };
+  }, [status, jobId]);
+
+  // Completed sessions do not poll continuously, but they do refresh once on
+  // recovery so persisted edit/subtitle/hook/translation versions win over a
+  // stale localStorage snapshot.
+  useEffect(() => {
+    if (status !== 'complete' || !jobId) return undefined;
+    const controller = new AbortController();
+    pollJob(jobId, controller.signal)
+      .then((data) => {
+        setJobMeta(data);
+        if (data.result) setResults(data.result);
+      })
+      .catch((error) => {
+        if (error.name !== 'AbortError') console.error('Completed job refresh failed', error);
+      });
+    return () => controller.abort();
   }, [status, jobId]);
 
 
@@ -511,6 +590,7 @@ function App() {
       return;
     }
     setStatus('processing');
+    setConnectionIssue(null);
     setLogs(["Starting process..."]);
     setResults(null);
     setJobMeta(null);
@@ -581,6 +661,7 @@ function App() {
     setLogs([]);
     setJobMeta(null);
     setProcessingMedia(null);
+    setConnectionIssue(null);
     localStorage.removeItem(SESSION_KEY);
   };
 
@@ -657,16 +738,15 @@ function App() {
       const res = await fetch(getApiUrl(`/api/jobs/${jobId}/resume`), {
         method: 'POST',
         headers: {
-          'Content-Type': 'application/json',
           'X-Gemini-Key': apiKey,
         },
-        body: JSON.stringify({ phase: 'analyze' }),
       });
       if (!res.ok) {
         const text = await res.text();
         throw new Error(text || 'Resume failed');
       }
       setStatus('queued');
+      setConnectionIssue(null);
       setLogs((prev) => [...prev, 'Job resumed.']);
     } catch (e) {
       console.error('Resume failed', e);
@@ -788,7 +868,7 @@ function App() {
                   <Shield size={12} /> Privacy: keys only live in your browser (sent to backend just to process)
                 </div>
               </div>
-              <KeyInput onKeySet={setApiKey} savedKey={apiKey} />
+              <KeyInput onKeySet={setApiKey} onDelete={deleteGeminiKey} savedKey={apiKey} />
 
               <div className="glass-panel p-6 mt-8">
                 <div className="flex items-center justify-between mb-4">
@@ -813,8 +893,13 @@ function App() {
                     <button onClick={() => fetchUserProfiles()} className="btn-primary py-2 px-4 text-sm">
                       Connect
                     </button>
+                    {uploadPostKey && (
+                      <button onClick={deleteUploadPostKey} className="btn-secondary py-2 px-4 text-sm text-red-300">
+                        Delete
+                      </button>
+                    )}
                   </div>
-                  <p className="text-xs text-zinc-500 leading-relaxed">
+                  <div className="text-xs text-zinc-500 leading-relaxed">
                     Connect your Upload-Post account to enable one-click publishing.
                     <div className="mt-3 grid grid-cols-1 sm:grid-cols-3 gap-2">
                       <a href="https://app.upload-post.com/login" target="_blank" rel="noopener noreferrer" className="p-2 border border-white/5 rounded-lg hover:bg-white/5 transition-colors flex flex-col gap-1">
@@ -834,7 +919,7 @@ function App() {
                     <span className="text-zinc-600 italic">
                       Keys are only stored in your browser. They are sent to the backend only to process your request, never stored server-side.
                     </span>
-                  </p>
+                  </div>
                 </div>
               </div>
 
@@ -868,8 +953,13 @@ function App() {
                     >
                       Save
                     </button>
+                    {elevenLabsKey && (
+                      <button onClick={deleteElevenLabsKey} className="btn-secondary py-2 px-4 text-sm text-red-300">
+                        Delete
+                      </button>
+                    )}
                   </div>
-                  <p className="text-xs text-zinc-500 leading-relaxed">
+                  <div className="text-xs text-zinc-500 leading-relaxed">
                     Get your API key from ElevenLabs to enable video translation.
                     <div className="mt-3 grid grid-cols-1 sm:grid-cols-2 gap-2">
                       <a href="https://elevenlabs.io/sign-up" target="_blank" rel="noopener noreferrer" className="p-2 border border-white/5 rounded-lg hover:bg-white/5 transition-colors flex flex-col gap-1">
@@ -885,7 +975,7 @@ function App() {
                     <span className="text-zinc-600 italic">
                       Keys are only stored in your browser. They are sent to the backend only to process your request, never stored server-side.
                     </span>
-                  </p>
+                  </div>
                 </div>
               </div>
 
@@ -919,8 +1009,13 @@ function App() {
                     >
                       Save
                     </button>
+                    {falKey && (
+                      <button onClick={deleteFalKey} className="btn-secondary py-2 px-4 text-sm text-red-300">
+                        Delete
+                      </button>
+                    )}
                   </div>
-                  <p className="text-xs text-zinc-500 leading-relaxed">
+                  <div className="text-xs text-zinc-500 leading-relaxed">
                     Get your API key from fal.ai to enable AI actor video generation.
                     <div className="mt-3 grid grid-cols-1 sm:grid-cols-2 gap-2">
                       <a href="https://fal.ai/dashboard/keys" target="_blank" rel="noopener noreferrer" className="p-2 border border-white/5 rounded-lg hover:bg-white/5 transition-colors flex flex-col gap-1">
@@ -936,7 +1031,7 @@ function App() {
                     <span className="text-zinc-600 italic">
                       Keys are only stored in your browser. Sent to backend only to process requests.
                     </span>
-                  </p>
+                  </div>
                 </div>
               </div>
             </div>
@@ -1009,6 +1104,12 @@ function App() {
                 </div>
 
                 <div className="mb-6 glass-panel p-4 space-y-4">
+                  {connectionIssue && (
+                    <div className="text-xs text-amber-200 bg-amber-500/10 border border-amber-500/20 rounded-xl p-3 flex items-start gap-2">
+                      <AlertTriangle size={14} className="shrink-0 mt-0.5" />
+                      <span>{connectionIssue}</span>
+                    </div>
+                  )}
                   <div className="space-y-2">
                     <div className="flex items-center justify-between text-sm">
                       <span className="text-zinc-400">{phaseLabel}</span>
@@ -1209,6 +1310,7 @@ function App() {
                           uploadUserId={uploadUserId}
                           geminiApiKey={apiKey}
                           elevenLabsKey={elevenLabsKey}
+                          onVersionChange={handleClipVersionChange}
                           onPlay={(time) => handleClipPlay(time)}
                           onPause={handleClipPause}
                         />

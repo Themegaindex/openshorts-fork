@@ -5,7 +5,7 @@ import SubtitleModal from './SubtitleModal';
 import HookModal from './HookModal';
 import TranslateModal from './TranslateModal';
 
-export default function ResultCard({ clip, index, jobId, uploadPostKey, uploadUserId, geminiApiKey, elevenLabsKey, onPlay, onPause }) {
+export default function ResultCard({ clip, index, jobId, uploadPostKey, uploadUserId, geminiApiKey, elevenLabsKey, onVersionChange, onPlay, onPause }) {
     const [showModal, setShowModal] = useState(false);
     const [showSubtitleModal, setShowSubtitleModal] = useState(false);
     const videoRef = React.useRef(null);
@@ -80,6 +80,7 @@ export default function ResultCard({ clip, index, jobId, uploadPostKey, uploadUs
             const data = await res.json();
             if (data.new_video_url) {
                 setCurrentVideoUrl(getApiUrl(data.new_video_url));
+                onVersionChange?.(index, data.new_video_url);
                 // Reload video
                 if (videoRef.current) {
                     videoRef.current.load();
@@ -129,6 +130,7 @@ export default function ResultCard({ clip, index, jobId, uploadPostKey, uploadUs
             const data = await res.json();
             if (data.new_video_url) {
                 setCurrentVideoUrl(getApiUrl(data.new_video_url));
+                onVersionChange?.(index, data.new_video_url);
                 if (videoRef.current) {
                     videoRef.current.load();
                 }
@@ -173,6 +175,7 @@ export default function ResultCard({ clip, index, jobId, uploadPostKey, uploadUs
             const data = await res.json();
             if (data.new_video_url) {
                 setCurrentVideoUrl(getApiUrl(data.new_video_url));
+                onVersionChange?.(index, data.new_video_url);
                 if (videoRef.current) {
                     videoRef.current.load();
                 }
@@ -235,6 +238,7 @@ export default function ResultCard({ clip, index, jobId, uploadPostKey, uploadUs
             console.log('[Translate] Success response:', data);
             if (data.new_video_url) {
                 setCurrentVideoUrl(getApiUrl(data.new_video_url));
+                onVersionChange?.(index, data.new_video_url);
                 if (videoRef.current) {
                     videoRef.current.load();
                 }

@@ -3,6 +3,21 @@
 All notable changes to OpenShorts are documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 
+## [Unreleased] — 2026-07-10
+
+### Fixed
+
+- **Persistent clip versions**: Auto Edit now updates the in-memory result, metadata and `job_state.json` atomically, matching subtitles, hooks and translations. Refresh, ZIP download, resume and social publishing now use the exact version shown in the UI.
+- **Safe stalled-job resume**: a heartbeat-stalled worker is terminated before it can keep a queue slot or race a resumed worker. Execution IDs prevent an old supervisor from overwriting the new queued state, and resume now lets the backend select the correct checkpoint instead of always forcing Gemini analysis.
+- **Verified completion**: worker summary events no longer expose `completed` early. The log stream is drained and metadata/video artifacts are validated before the final status is published or S3 backup starts.
+- **Race-free clip tools**: Auto Edit, subtitles, hooks and translation are serialized per clip and use unique temporary/output names. Concurrent requests can no longer overwrite each other's files.
+- **Request validation and errors**: negative clip indices are rejected for all clip operations, expected HTTP errors keep their correct status, and unexpected failures return stable user-facing messages while technical details remain in server logs.
+- **Non-blocking thumbnail download**: the direct Thumbnail Studio URL path now runs yt-dlp outside the API event loop.
+- **Restart recovery**: Thumbnail Studio sessions, thumbnail publish jobs and SaaS generation jobs are persisted atomically and recovered after a server restart. Interrupted external jobs return an explicit recoverable failure instead of disappearing.
+- **Connection recovery**: temporary status-poll failures no longer turn a potentially running server job into a local failure. Polling continues sequentially with backoff and automatically clears the warning after reconnection.
+- **API-key deletion**: Gemini, Upload-Post, ElevenLabs and fal.ai keys now have explicit delete controls and empty values are removed from `localStorage` instead of reappearing after reload.
+- Added 14 regression tests for version persistence, negative indices, completion ordering, stalled-process resume, auxiliary-job recovery, thumbnail event-loop safety, per-clip operation locks and preserved HTTP error statuses.
+
 ## [2.0.0] — 2026-07-08
 
 Major overhaul release: new output formats, watermarking, a completely reworked AI Auto-Edit,
