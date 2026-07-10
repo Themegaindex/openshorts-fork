@@ -242,7 +242,11 @@ class JobReporter:
         if message:
             payload["message"] = message
         payload.update(extra)
-        print(f"{EVENT_PREFIX}{json.dumps(payload, ensure_ascii=False)}", flush=True)
+        # Leading newline: yt-dlp writes \r-progress into the same stdout, and
+        # an event glued behind such a fragment would not be recognized by the
+        # server — its heartbeat would be lost and the stall monitor could
+        # kill a healthy download.
+        print(f"\n{EVENT_PREFIX}{json.dumps(payload, ensure_ascii=False)}", flush=True)
         if event_type != "estimate":
             self._maybe_announce_total_estimate()
 
@@ -2107,10 +2111,6 @@ def _load_resume_context(resume_dir: str):
         # resume from the transcription phase instead of failing — the
         # pipeline handles transcript=None by transcribing again.
         source_video = _find_source_video(resume_dir)
-        if not source_video:
-            raise FileNotFoundError(f"No analysis input file found in {resume_dir}")
-
-        video_title = os.path.splitext(os.path.basename(source_video))[0]
         source_url = None
         state_file = os.path.join(resume_dir, "job_state.json")
         if os.path.exists(state_file):
@@ -2119,6 +2119,26 @@ def _load_resume_context(resume_dir: str):
                     source_url = json.load(f).get("source_url")
             except Exception:
                 pass
+
+        if not source_video:
+            # Job died mid-download (only a .part file left, or nothing at
+            # all). With a known source URL the pipeline can re-download
+            # instead of failing — yt-dlp even continues partial .part files.
+            if not source_url:
+                raise FileNotFoundError(f"No analysis input file found in {resume_dir}")
+            print("🔁 No checkpoints or source video found — re-downloading source for resume.")
+            return {
+                "output_dir": resume_dir,
+                "video_title": None,
+                "input_video": None,
+                "source_url": source_url,
+                "duration": 0.0,
+                "transcript": None,
+                "analysis_result": None,
+                "metadata": None,
+            }
+
+        video_title = os.path.splitext(os.path.basename(source_video))[0]
 
         print(f"🔁 No checkpoints found — resuming from source video: {os.path.basename(source_video)}")
         return {
@@ -2235,6 +2255,12 @@ if __name__ == '__main__':
             force_analyze = args.resume_phase == "analyze"
             if force_analyze or not _analysis_result_has_valid_clips(analysis_result):
                 analysis_result = None
+            if (not input_video or not os.path.exists(input_video)) and source_url:
+                # Source video lost (e.g. killed mid-download): re-download
+                # instead of failing the resume. yt-dlp resumes .part files.
+                reporter.set_phase("download", "Downloading source video",
+                                   message="Source video missing — re-downloading for resume...")
+                input_video, video_title = download_youtube_video(source_url, output_dir)
             reporter.emit("resume", "Resuming previous job from saved checkpoints.", important=True, resumable=True)
         else:
             output_format = args.output_format

@@ -1055,19 +1055,29 @@ def enqueue_output(out, job_id):
     """Reads output from a subprocess and appends it to jobs logs."""
     try:
         for line in iter(out.readline, b''):
-            decoded_line = line.decode('utf-8', errors='replace').strip()
-            if decoded_line:
+            decoded = line.decode('utf-8', errors='replace')
+            # yt-dlp writes download progress with bare carriage returns (no
+            # newline) into the same stdout as our __JOB_EVENT__ lines. Without
+            # splitting on \r, heartbeat events get glued behind progress
+            # fragments, are never recognized, and the stall monitor kills a
+            # perfectly healthy download after HEARTBEAT_STALLED_SECONDS.
+            for segment in decoded.replace('\r', '\n').split('\n'):
+                decoded_line = segment.strip()
+                if not decoded_line:
+                    continue
                 print(f"📝 [Job Output] {decoded_line}")
-                if job_id in jobs:
-                    if decoded_line.startswith(EVENT_PREFIX):
-                        try:
-                            event = json.loads(decoded_line[len(EVENT_PREFIX):].strip())
-                            _apply_job_event(job_id, event)
-                            continue
-                        except Exception as e:
-                            _append_log(job_id, f"Failed to parse worker event: {e}", level="warning", category="event", important=True)
-                    level, category, important = _classify_raw_log(decoded_line)
-                    _append_log(job_id, decoded_line, level=level, category=category, important=important)
+                if job_id not in jobs:
+                    continue
+                event_idx = decoded_line.find(EVENT_PREFIX)
+                if event_idx != -1:
+                    try:
+                        event = json.loads(decoded_line[event_idx + len(EVENT_PREFIX):].strip())
+                        _apply_job_event(job_id, event)
+                        continue
+                    except Exception as e:
+                        _append_log(job_id, f"Failed to parse worker event: {e}", level="warning", category="event", important=True)
+                level, category, important = _classify_raw_log(decoded_line)
+                _append_log(job_id, decoded_line, level=level, category=category, important=important)
     except Exception as e:
         print(f"Error reading output for job {job_id}: {e}")
     finally:
