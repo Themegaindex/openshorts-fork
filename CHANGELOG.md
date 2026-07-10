@@ -7,6 +7,7 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 
 ### Fixed
 
+- **GitHub Actions backend tests**: CI now installs the complete lightweight test dependency set, so application-level regression tests can import the FastAPI backend without pulling in the large video/ML stack. Removed three obsolete manual hook verification scripts; the maintained automated pytest suite remains intact.
 - **Persistent clip versions**: Auto Edit now updates the in-memory result, metadata and `job_state.json` atomically, matching subtitles, hooks and translations. Refresh, ZIP download, resume and social publishing now use the exact version shown in the UI.
 - **Safe stalled-job resume**: a heartbeat-stalled worker is terminated before it can keep a queue slot or race a resumed worker. Execution IDs prevent an old supervisor from overwriting the new queued state, and resume now lets the backend select the correct checkpoint instead of always forcing Gemini analysis.
 - **Verified completion**: worker summary events no longer expose `completed` early. The log stream is drained and metadata/video artifacts are validated before the final status is published or S3 backup starts.

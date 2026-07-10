@@ -1,0 +1,11 @@
+# Lightweight dependencies required to collect and run the automated test suite.
+# Video/ML packages from requirements.txt are intentionally excluded from CI.
+pytest
+boto3
+fastapi
+google-genai
+httpx
+Pillow
+pydantic
+python-dotenv
+python-multipart
