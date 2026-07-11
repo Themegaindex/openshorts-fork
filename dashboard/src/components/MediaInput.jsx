@@ -1,5 +1,5 @@
 import React, { useState } from 'react';
-import { Youtube, Upload, FileVideo, X, Sparkles, Smartphone, Monitor, Square } from 'lucide-react';
+import { Youtube, Upload, FileVideo, X, Sparkles, Smartphone, Monitor, Square, Rows2, UserRound, GalleryHorizontal } from 'lucide-react';
 
 const FORMAT_OPTIONS = [
     { id: 'auto', label: 'Auto', hint: 'Smart detect', Icon: Sparkles },
@@ -8,18 +8,25 @@ const FORMAT_OPTIONS = [
     { id: 'square', label: '1:1', hint: 'Square feed', Icon: Square },
 ];
 
+const LAYOUT_OPTIONS = [
+    { id: 'smart', label: 'Smart Split', hint: '2 people stacked', Icon: Rows2 },
+    { id: 'zoom', label: 'Speaker Zoom', hint: 'Always one person', Icon: UserRound },
+    { id: 'wide', label: 'Wide', hint: 'Full width + blur', Icon: GalleryHorizontal },
+];
+
 export default function MediaInput({ onProcess, isProcessing }) {
     const [mode, setMode] = useState('url'); // 'url' | 'file'
     const [url, setUrl] = useState('');
     const [file, setFile] = useState(null);
     const [outputFormat, setOutputFormat] = useState('auto');
+    const [layoutStyle, setLayoutStyle] = useState('smart');
 
     const handleSubmit = (e) => {
         e.preventDefault();
         if (mode === 'url' && url) {
-            onProcess({ type: 'url', payload: url, outputFormat });
+            onProcess({ type: 'url', payload: url, outputFormat, layoutStyle });
         } else if (mode === 'file' && file) {
-            onProcess({ type: 'file', payload: file, outputFormat });
+            onProcess({ type: 'file', payload: file, outputFormat, layoutStyle });
         }
     };
 
@@ -124,6 +131,30 @@ export default function MediaInput({ onProcess, isProcessing }) {
                         ))}
                     </div>
                 </div>
+
+                {/* Reframing layout — only relevant when the output gets reframed */}
+                {outputFormat !== 'horizontal' && (
+                    <div className="mt-4">
+                        <div className="text-xs font-bold text-zinc-400 uppercase tracking-wider mb-2">Layout</div>
+                        <div className="grid grid-cols-3 gap-2">
+                            {LAYOUT_OPTIONS.map(({ id, label, hint, Icon }) => (
+                                <button
+                                    key={id}
+                                    type="button"
+                                    onClick={() => setLayoutStyle(id)}
+                                    className={`flex flex-col items-center gap-1 py-2.5 px-1 rounded-xl border text-center transition-all ${layoutStyle === id
+                                        ? 'border-primary/60 bg-primary/10 text-white'
+                                        : 'border-white/5 bg-white/5 text-zinc-400 hover:border-white/15 hover:text-white'
+                                        }`}
+                                >
+                                    <Icon size={16} className={layoutStyle === id ? 'text-primary' : ''} />
+                                    <span className="text-xs font-bold">{label}</span>
+                                    <span className="text-[9px] text-zinc-500 leading-tight">{hint}</span>
+                                </button>
+                            ))}
+                        </div>
+                    </div>
+                )}
 
                 <button
                     type="submit"

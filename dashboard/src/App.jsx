@@ -606,11 +606,13 @@ function App() {
           url: data.payload,
           force_low_quality: forceLowQuality,
           output_format: data.outputFormat || 'auto',
+          layout_style: data.layoutStyle || 'smart',
         });
       } else {
         const formData = new FormData();
         formData.append('file', data.payload);
         formData.append('output_format', data.outputFormat || 'auto');
+        formData.append('layout_style', data.layoutStyle || 'smart');
         body = formData;
       }
 

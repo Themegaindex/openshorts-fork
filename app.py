@@ -1339,7 +1339,8 @@ async def process_endpoint(
     request: Request,
     file: Optional[UploadFile] = File(None),
     url: Optional[str] = Form(None),
-    output_format: Optional[str] = Form(None)
+    output_format: Optional[str] = Form(None),
+    layout_style: Optional[str] = Form(None)
 ):
     api_key = request.headers.get("X-Gemini-Key")
     if not api_key:
@@ -1353,9 +1354,12 @@ async def process_endpoint(
         url = body.get("url")
         force_low_quality = bool(body.get("force_low_quality"))
         output_format = body.get("output_format")
+        layout_style = body.get("layout_style")
 
     if output_format not in ("vertical", "horizontal", "square"):
         output_format = "auto"
+    if layout_style not in ("zoom", "wide"):
+        layout_style = "smart"
 
     if not url and not file:
         raise HTTPException(status_code=400, detail="Must provide URL or File")
@@ -1403,6 +1407,7 @@ async def process_endpoint(
 
     cmd.extend(["-o", job_output_dir])
     cmd.extend(["--format", output_format])
+    cmd.extend(["--layout", layout_style])
 
     # Enqueue Job
     jobs[job_id] = _build_job_state(

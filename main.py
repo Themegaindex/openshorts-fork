@@ -37,7 +37,12 @@ import shutil
 from typing import List, Optional
 from pydantic import BaseModel
 from clip_selection import build_transcript_windows, snap_clip_to_words
-from render_planning import smooth_scene_strategies
+from render_planning import (
+    decide_scene_layout,
+    inherit_split_centers,
+    smooth_scene_strategies,
+    split_crop_windows,
+)
 
 import warnings
 warnings.filterwarnings("ignore", category=UserWarning, module='google.protobuf')
@@ -48,6 +53,7 @@ load_dotenv()
 # --- Constants ---
 ASPECT_RATIO = 9 / 16
 OUTPUT_FORMATS = ("auto", "vertical", "horizontal", "square")
+LAYOUT_STYLES = ("smart", "zoom", "wide")
 # Watermark: subtle centered overlay so rendered clips can't be re-uploaded as
 # someone else's work. Configure via env; WATERMARK_TEXT wins over the image.
 WATERMARK_ENABLED = os.environ.get("WATERMARK_ENABLED", "1").strip().lower() not in ("0", "false", "off", "no")
@@ -1111,6 +1117,34 @@ def create_general_frame(frame, output_width, output_height):
     return final_frame
 
 
+def create_split_frame(frame, output_width, output_height, centers, stacked=True):
+    """
+    Opus-Clip style split layout for two-person shots: crop a window around
+    each face and stack them (vertically for 9:16, side by side for 1:1).
+    Both people stay large in frame — no blurred bars, nobody cropped out.
+    """
+    src_h, src_w = frame.shape[:2]
+    windows = split_crop_windows(src_w, src_h, output_width, output_height, centers, stacked=stacked)
+
+    if stacked:
+        panel_w, panel_h = output_width, max(1, output_height // 2)
+    else:
+        panel_w, panel_h = max(1, output_width // 2), output_height
+
+    panels = []
+    for (x1, y1, x2, y2) in windows:
+        crop = frame[y1:y2, x1:x2]
+        if crop.size == 0:
+            crop = frame
+        panels.append(cv2.resize(crop, (panel_w, panel_h)))
+
+    combined = cv2.vconcat(panels) if stacked else cv2.hconcat(panels)
+    if combined.shape[0] != output_height or combined.shape[1] != output_width:
+        # Odd output sizes leave a 1px remainder after halving — snap to size.
+        combined = cv2.resize(combined, (output_width, output_height))
+    return combined
+
+
 _WATERMARK_FONT_CANDIDATES = [
     "C:\\Windows\\Fonts\\arialbd.ttf",
     "C:\\Windows\\Fonts\\segoeuib.ttf",
@@ -1203,17 +1237,22 @@ def _apply_watermark(frame, blender):
     return frame
 
 
-def analyze_scenes_strategy(video_path, scenes):
+def analyze_scenes_strategy(video_path, scenes, layout_style="smart"):
     """
-    Analyzes each scene to determine if it should be TRACK (Single person) or GENERAL (Group/Wide).
-    Returns list of strategies corresponding to scenes.
+    Analyzes each scene to pick a layout: TRACK (zoom on one person),
+    SPLIT (two people stacked) or GENERAL (blurred wide shot).
+    Returns (strategies, split_centers) — one entry per scene; split_centers
+    holds the two face centers for SPLIT scenes, None otherwise.
     """
     cap = cv2.VideoCapture(video_path)
     strategies = []
-    
+    split_centers = []
+
     if not cap.isOpened():
-        return ['TRACK'] * len(scenes)
-        
+        return ['TRACK'] * len(scenes), [None] * len(scenes)
+
+    frame_width = int(cap.get(cv2.CAP_PROP_FRAME_WIDTH) or 0) or 1920
+
     for start, end in tqdm(scenes, desc="   Analyzing Scenes"):
         # Sample 3 frames (start, middle, end)
         frames_to_check = [
@@ -1221,35 +1260,22 @@ def analyze_scenes_strategy(video_path, scenes):
             int((start.get_frames() + end.get_frames()) / 2),
             end.get_frames() - 5
         ]
-        
-        face_counts = []
+
+        face_samples = []
         for f_idx in frames_to_check:
             cap.set(cv2.CAP_PROP_POS_FRAMES, f_idx)
             ret, frame = cap.read()
             if not ret: continue
-            
-            # Detect faces
+
             candidates = detect_face_candidates(frame)
-            face_counts.append(len(candidates))
-            
-        # Decision Logic
-        if not face_counts:
-            avg_faces = 0
-        else:
-            avg_faces = sum(face_counts) / len(face_counts)
-            
-        # Strategy:
-        # 0 faces -> GENERAL (Landscape/B-roll)
-        # 1 face -> TRACK
-        # > 1.2 faces -> GENERAL (Group)
-        
-        if avg_faces > 1.2 or avg_faces < 0.5:
-            strategies.append('GENERAL')
-        else:
-            strategies.append('TRACK')
-            
+            face_samples.append([c['box'] for c in candidates])
+
+        strategy, centers = decide_scene_layout(face_samples, frame_width, layout_style=layout_style)
+        strategies.append(strategy)
+        split_centers.append(centers)
+
     cap.release()
-    return strategies
+    return strategies, split_centers
 
 def detect_scenes(video_path):
     scene_manager = SceneManager()
@@ -1569,17 +1595,18 @@ def _finalize_clip_passthrough(input_video, final_output_video, progress_callbac
     return True
 
 
-def _render_clip(input_video, final_output_video, output_format="auto", progress_callback=None):
+def _render_clip(input_video, final_output_video, output_format="auto", layout_style="smart", progress_callback=None):
     """Route a cut clip through the right renderer for the chosen output format.
     'auto' behaves like 'vertical'; the vertical renderer itself detects sources
     that already match the target aspect and skips reframing for them."""
     if output_format == "horizontal":
         return _finalize_clip_passthrough(input_video, final_output_video, progress_callback)
     aspect = 1.0 if output_format == "square" else ASPECT_RATIO
-    return process_video_to_vertical(input_video, final_output_video, progress_callback, aspect_ratio=aspect)
+    return process_video_to_vertical(input_video, final_output_video, progress_callback,
+                                     aspect_ratio=aspect, layout_style=layout_style)
 
 
-def process_video_to_vertical(input_video, final_output_video, progress_callback=None, aspect_ratio=ASPECT_RATIO):
+def process_video_to_vertical(input_video, final_output_video, progress_callback=None, aspect_ratio=ASPECT_RATIO, layout_style="smart"):
     """
     Core logic to convert horizontal video to vertical using scene detection and Active Speaker Tracking (MediaPipe).
     """
@@ -1645,8 +1672,8 @@ def process_video_to_vertical(input_video, final_output_video, progress_callback
     print("\n   🤖 Step 3: Analyzing Scenes for Strategy (Single vs Group)...")
     if progress_callback:
         progress_callback(14.0, "Analyzing scene strategy...")
-    scene_strategies = analyze_scenes_strategy(input_video, scenes)
-    # scene_strategies is a list of 'TRACK' or 'General' corresponding to scenes
+    scene_strategies, scene_split_centers = analyze_scenes_strategy(input_video, scenes, layout_style=layout_style)
+    # One strategy ('TRACK' | 'SPLIT' | 'GENERAL') per scene.
 
     # Interview footage cuts between wide shots and close-ups every few
     # seconds; raw per-scene decisions made the layout flip constantly.
@@ -1660,7 +1687,11 @@ def process_video_to_vertical(input_video, final_output_video, progress_callback
     if smoothed != scene_strategies:
         flips = sum(1 for a, b in zip(smoothed, scene_strategies) if a != b)
         print(f"   🧘 Stabilized layout plan: {flips} scene(s) smoothed to avoid layout flicker.")
-    scene_strategies = smoothed
+    # Scenes that inherited SPLIT during smoothing need face centers too.
+    scene_strategies, scene_split_centers = inherit_split_centers(smoothed, scene_split_centers)
+    if any(s == 'SPLIT' for s in scene_strategies):
+        split_count = sum(1 for s in scene_strategies if s == 'SPLIT')
+        print(f"   🪟 Split layout active in {split_count}/{len(scene_strategies)} scene(s).")
     
     print("\n   ✂️ Step 4: Processing video frames...")
     if progress_callback:
@@ -1708,8 +1739,24 @@ def process_video_to_vertical(input_video, final_output_video, progress_callback
             current_strategy = scene_strategies[current_scene_index] if current_scene_index < len(scene_strategies) else 'TRACK'
 
             # Apply Strategy
-            if current_strategy == 'GENERAL':
+            split_centers = (
+                scene_split_centers[current_scene_index]
+                if current_strategy == 'SPLIT' and current_scene_index < len(scene_split_centers)
+                else None
+            )
+            if current_strategy == 'SPLIT' and split_centers:
+                # Two-person shot -> both people large, stacked (9:16) or
+                # side by side (1:1). Fixed per scene = calm framing.
+                output_frame = create_split_frame(
+                    frame, OUTPUT_WIDTH, OUTPUT_HEIGHT, split_centers,
+                    stacked=(OUTPUT_HEIGHT >= OUTPUT_WIDTH),
+                )
+                cameraman.current_center_x = original_width / 2
+                cameraman.target_center_x = original_width / 2
+
+            elif current_strategy == 'GENERAL' or current_strategy == 'SPLIT':
                 # "Plano General" -> Blur Background + Fit Width
+                # (also the fallback for SPLIT scenes without face centers)
                 output_frame = create_general_frame(frame, OUTPUT_WIDTH, OUTPUT_HEIGHT)
 
                 # Reset cameraman/tracker so they don't drift while inactive
@@ -2268,6 +2315,8 @@ if __name__ == '__main__':
     parser.add_argument('--resume-phase', choices=['transcribe', 'analyze', 'render'], help="Force resume from a specific phase.")
     parser.add_argument('--format', dest='output_format', choices=list(OUTPUT_FORMATS), default='auto',
                         help="Output format: auto (smart), vertical (9:16), horizontal (original), square (1:1).")
+    parser.add_argument('--layout', dest='layout_style', choices=list(LAYOUT_STYLES), default='smart',
+                        help="Reframing layout: smart (split two-person shots), zoom (speaker zoom only), wide (always blurred wide).")
     parser.add_argument('--job-id', type=str, help="Optional job id for structured worker events.")
     args = parser.parse_args()
 
@@ -2290,9 +2339,13 @@ if __name__ == '__main__':
         if args.resume_dir:
             output_dir = _ensure_dir(args.resume_dir)
             resume_context = _load_resume_context(output_dir)
-            output_format = _load_render_config(output_dir).get("output_format") or args.output_format
+            _render_config = _load_render_config(output_dir)
+            output_format = _render_config.get("output_format") or args.output_format
             if output_format not in OUTPUT_FORMATS:
                 output_format = "auto"
+            layout_style = _render_config.get("layout_style") or args.layout_style
+            if layout_style not in LAYOUT_STYLES:
+                layout_style = "smart"
             input_video = resume_context["input_video"]
             video_title = resume_context["video_title"]
             source_url = resume_context["source_url"]
@@ -2311,6 +2364,7 @@ if __name__ == '__main__':
             reporter.emit("resume", "Resuming previous job from saved checkpoints.", important=True, resumable=True)
         else:
             output_format = args.output_format
+            layout_style = args.layout_style
             if args.url:
                 if args.output and not args.skip_analysis:
                     output_dir = _ensure_dir(args.output)
@@ -2321,8 +2375,9 @@ if __name__ == '__main__':
                         output_dir = os.path.dirname(args.output) or "."
                     else:
                         output_dir = "."
-                # Persist the format before the download so a crash-resume keeps it.
-                _save_json_file(os.path.join(output_dir, "render_config.json"), {"output_format": output_format})
+                # Persist the render settings before the download so a crash-resume keeps them.
+                _save_json_file(os.path.join(output_dir, "render_config.json"),
+                                {"output_format": output_format, "layout_style": layout_style})
                 reporter.set_phase("download", "Downloading source video", message="Starting YouTube download...")
                 input_video, video_title = download_youtube_video(args.url, output_dir)
             else:
@@ -2342,8 +2397,9 @@ if __name__ == '__main__':
             raise FileNotFoundError(f"Input file not found: {input_video}")
 
         # Persist render settings so a resume renders exactly like the original run.
-        _save_json_file(os.path.join(output_dir, "render_config.json"), {"output_format": output_format})
-        print(f"🖼️  Output format: {output_format}")
+        _save_json_file(os.path.join(output_dir, "render_config.json"),
+                        {"output_format": output_format, "layout_style": layout_style})
+        print(f"🖼️  Output format: {output_format} | Layout: {layout_style}")
 
         reporter.artifact("source_video", input_video, message=f"Source video ready: {input_video}")
         duration = duration or _get_video_duration(input_video)
@@ -2362,6 +2418,7 @@ if __name__ == '__main__':
                 input_video,
                 output_file,
                 output_format=output_format,
+                layout_style=layout_style,
                 progress_callback=lambda percent, message: reporter.progress(percent, message=message, category="render"),
             )
             if not success:
@@ -2407,6 +2464,7 @@ if __name__ == '__main__':
                     input_video,
                     output_file,
                     output_format=output_format,
+                    layout_style=layout_style,
                     progress_callback=lambda percent, message: reporter.progress(percent, message=message, category="render"),
                 )
                 if not success:
@@ -2476,7 +2534,8 @@ if __name__ == '__main__':
                             category="render",
                         )
 
-                    success = _render_clip(clip_temp_path, clip_final_path, output_format=output_format, progress_callback=_clip_progress)
+                    success = _render_clip(clip_temp_path, clip_final_path, output_format=output_format,
+                                           layout_style=layout_style, progress_callback=_clip_progress)
                     if not success:
                         raise RuntimeError(f"Clip render failed for {clip_filename}")
                     reporter.artifact(f"clip_{i + 1}", clip_final_path, message=f"Clip {i + 1} ready: {clip_final_path}")
