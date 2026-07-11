@@ -1134,6 +1134,12 @@ def _render_watermark_rgba(output_width):
 
     wm_width = max(2, int(output_width * WATERMARK_WIDTH_FRACTION))
     image_path = WATERMARK_IMAGE or _find_default_watermark_image()
+    if image_path and not os.path.isabs(image_path) and not os.path.exists(image_path):
+        # Resolve relative WATERMARK_IMAGE paths against the project folder so
+        # the .env entry works regardless of the worker's working directory.
+        candidate = os.path.join(os.path.dirname(os.path.abspath(__file__)), image_path)
+        if os.path.exists(candidate):
+            image_path = candidate
 
     if not WATERMARK_TEXT and image_path:
         img = PILImage.open(image_path).convert("RGBA")

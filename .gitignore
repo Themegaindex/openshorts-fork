@@ -54,3 +54,7 @@ Planundfixes.md
 
 # Local AI dev instructions (not published)
 CLAUDE.md
+
+# Personal branding assets (configured via WATERMARK_IMAGE in .env)
+logo.png
+logo_watermark.png
