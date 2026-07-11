@@ -37,6 +37,7 @@ import shutil
 from typing import List, Optional
 from pydantic import BaseModel
 from clip_selection import build_transcript_windows, snap_clip_to_words
+from render_planning import smooth_scene_strategies
 
 import warnings
 warnings.filterwarnings("ignore", category=UserWarning, module='google.protobuf')
@@ -999,7 +1000,12 @@ class SpeakerTracker:
                 old_cand = next((c for c in current_candidates if c['id'] == self.active_speaker_id), None)
                 if old_cand:
                     return old_cand['box']
-            
+                if self.active_speaker_id is not None:
+                    # Active speaker briefly lost (occlusion / detector
+                    # dropout): hold the camera instead of instantly
+                    # snapping to another person.
+                    return None
+
             self.active_speaker_id = target_id
             self.last_switch_frame = frame_number
             self.locked_counter = 0
@@ -1635,6 +1641,20 @@ def process_video_to_vertical(input_video, final_output_video, progress_callback
         progress_callback(14.0, "Analyzing scene strategy...")
     scene_strategies = analyze_scenes_strategy(input_video, scenes)
     # scene_strategies is a list of 'TRACK' or 'General' corresponding to scenes
+
+    # Interview footage cuts between wide shots and close-ups every few
+    # seconds; raw per-scene decisions made the layout flip constantly.
+    # Smooth the plan: short scenes inherit their predecessor, single-scene
+    # islands are flattened.
+    scene_seconds = [
+        max(0.0, (s_end.get_frames() - s_start.get_frames()) / max(float(fps or 0), 1.0))
+        for s_start, s_end in scenes
+    ]
+    smoothed = smooth_scene_strategies(scene_strategies, scene_seconds)
+    if smoothed != scene_strategies:
+        flips = sum(1 for a, b in zip(smoothed, scene_strategies) if a != b)
+        print(f"   🧘 Stabilized layout plan: {flips} scene(s) smoothed to avoid layout flicker.")
+    scene_strategies = smoothed
     
     print("\n   ✂️ Step 4: Processing video frames...")
     if progress_callback:
@@ -1660,8 +1680,10 @@ def process_video_to_vertical(input_video, final_output_video, progress_callback
     for s_start, s_end in scenes:
         scene_boundaries.append((s_start.get_frames(), s_end.get_frames()))
 
-    # Global tracker for single-person shots
-    speaker_tracker = SpeakerTracker(cooldown_frames=30)
+    # Global tracker for single-person shots. Long cooldown/stabilization:
+    # with two similarly sized faces the pure size score flips easily, and a
+    # 1s cooldown made the camera pendulum between people every second.
+    speaker_tracker = SpeakerTracker(stabilization_frames=25, cooldown_frames=90)
 
     last_progress_emit = time.time()
     try:
