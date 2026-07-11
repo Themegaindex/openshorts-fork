@@ -860,20 +860,18 @@ class SmoothedCameraman:
             
             # SIMPLIFIED LOGIC:
             # 1. Is the target outside the safe zone?
-            if abs(diff) > self.safe_zone_radius:
-                # 2. If yes, move towards it slowly (Linear Speed)
-                # Determine direction
+            if abs(diff) > self.crop_width * 0.6:
+                # Speaker switch or big jump: hard cut like a real editor.
+                # Panning across the studio at 15px/frame read as cheap
+                # wobble — cuts are the norm in edited shorts.
+                self.current_center_x = self.target_center_x
+            elif abs(diff) > self.safe_zone_radius:
+                # 2. Small drift: move towards it slowly (Linear Speed)
                 direction = 1 if diff > 0 else -1
-                
-                # Speed: 2 pixels per frame (Slow pan)
-                # If the distance is HUGE (scene change or fast movement), speed up slightly
-                if abs(diff) > self.crop_width * 0.5:
-                    speed = 15.0 # Fast re-frame
-                else:
-                    speed = 3.0  # Slow, steady pan
-                
+                speed = 3.0  # Slow, steady pan
+
                 self.current_center_x += direction * speed
-                
+
                 # Check if we overshot (prevent oscillation)
                 new_diff = self.target_center_x - self.current_center_x
                 if (direction == 1 and new_diff < 0) or (direction == -1 and new_diff > 0):
@@ -914,6 +912,8 @@ class SpeakerTracker:
         self.stabilization_threshold = stabilization_frames # Frames needed to confirm a new speaker
         self.switch_cooldown = cooldown_frames              # Minimum frames before switching again
         self.last_switch_frame = -1000
+        self.pending_switch_id = None   # Candidate waiting to take over
+        self.pending_switch_count = 0   # Consecutive decisions it has dominated
         
         # ID tracking
         self.next_id = 0
@@ -996,17 +996,29 @@ class SpeakerTracker:
         # 4. Decide Switch
         if best_candidate:
             target_id = best_candidate['id']
-            
+
             if target_id == self.active_speaker_id:
                 self.locked_counter += 1
+                self.pending_switch_id = None
+                self.pending_switch_count = 0
                 return best_candidate['box']
-            
-            # New person
-            if frame_number - self.last_switch_frame < self.switch_cooldown:
-                old_cand = next((c for c in current_candidates if c['id'] == self.active_speaker_id), None)
-                if old_cand:
-                    return old_cand['box']
-                if self.active_speaker_id is not None:
+
+            # New person wants focus. Adopt instantly only when nobody is
+            # active yet; otherwise require SUSTAINED dominance (the
+            # stabilization threshold) on top of the switch cooldown — a
+            # single score flip must never move the camera.
+            if self.active_speaker_id is not None:
+                if target_id == self.pending_switch_id:
+                    self.pending_switch_count += 1
+                else:
+                    self.pending_switch_id = target_id
+                    self.pending_switch_count = 1
+
+                within_cooldown = frame_number - self.last_switch_frame < self.switch_cooldown
+                if within_cooldown or self.pending_switch_count < self.stabilization_threshold:
+                    old_cand = next((c for c in current_candidates if c['id'] == self.active_speaker_id), None)
+                    if old_cand:
+                        return old_cand['box']
                     # Active speaker briefly lost (occlusion / detector
                     # dropout): hold the camera instead of instantly
                     # snapping to another person.
@@ -1015,8 +1027,10 @@ class SpeakerTracker:
             self.active_speaker_id = target_id
             self.last_switch_frame = frame_number
             self.locked_counter = 0
+            self.pending_switch_id = None
+            self.pending_switch_count = 0
             return best_candidate['box']
-            
+
         return None
 
 def detect_face_candidates(frame):
@@ -1046,6 +1060,28 @@ def detect_face_candidates(frame):
         })
             
     return candidates
+
+def detect_person_boxes(frame):
+    """
+    All YOLO person boxes as [x, y, w, h]. Full-body detection stays reliable
+    on wide shots where the short-range face model misses distant or profile
+    faces — this is the robust people-count signal for the layout decision.
+    """
+    results = model(frame, verbose=False, classes=[0])
+    boxes = []
+    for result in results or []:
+        for box in result.boxes:
+            try:
+                conf = float(box.conf[0])
+            except (TypeError, IndexError):
+                conf = 1.0
+            if conf < 0.5:
+                continue
+            x1, y1, x2, y2 = [int(i) for i in box.xyxy[0]]
+            if x2 > x1 and y2 > y1:
+                boxes.append([x1, y1, x2 - x1, y2 - y1])
+    return boxes
+
 
 def detect_person_yolo(frame):
     """
@@ -1254,14 +1290,15 @@ def analyze_scenes_strategy(video_path, scenes, layout_style="smart"):
     frame_width = int(cap.get(cv2.CAP_PROP_FRAME_WIDTH) or 0) or 1920
 
     for start, end in tqdm(scenes, desc="   Analyzing Scenes"):
-        # Sample 3 frames (start, middle, end)
-        frames_to_check = [
-            start.get_frames() + 5,
-            int((start.get_frames() + end.get_frames()) / 2),
-            end.get_frames() - 5
-        ]
+        # Sample 5 frames spread across the scene for a stable statistic.
+        span = max(0, end.get_frames() - start.get_frames())
+        frames_to_check = sorted({
+            int(start.get_frames() + span * fraction)
+            for fraction in (0.1, 0.3, 0.5, 0.7, 0.9)
+        })
 
         face_samples = []
+        person_samples = []
         for f_idx in frames_to_check:
             cap.set(cv2.CAP_PROP_POS_FRAMES, f_idx)
             ret, frame = cap.read()
@@ -1269,8 +1306,12 @@ def analyze_scenes_strategy(video_path, scenes, layout_style="smart"):
 
             candidates = detect_face_candidates(frame)
             face_samples.append([c['box'] for c in candidates])
+            person_samples.append(detect_person_boxes(frame))
 
-        strategy, centers = decide_scene_layout(face_samples, frame_width, layout_style=layout_style)
+        strategy, centers = decide_scene_layout(
+            face_samples, frame_width, layout_style=layout_style,
+            person_samples=person_samples,
+        )
         strategies.append(strategy)
         split_centers.append(centers)
 
@@ -1689,9 +1730,11 @@ def process_video_to_vertical(input_video, final_output_video, progress_callback
         print(f"   🧘 Stabilized layout plan: {flips} scene(s) smoothed to avoid layout flicker.")
     # Scenes that inherited SPLIT during smoothing need face centers too.
     scene_strategies, scene_split_centers = inherit_split_centers(smoothed, scene_split_centers)
-    if any(s == 'SPLIT' for s in scene_strategies):
-        split_count = sum(1 for s in scene_strategies if s == 'SPLIT')
-        print(f"   🪟 Split layout active in {split_count}/{len(scene_strategies)} scene(s).")
+    layout_counts = {}
+    for s in scene_strategies:
+        layout_counts[s] = layout_counts.get(s, 0) + 1
+    layout_summary = ", ".join(f"{count}x{name}" for name, count in sorted(layout_counts.items()))
+    print(f"   🎛️ Layout plan ({layout_style}): {layout_summary}")
     
     print("\n   ✂️ Step 4: Processing video frames...")
     if progress_callback:

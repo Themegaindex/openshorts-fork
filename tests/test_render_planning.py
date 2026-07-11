@@ -135,3 +135,67 @@ class TestInheritSplitCenters:
         out_strats, out_centers = inherit_split_centers(strategies, centers)
         assert out_strats == ["SPLIT", "SPLIT"]
         assert out_centers[0] == [(300, 100), (1200, 100)]
+
+
+from render_planning import person_head_center
+
+
+def _person(x, y, w=300, h=800):
+    return (x, y, w, h)
+
+
+class TestPersonHeadCenter:
+    def test_head_is_top_fifth_centered(self):
+        cx, cy = person_head_center((100, 200, 300, 800))
+        assert cx == 250          # horizontally centered
+        assert cy == 200 + 160    # 20% down the body
+
+
+class TestDecideSceneLayoutWithPersons:
+    def test_wide_shot_two_persons_no_faces_splits(self):
+        # The podcast bug: face model sees nothing on the wide shot, but YOLO
+        # reliably sees two people -> must SPLIT with head centers.
+        faces = [[], [], [], [], []]
+        persons = [[_person(200, 300), _person(1300, 320)]] * 5
+        strategy, centers = decide_scene_layout(faces, 1920, layout_style="smart", person_samples=persons)
+        assert strategy == "SPLIT"
+        assert centers[0][0] < centers[1][0]
+        assert centers[0] == person_head_center(_person(200, 300))
+
+    def test_flaky_single_face_with_two_persons_splits(self):
+        # Face detector occasionally catches one face — person count wins.
+        faces = [[(250, 350, 90, 90)], [], [(250, 350, 90, 90)], [], []]
+        persons = [[_person(200, 300), _person(1300, 320)]] * 5
+        strategy, _ = decide_scene_layout(faces, 1920, layout_style="smart", person_samples=persons)
+        assert strategy == "SPLIT"
+
+    def test_single_person_no_face_tracks(self):
+        faces = [[], [], []]
+        persons = [[_person(800, 200)]] * 3
+        assert decide_scene_layout(faces, 1920, layout_style="smart", person_samples=persons)[0] == "TRACK"
+
+    def test_three_persons_general(self):
+        faces = [[], [], []]
+        persons = [[_person(100, 300), _person(800, 300), _person(1500, 300)]] * 3
+        assert decide_scene_layout(faces, 1920, layout_style="smart", person_samples=persons)[0] == "GENERAL"
+
+    def test_two_persons_too_close_general(self):
+        faces = [[], [], []]
+        persons = [[_person(800, 300), _person(950, 300)]] * 3  # heads ~150px apart
+        assert decide_scene_layout(faces, 1920, layout_style="smart", person_samples=persons)[0] == "GENERAL"
+
+    def test_nothing_detected_general(self):
+        assert decide_scene_layout([[], [], []], 1920, layout_style="smart", person_samples=[[], [], []])[0] == "GENERAL"
+
+    def test_faces_preferred_over_person_boxes_for_centers(self):
+        # When both signals see two people, centers come from the faces.
+        faces = [[(240, 340, 100, 100), (1340, 360, 100, 100)]] * 3
+        persons = [[_person(200, 300), _person(1300, 320)]] * 3
+        strategy, centers = decide_scene_layout(faces, 1920, layout_style="smart", person_samples=persons)
+        assert strategy == "SPLIT"
+        assert centers[0] == (290.0, 390.0)  # face center, not person head point
+
+    def test_zoom_style_ignores_person_samples(self):
+        faces = [[(250, 350, 90, 90)]] * 3
+        persons = [[_person(200, 300), _person(1300, 320)]] * 3
+        assert decide_scene_layout(faces, 1920, layout_style="zoom", person_samples=persons)[0] == "TRACK"

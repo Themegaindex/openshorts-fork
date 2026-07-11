@@ -56,10 +56,29 @@ def _median(values):
     return ordered[len(ordered) // 2]
 
 
-def decide_scene_layout(face_samples, frame_width, layout_style="smart"):
-    """Pick the layout for one scene from sampled face boxes.
+def person_head_center(box):
+    """Approximate head position inside a full-person YOLO box (x, y, w, h):
+    horizontally centered, vertically ~20% from the top of the body."""
+    x, y, w, h = box
+    return (x + w / 2.0, y + h * 0.2)
+
+
+def _median_pair_centers(pair_samples):
+    """Median left/right center over samples that each contain two centers."""
+    lefts = [pair[0] for pair in pair_samples]
+    rights = [pair[1] for pair in pair_samples]
+    left_center = (_median([c[0] for c in lefts]), _median([c[1] for c in lefts]))
+    right_center = (_median([c[0] for c in rights]), _median([c[1] for c in rights]))
+    return left_center, right_center
+
+
+def decide_scene_layout(face_samples, frame_width, layout_style="smart", person_samples=None):
+    """Pick the layout for one scene from sampled detections.
 
     face_samples: one list of (x, y, w, h) face boxes per sampled frame.
+    person_samples: optional matching lists of full-person YOLO boxes — the
+    robust signal on wide shots, where the short-range face model misses
+    distant or profile faces entirely.
     layout_style: "smart" (split two-person shots), "zoom" (legacy
     TRACK/GENERAL behavior) or "wide" (always the blurred wide layout).
 
@@ -79,26 +98,35 @@ def decide_scene_layout(face_samples, frame_width, layout_style="smart"):
         return "TRACK", None
 
     # --- smart ---
-    if avg < 0.5:
-        return "GENERAL", None
-    if avg > 2.5:
+    p_samples = [s for s in (person_samples or []) if s is not None]
+    n_people = _median([len(s) for s in p_samples]) if p_samples else None
+
+    if avg > 2.5 or (n_people is not None and n_people >= 3):
         # Three or more people: a two-panel split would drop someone.
         return "GENERAL", None
 
-    two_face_samples = [s for s in samples if len(s) >= 2]
-    if avg >= 1.5 and len(two_face_samples) * 2 >= max(1, len(samples)):
-        # Two people visible in most samples: try the stacked split look.
-        lefts, rights = [], []
-        for s in two_face_samples:
-            left, right = _two_largest_centers(s)
-            lefts.append(left)
-            rights.append(right)
-        left_center = (_median([c[0] for c in lefts]), _median([c[1] for c in lefts]))
-        right_center = (_median([c[0] for c in rights]), _median([c[1] for c in rights]))
-        if right_center[0] - left_center[0] >= frame_width * SPLIT_MIN_SEPARATION_FRACTION:
-            return "SPLIT", [left_center, right_center]
+    if n_people == 2 or avg >= 1.5:
+        # Two people in the shot: try the stacked split look. Prefer face
+        # positions; fall back to head points of the person boxes when the
+        # face detector misses them (typical for wide podcast shots).
+        two_face_samples = [s for s in samples if len(s) >= 2]
+        centers = None
+        if two_face_samples and len(two_face_samples) * 2 >= max(1, len(samples)):
+            centers = _median_pair_centers([_two_largest_centers(s) for s in two_face_samples])
+        else:
+            two_person_samples = [s for s in p_samples if len(s) >= 2]
+            if two_person_samples:
+                pairs = []
+                for s in two_person_samples:
+                    largest = sorted(s, key=lambda b: b[2] * b[3], reverse=True)[:2]
+                    pairs.append(sorted((person_head_center(b) for b in largest), key=lambda c: c[0]))
+                centers = _median_pair_centers(pairs)
+        if centers and centers[1][0] - centers[0][0] >= frame_width * SPLIT_MIN_SEPARATION_FRACTION:
+            return "SPLIT", [centers[0], centers[1]]
         return "GENERAL", None
 
+    if avg < 0.5 and (n_people is None or n_people < 1):
+        return "GENERAL", None
     return "TRACK", None
 
 
