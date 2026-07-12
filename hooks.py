@@ -5,6 +5,7 @@ import subprocess
 import urllib.request
 import uuid
 from PIL import Image, ImageDraw, ImageFont, ImageFilter
+from video_formats import EVEN_PAD_FILTER
 
 FONT_URL = "https://github.com/googlefonts/noto-fonts/raw/main/hinted/ttf/NotoSerif/NotoSerif-Bold.ttf"
 FONT_DIR = "fonts"
@@ -337,9 +338,9 @@ def add_hook_to_video(video_path, text, output_path, position="top", font_scale=
             'ffmpeg', '-y',
             '-i', video_path,
             '-i', img_path,
-            '-filter_complex', f"[0:v][1:v]overlay={overlay_x}:{overlay_y}",
+            '-filter_complex', f"[0:v][1:v]overlay={overlay_x}:{overlay_y},{EVEN_PAD_FILTER}",
             '-c:a', 'copy',
-            '-c:v', 'libx264', '-preset', 'fast', '-crf', '22',
+            '-c:v', 'libx264', '-preset', 'fast', '-crf', '22', '-pix_fmt', 'yuv420p',
             '-movflags', '+faststart',
             output_path
         ]

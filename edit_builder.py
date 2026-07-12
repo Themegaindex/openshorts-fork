@@ -94,16 +94,24 @@ def normalize_edits(edits, duration, has_captions=False):
 def _zoom_term(entry, fps):
     """One additive term of the zoompan z expression for a zoom-type edit."""
     start_frame = int(round(entry["start"] * fps))
-    end_frame = max(start_frame + 2, int(round(entry["end"] * fps)))
-    span = end_frame - start_frame
+    end_frame_exclusive = max(start_frame + 2, int(round(entry["end"] * fps)))
+    last_frame = end_frame_exclusive - 1
+    span = end_frame_exclusive - start_frame
     strength = entry["strength"]
-    gate = f"between(on,{start_frame},{end_frame})"
+    # FFmpeg's between() includes both ends. Gating through end-1 makes edit
+    # ranges half-open [start, end), so touching zooms never stack for a frame.
+    gate = f"between(on,{start_frame},{last_frame})"
     if entry["type"] == "zoom_in":
-        # Linear ramp from 0 to full strength across the segment.
-        return f"{strength:.4f}*clip((on-{start_frame})/{span},0,1)*{gate}"
+        # Ease in, hold, then ease back to 1.0 before the segment ends. The old
+        # one-way ramp snapped abruptly back to the base crop on the next frame.
+        ramp = max(1.0, span * 0.30)
+        return (
+            f"{strength:.4f}*min(clip((on-{start_frame})/{ramp:.1f},0,1),"
+            f"clip(({end_frame_exclusive}-on)/{ramp:.1f},0,1))*{gate}"
+        )
     if entry["type"] == "zoom_pulse":
         # Triangular in-and-out peaking mid-segment.
-        mid = (start_frame + end_frame) / 2.0
+        mid = (start_frame + end_frame_exclusive) / 2.0
         half = max(span / 2.0, 1.0)
         return f"{strength:.4f}*(1-abs((on-{mid:.1f})/{half:.1f}))*{gate}"
     # punch_in: constant tighter framing for the whole segment.

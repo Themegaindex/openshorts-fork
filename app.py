@@ -14,7 +14,7 @@ import zipfile
 import hashlib
 from datetime import datetime, timezone
 from dotenv import load_dotenv
-from typing import Dict, Optional, List
+from typing import Dict, Optional, List, Literal
 from contextlib import asynccontextmanager
 from fastapi import FastAPI, UploadFile, File, Form, HTTPException, Request, Header, BackgroundTasks
 from fastapi.middleware.cors import CORSMiddleware
@@ -24,6 +24,7 @@ from fastapi.responses import HTMLResponse, JSONResponse, FileResponse
 from starlette.background import BackgroundTask
 from pydantic import BaseModel, Field
 from s3_uploader import upload_job_artifacts, list_all_clips, upload_actor_to_s3, list_actor_gallery, upload_video_to_gallery, list_video_gallery
+from video_formats import CANONICAL_OUTPUT_FORMATS, normalize_output_format
 
 load_dotenv()
 
@@ -825,7 +826,11 @@ def _build_result_from_metadata(job_id: str, metadata_path: str, output_dir: str
 
 def _build_result_from_video_artifacts(job_id: str, output_dir: str) -> Optional[dict]:
     fallback_candidates = sorted(
-        glob.glob(os.path.join(output_dir, "*_vertical.mp4")),
+        {
+            path
+            for output_format in CANONICAL_OUTPUT_FORMATS
+            for path in glob.glob(os.path.join(output_dir, f"*_{output_format}.mp4"))
+        },
         key=lambda p: os.path.getmtime(p),
         reverse=True,
     )
@@ -834,7 +839,9 @@ def _build_result_from_video_artifacts(job_id: str, output_dir: str) -> Optional
 
     fallback_path = fallback_candidates[0]
     fallback_filename = os.path.basename(fallback_path)
-    fallback_title = os.path.splitext(fallback_filename)[0].replace("_vertical", "").replace("_", " ").strip()
+    fallback_stem = os.path.splitext(fallback_filename)[0]
+    fallback_stem = re.sub(r"_(?:vertical|square|original)$", "", fallback_stem)
+    fallback_title = fallback_stem.replace("_", " ").strip()
 
     return {
         'clips': [
@@ -1356,8 +1363,7 @@ async def process_endpoint(
         output_format = body.get("output_format")
         layout_style = body.get("layout_style")
 
-    if output_format not in ("vertical", "horizontal", "square"):
-        output_format = "auto"
+    output_format = normalize_output_format(output_format)
     if layout_style not in ("zoom", "wide"):
         layout_style = "smart"
 
@@ -1621,27 +1627,31 @@ async def _edit_clip_locked(req: EditRequest, x_gemini_key: Optional[str]):
         raise HTTPException(status_code=400, detail="Job result not available")
     if req.clip_index >= len(job['result']['clips']):
         raise HTTPException(status_code=404, detail="Clip not found")
+
+    output_dir = os.path.join(OUTPUT_DIR, req.job_id)
+    json_files = glob.glob(os.path.join(output_dir, "*_metadata.json"))
+    if not json_files:
+        raise HTTPException(status_code=404, detail="Metadata not found")
+    with open(json_files[0], 'r', encoding='utf-8') as f:
+        metadata = json.load(f)
+    metadata_clips = metadata.get('shorts', [])
+    if req.clip_index >= len(metadata_clips):
+        raise HTTPException(status_code=404, detail="Clip metadata not found")
+    clip_data = metadata_clips[req.clip_index]
         
     try:
-        # Resolve Input Path: Prefer explict input_filename from frontend (chaining edits)
-        if req.input_filename:
-            # Security: Ensure just a filename, no paths
-            safe_name = os.path.basename(req.input_filename)
-            input_path = os.path.join(OUTPUT_DIR, req.job_id, safe_name)
-            filename = safe_name
-        else:
-            # Fallback to original clip
-            clip = job['result']['clips'][req.clip_index]
-            filename = clip['video_url'].split('/')[-1]
-            input_path = os.path.join(OUTPUT_DIR, req.job_id, filename)
-        
-        if not os.path.exists(input_path):
-             raise HTTPException(status_code=404, detail=f"Video file not found: {input_path}")
+        requested_filename = os.path.basename(req.input_filename) if req.input_filename else None
+        layer_store, layer_entry = _resolve_clip_layer_state(
+            output_dir, req.clip_index, clip_data, requested_filename,
+        )
+        input_path = _clean_source_path(output_dir, layer_entry)
+        filename = os.path.basename(input_path)
 
-        # Define output path for edited video
+        # Auto Edit works on pixels without presentation layers. Stored
+        # subtitles/hooks are composed once onto the edited clean source later.
         operation_id = uuid.uuid4().hex[:12]
         edited_filename = f"edited_{operation_id}_{filename}"
-        output_path = os.path.join(OUTPUT_DIR, req.job_id, edited_filename)
+        edited_clean_path = os.path.join(output_dir, edited_filename)
         
         # Run editing in a thread to avoid blocking main loop
         # Since VideoEditor uses blocking calls (subprocess, API wait)
@@ -1651,7 +1661,7 @@ async def _edit_clip_locked(req: EditRequest, x_gemini_key: Optional[str]):
             # SAFE FILE RENAMING STRATEGY (Avoid UnicodeEncodeError in Docker)
             # Create a safe ASCII filename in the same directory
             safe_filename = f"temp_input_{req.job_id}_{operation_id}.mp4"
-            safe_input_path = os.path.join(OUTPUT_DIR, req.job_id, safe_filename)
+            safe_input_path = os.path.join(output_dir, safe_filename)
             
             # Copy original file to safe path
             # (Copy is safer than rename if something crashes, we keep original)
@@ -1674,23 +1684,20 @@ async def _edit_clip_locked(req: EditRequest, x_gemini_key: Optional[str]):
                 # Load transcript from metadata
                 transcript = None
                 try:
-                    meta_files = glob.glob(os.path.join(OUTPUT_DIR, req.job_id, "*_metadata.json"))
-                    if meta_files:
-                        with open(meta_files[0], 'r', encoding='utf-8') as f:
-                            data = json.load(f)
-                            transcript = _load_transcript_for_job(os.path.join(OUTPUT_DIR, req.job_id), metadata=data)
+                    transcript = _load_transcript_for_job(output_dir, metadata=metadata)
                 except Exception as e:
                     print(f"⚠️ Could not load transcript for editing context: {e}")
 
-                # 3. Get Plan (Filter String)
-                # Burned-in captions/hooks must survive the edit: zooming would
-                # crop or shift them, so tell the editor to avoid zoom effects.
-                has_captions = ("subtitled_" in filename) or ("hook_" in filename)
-                filter_data = editor.get_ffmpeg_filter(vid_file, duration, fps=fps, width=width, height=height, transcript=transcript, has_captions=has_captions)
+                # The input is clean, so visual zoom effects are safe; layers
+                # will be rendered in final screen coordinates afterwards.
+                filter_data = editor.get_ffmpeg_filter(
+                    vid_file, duration, fps=fps, width=width, height=height,
+                    transcript=transcript, has_captions=False,
+                )
                 
                 # 4. Apply
                 # Use safe output name first
-                safe_output_path = os.path.join(OUTPUT_DIR, req.job_id, f"temp_output_{req.job_id}_{operation_id}.mp4")
+                safe_output_path = os.path.join(output_dir, f"temp_output_{req.job_id}_{operation_id}.mp4")
                 editor.apply_edits(safe_input_path, safe_output_path, filter_data)
                 
                 # Move result to final destination (rename works even if dest name has unicode if filesystem supports it, 
@@ -1699,7 +1706,7 @@ async def _edit_clip_locked(req: EditRequest, x_gemini_key: Optional[str]):
                 # If filename has unicode, output_path has unicode.
                 # Let's hope shutil.move / os.rename works.
                 if os.path.exists(safe_output_path):
-                    shutil.move(safe_output_path, output_path)
+                    shutil.move(safe_output_path, edited_clean_path)
                 
                 return filter_data
             finally:
@@ -1710,17 +1717,29 @@ async def _edit_clip_locked(req: EditRequest, x_gemini_key: Optional[str]):
         # Run in thread pool
         loop = asyncio.get_event_loop()
         plan = await loop.run_in_executor(None, run_edit)
-        
-        # Update clip URL in the job result? 
-        # Or return new URL and let frontend handle it?
-        # Updating job result allows persistence if page refreshes.
-        
-        new_video_url = f"/videos/{req.job_id}/{edited_filename}"
-        _update_clip_version(req.job_id, req.clip_index, new_video_url)
-        
-        # Start a new "edited" clip entry or just update the current one?
-        # Let's update the current one's video_url but keep backup?
-        # Or return the new URL to the frontend to display.
+
+        candidate_entry = _entry_with_clean_source(layer_entry, edited_filename)
+        if candidate_entry.get("subtitle") or candidate_entry.get("hook"):
+            output_filename = _layered_filename(candidate_entry, uuid.uuid4().hex[:12])
+            rendered_path = os.path.join(output_dir, output_filename)
+            await loop.run_in_executor(
+                None, _render_stored_layers, output_dir, candidate_entry, rendered_path,
+            )
+        else:
+            output_filename = edited_filename
+
+        candidate_entry["current_render"] = output_filename
+        layer_store["clips"][str(req.clip_index)] = candidate_entry
+        _save_clip_layers(output_dir, layer_store)
+
+        new_video_url = f"/videos/{req.job_id}/{output_filename}"
+        _update_clip_version(
+            req.job_id,
+            req.clip_index,
+            new_video_url,
+            metadata_path=json_files[0],
+            metadata=metadata,
+        )
         
         return {
             "success": True, 
@@ -1734,13 +1753,14 @@ async def _edit_clip_locked(req: EditRequest, x_gemini_key: Optional[str]):
         print(f"❌ Edit Error: {e}")
         raise HTTPException(status_code=500, detail="Auto Edit failed. Check the server logs for details.")
 
-# --- Clip layer state: single-pass rendering for subtitles + hook ---------
-# Subtitle and hook settings are remembered per base clip (clip_layers.json in
-# the job folder). Every subtitle/hook request re-renders BOTH layers from the
-# base clip in ONE FFmpeg pass — no more encode-of-an-encode chains (double
-# wait time + stacked generation loss).
+# --- Clip layer state: clean source + single-pass presentation layers ------
+# Version 2 is indexed by logical clip, not by an ever-changing filename.
+# Auto Edit and Translation always consume ``clean_source``; subtitle + hook
+# are then composed exactly once. This prevents a rendered subtitle from being
+# baked into the next edit and receiving a second subtitle on top.
 
 CLIP_LAYERS_FILE = "clip_layers.json"
+CLIP_LAYERS_VERSION = 2
 HOOK_SIZE_SCALE = {"S": 0.8, "M": 1.0, "L": 1.3}
 
 
@@ -1759,10 +1779,10 @@ def _load_clip_layers(output_dir: str) -> dict:
 
 def _save_clip_layers(output_dir: str, layers: dict):
     try:
-        with open(os.path.join(output_dir, CLIP_LAYERS_FILE), "w", encoding="utf-8") as f:
-            json.dump(layers, f, indent=2, ensure_ascii=False)
+        _safe_write_json(os.path.join(output_dir, CLIP_LAYERS_FILE), layers)
     except Exception as e:
         print(f"⚠️ Failed to persist clip layers: {e}")
+        raise
 
 
 def _strip_layer_prefixes(filename: str, output_dir: str) -> str:
@@ -1774,6 +1794,173 @@ def _strip_layer_prefixes(filename: str, output_dir: str) -> str:
             break
         filename = m.group(1)
     return filename
+
+
+def _new_clip_layer_store(legacy_entries: Optional[dict] = None) -> dict:
+    return {
+        "version": CLIP_LAYERS_VERSION,
+        "clips": {},
+        # Filename-keyed v1 entries cannot all be assigned to clip indices
+        # without metadata for every clip. Keep the unresolved entries until
+        # each logical clip is touched and migrated lazily.
+        "legacy_entries": dict(legacy_entries or {}),
+    }
+
+
+def _filename_from_clip(clip_data: dict, requested_filename: Optional[str] = None) -> str:
+    if requested_filename:
+        return os.path.basename(requested_filename)
+    current = os.path.basename(str(clip_data.get("video_url") or "").split("/")[-1])
+    return current or os.path.basename(str(clip_data.get("output_filename") or ""))
+
+
+def _resolve_clip_layer_state(
+    output_dir: str,
+    clip_index: int,
+    clip_data: dict,
+    requested_filename: Optional[str] = None,
+):
+    """Return ``(store, entry)`` and lazily migrate filename-keyed v1 data.
+
+    Migration first unwraps presentation-layer prefixes when the underlying
+    clean edit/translation still exists, then falls back to metadata's
+    original ``output_filename``. Unrelated v1 entries remain available for
+    later clips instead of being discarded by the first migrated operation.
+    """
+    raw = _load_clip_layers(output_dir)
+    current_filename = _filename_from_clip(clip_data, requested_filename)
+    original_filename = os.path.basename(str(clip_data.get("output_filename") or ""))
+    stripped_current = _strip_layer_prefixes(current_filename, output_dir)
+    stripped_path = os.path.join(output_dir, stripped_current)
+    current_path = os.path.join(output_dir, current_filename)
+    recovered_layered_derivative = (
+        stripped_current != current_filename
+        and os.path.exists(stripped_path)
+    )
+    current_is_clean_derivative = (
+        current_filename.startswith(("edited_", "translated_"))
+        and "subtitled_" not in current_filename
+        and not re.search(r"(?:^|_)hook_(?:[A-Za-z0-9-]+_)?", current_filename)
+        and os.path.exists(current_path)
+    )
+    fallback_clean = stripped_current if recovered_layered_derivative else ""
+    if not fallback_clean and current_is_clean_derivative:
+        fallback_clean = current_filename
+    if not fallback_clean and os.path.exists(os.path.join(output_dir, original_filename)):
+        fallback_clean = original_filename
+    if not fallback_clean:
+        fallback_clean = stripped_current
+
+    if raw.get("version") == CLIP_LAYERS_VERSION and isinstance(raw.get("clips"), dict):
+        store = raw
+        legacy_entries = store.get("legacy_entries")
+        if not isinstance(legacy_entries, dict):
+            legacy_entries = {}
+            store["legacy_entries"] = legacy_entries
+    else:
+        legacy_entries = {
+            key: value
+            for key, value in (raw.items() if isinstance(raw, dict) else [])
+            if isinstance(value, dict)
+        }
+        store = _new_clip_layer_store(legacy_entries)
+        legacy_entries = store["legacy_entries"]
+
+    clip_key = str(clip_index)
+    if clip_key not in store["clips"]:
+        legacy_entry = None
+        matched_legacy_key = None
+        for key in (stripped_current, fallback_clean, original_filename, current_filename):
+            candidate = legacy_entries.get(key) if key else None
+            if isinstance(candidate, dict):
+                legacy_entry = candidate
+                matched_legacy_key = key
+                break
+        if legacy_entry:
+            store["clips"][clip_key] = {
+                "clean_source": fallback_clean,
+                "current_render": current_filename,
+                "subtitle": legacy_entry.get("subtitle"),
+                "hook": legacy_entry.get("hook"),
+            }
+            legacy_entries.pop(matched_legacy_key, None)
+
+    entry = store["clips"].setdefault(clip_key, {
+        "clean_source": fallback_clean,
+        "current_render": current_filename,
+        "subtitle": None,
+        "hook": None,
+    })
+    if not entry.get("clean_source"):
+        entry["clean_source"] = fallback_clean or current_filename
+    if not entry.get("current_render"):
+        entry["current_render"] = current_filename or entry["clean_source"]
+    entry.setdefault("subtitle", None)
+    entry.setdefault("hook", None)
+    return store, entry
+
+
+def _clean_source_path(output_dir: str, entry: dict) -> str:
+    clean_source = os.path.basename(str(entry.get("clean_source") or ""))
+    path = os.path.join(output_dir, clean_source)
+    if not clean_source or not os.path.exists(path):
+        raise HTTPException(status_code=404, detail=f"Clean video source not found: {path}")
+    return path
+
+
+def _stored_subtitle_layer(output_dir: str, entry: dict):
+    subtitle = entry.get("subtitle") or {}
+    filename = os.path.basename(str(subtitle.get("path") or ""))
+    path = os.path.join(output_dir, filename)
+    if filename and os.path.exists(path):
+        return path, subtitle.get("burn_opts") or {}
+    return None, None
+
+
+def _render_stored_layers(output_dir: str, entry: dict, output_path: str):
+    """Render the entry's current subtitle/hook once from its clean source."""
+    input_path = _clean_source_path(output_dir, entry)
+    subtitle_path, subtitle_burn_opts = _stored_subtitle_layer(output_dir, entry)
+    hook_png, hook_x, hook_y = _prepare_hook_layer(input_path, entry.get("hook"))
+    if not subtitle_path and not hook_png:
+        raise ValueError("No renderable subtitle or hook layer")
+    try:
+        burn_layers(
+            input_path,
+            output_path,
+            subtitle_path=subtitle_path,
+            burn_opts=subtitle_burn_opts,
+            hook_png=hook_png,
+            hook_x=hook_x,
+            hook_y=hook_y,
+            hook_entrance=True,
+        )
+    finally:
+        if hook_png and os.path.exists(hook_png):
+            os.remove(hook_png)
+
+
+def _layered_filename(entry: dict, generation_id: str) -> str:
+    clean_source = os.path.basename(str(entry.get("clean_source") or "clip.mp4"))
+    prefix = "subtitled" if entry.get("subtitle") else "hook"
+    return f"{prefix}_{generation_id}_{clean_source}"
+
+
+def _entry_with_clean_source(
+    entry: dict,
+    clean_source: str,
+    *,
+    clear_subtitle: bool = False,
+    transcript_source: Optional[str] = None,
+) -> dict:
+    """Pure state transition shared by edit and translation workflows."""
+    updated = dict(entry)
+    updated["clean_source"] = os.path.basename(clean_source)
+    if clear_subtitle:
+        updated["subtitle"] = None
+    if transcript_source is not None:
+        updated["transcript_source"] = transcript_source
+    return updated
 
 
 def _prepare_hook_layer(input_path: str, hook_layer: Optional[dict]):
@@ -1795,18 +1982,18 @@ def _prepare_hook_layer(input_path: str, hook_layer: Optional[dict]):
 class SubtitleRequest(BaseModel):
     job_id: str
     clip_index: int = Field(ge=0)
-    position: str = "bottom" # top, middle, bottom
-    font_size: int = 16
-    font_name: str = "Verdana"
-    font_color: str = "#FFFFFF"
-    border_color: str = "#000000"
-    border_width: int = 2
-    bg_color: str = "#000000"
-    bg_opacity: float = 0.0
-    style: str = "classic"  # classic (uniform color) or karaoke (word highlight)
-    highlight_color: str = "#FFD700"
-    effect: str = "none"  # none | glow | pop | box (karaoke only)
-    base_opacity: float = 1.0  # opacity of non-active words (dimmed modern look)
+    position: Literal["top", "middle", "bottom"] = "bottom"
+    font_size: int = Field(default=16, ge=10, le=200)
+    font_name: str = Field(default="Verdana", min_length=1, max_length=100)
+    font_color: str = Field(default="#FFFFFF", pattern=r"^#[0-9A-Fa-f]{6}$")
+    border_color: str = Field(default="#000000", pattern=r"^#[0-9A-Fa-f]{6}$")
+    border_width: int = Field(default=2, ge=0, le=10)
+    bg_color: str = Field(default="#000000", pattern=r"^#[0-9A-Fa-f]{6}$")
+    bg_opacity: float = Field(default=0.0, ge=0.0, le=1.0)
+    style: Literal["classic", "karaoke"] = "classic"
+    highlight_color: str = Field(default="#FFD700", pattern=r"^#[0-9A-Fa-f]{6}$")
+    effect: Literal["none", "glow", "pop", "box", "bounce"] = "none"
+    base_opacity: float = Field(default=1.0, ge=0.05, le=1.0)
     uppercase: bool = False
     input_filename: Optional[str] = None
 
@@ -1844,28 +2031,15 @@ async def _add_subtitles_locked(req: SubtitleRequest):
         
     clip_data = clips[req.clip_index]
     
-    # Video Path
-    if req.input_filename:
-        # Use chained file
-        filename = os.path.basename(req.input_filename)
-    else:
-        # Fallback to standard naming
-        filename = clip_data.get('video_url', '').split('/')[-1]
-        if not filename:
-             base_name = os.path.basename(json_files[0]).replace('_metadata.json', '')
-             filename = f"{base_name}_clip_{req.clip_index+1}.mp4"
-
-    # Re-subtitling must replace previous layers instead of burning over
-    # them — in BOTH paths (bulk picks the file itself, the single-clip modal
-    # sends its current file explicitly): walk subtitled_/hook_ prefixes back
-    # to the base file, then re-render all stored layers in one pass.
-    filename = _strip_layer_prefixes(filename, output_dir)
-
-    input_path = os.path.join(output_dir, filename)
-    if not os.path.exists(input_path):
-        # Try looking for edited version if url implied it?
-        # Just fail if not found.
-        raise HTTPException(status_code=404, detail=f"Video file not found: {input_path}")
+    requested_filename = os.path.basename(req.input_filename) if req.input_filename else None
+    if not requested_filename and not _filename_from_clip(clip_data):
+        base_name = os.path.basename(json_files[0]).replace('_metadata.json', '')
+        requested_filename = f"{base_name}_clip_{req.clip_index + 1}.mp4"
+    layer_store, layer_entry = _resolve_clip_layer_state(
+        output_dir, req.clip_index, clip_data, requested_filename,
+    )
+    input_path = _clean_source_path(output_dir, layer_entry)
+    clean_filename = os.path.basename(input_path)
         
     # Define outputs
     generation_id = uuid.uuid4().hex[:12]
@@ -1882,15 +2056,14 @@ async def _add_subtitles_locked(req: SubtitleRequest):
         effect=req.effect, base_opacity=req.base_opacity, uppercase=req.uppercase,
     )
 
-    # Output video
-    # We create a new file "subtitled_..."
-    output_filename = f"subtitled_{generation_id}_{filename}"
-    output_path = os.path.join(output_dir, output_filename)
-
     try:
         # 1. Generate subtitle file (SRT, or karaoke ASS with word highlight)
-        # Check if this is a dubbed video - if so, transcribe it fresh
-        is_dubbed = filename.startswith("translated_")
+        # Dubbed media must be transcribed from its current audio. The marker
+        # survives later clean-source edits through the v2 layer entry.
+        is_dubbed = (
+            layer_entry.get("transcript_source") == "media"
+            or "translated_" in clean_filename
+        )
 
         if is_dubbed:
             print(f"🎙️ Dubbed video detected, transcribing audio for subtitles...")
@@ -1909,30 +2082,30 @@ async def _add_subtitles_locked(req: SubtitleRequest):
         if not success:
              raise HTTPException(status_code=400, detail="No words found for this clip range.")
 
-        # 2. Remember this subtitle layer for the base clip, then burn ALL
-        # stored layers (subtitles + existing hook) in ONE encode pass.
+        # 2. Compose ALL presentation layers from the clean source in one pass.
+        # State is only committed after FFmpeg succeeds.
         burn_opts = dict(alignment=req.position, fontsize=req.font_size,
                          font_name=req.font_name, font_color=req.font_color,
                          border_color=req.border_color, border_width=req.border_width,
                          bg_color=req.bg_color, bg_opacity=req.bg_opacity)
-        layers = _load_clip_layers(output_dir)
-        layer_entry = layers.setdefault(filename, {})
-        layer_entry["subtitle"] = {"path": srt_filename, "burn_opts": burn_opts}
-        _save_clip_layers(output_dir, layers)
+        candidate_entry = dict(layer_entry)
+        candidate_entry["subtitle"] = {
+            "path": srt_filename,
+            "burn_opts": burn_opts,
+            "style": req.style,
+            "effect": req.effect,
+        }
+        output_filename = _layered_filename(candidate_entry, generation_id)
+        output_path = os.path.join(output_dir, output_filename)
 
         def run_burn():
-            hook_png, hook_x, hook_y = _prepare_hook_layer(input_path, layer_entry.get("hook"))
-            try:
-                burn_layers(input_path, output_path,
-                            subtitle_path=srt_path, burn_opts=burn_opts,
-                            hook_png=hook_png, hook_x=hook_x, hook_y=hook_y,
-                            hook_entrance=True)
-            finally:
-                if hook_png and os.path.exists(hook_png):
-                    os.remove(hook_png)
+            _render_stored_layers(output_dir, candidate_entry, output_path)
 
         loop = asyncio.get_event_loop()
         await loop.run_in_executor(None, run_burn)
+        candidate_entry["current_render"] = output_filename
+        layer_store["clips"][str(req.clip_index)] = candidate_entry
+        _save_clip_layers(output_dir, layer_store)
         
     except HTTPException:
         raise
@@ -2031,63 +2204,30 @@ async def _add_hook_locked(req: HookRequest):
         
     clip_data = clips[req.clip_index]
     
-    # Video Path
-    if req.input_filename:
-        filename = os.path.basename(req.input_filename)
-    else:
-        filename = clip_data.get('video_url', '').split('/')[-1]
-        if not filename:
-             base_name = os.path.basename(json_files[0]).replace('_metadata.json', '')
-             filename = f"{base_name}_clip_{req.clip_index+1}.mp4"
-         
-    # Re-hooking or hooking a subtitled clip must not re-encode an encode:
-    # walk back to the base file and render all stored layers in one pass.
-    filename = _strip_layer_prefixes(filename, output_dir)
+    requested_filename = os.path.basename(req.input_filename) if req.input_filename else None
+    if not requested_filename and not _filename_from_clip(clip_data):
+        base_name = os.path.basename(json_files[0]).replace('_metadata.json', '')
+        requested_filename = f"{base_name}_clip_{req.clip_index + 1}.mp4"
+    layer_store, layer_entry = _resolve_clip_layer_state(
+        output_dir, req.clip_index, clip_data, requested_filename,
+    )
+    _clean_source_path(output_dir, layer_entry)
 
-    input_path = os.path.join(output_dir, filename)
-    if not os.path.exists(input_path):
-        raise HTTPException(status_code=404, detail=f"Video file not found: {input_path}")
-
-    # Output video
     generation_id = uuid.uuid4().hex[:12]
-    output_filename = f"hook_{generation_id}_{filename}"
+    candidate_entry = dict(layer_entry)
+    candidate_entry["hook"] = {"text": req.text, "position": req.position, "size": req.size}
+    output_filename = _layered_filename(candidate_entry, generation_id)
     output_path = os.path.join(output_dir, output_filename)
 
-    font_scale = HOOK_SIZE_SCALE.get(req.size, 1.0)
-
-    # Remember this hook layer for the base clip.
-    layers = _load_clip_layers(output_dir)
-    layer_entry = layers.setdefault(filename, {})
-    layer_entry["hook"] = {"text": req.text, "position": req.position, "size": req.size}
-    _save_clip_layers(output_dir, layers)
-
-    # Reuse the stored subtitle layer (if its file still exists) so hook and
-    # subtitles land in the same single encode.
-    subtitle_path = None
-    subtitle_burn_opts = None
-    sub_layer = layer_entry.get("subtitle") or {}
-    if sub_layer.get("path"):
-        candidate = os.path.join(output_dir, os.path.basename(sub_layer["path"]))
-        if os.path.exists(candidate):
-            subtitle_path = candidate
-            subtitle_burn_opts = sub_layer.get("burn_opts")
-
     try:
-        # Run in thread pool
         def run_hook():
-            hook_png, hook_x, hook_y = prepare_hook_overlay(
-                input_path, req.text, position=req.position, font_scale=font_scale)
-            try:
-                burn_layers(input_path, output_path,
-                            subtitle_path=subtitle_path, burn_opts=subtitle_burn_opts,
-                            hook_png=hook_png, hook_x=hook_x, hook_y=hook_y,
-                            hook_entrance=True)
-            finally:
-                if hook_png and os.path.exists(hook_png):
-                    os.remove(hook_png)
+            _render_stored_layers(output_dir, candidate_entry, output_path)
 
         loop = asyncio.get_event_loop()
         await loop.run_in_executor(None, run_hook)
+        candidate_entry["current_render"] = output_filename
+        layer_store["clips"][str(req.clip_index)] = candidate_entry
+        _save_clip_layers(output_dir, layer_store)
         
     except HTTPException:
         raise
@@ -2154,31 +2294,28 @@ async def _translate_clip_locked(req: TranslateRequest, x_elevenlabs_key: Option
 
     clip_data = clips[req.clip_index]
 
-    # Video Path
-    if req.input_filename:
-        filename = os.path.basename(req.input_filename)
-    else:
-        filename = clip_data.get('video_url', '').split('/')[-1]
-        if not filename:
-             base_name = os.path.basename(json_files[0]).replace('_metadata.json', '')
-             filename = f"{base_name}_clip_{req.clip_index+1}.mp4"
-
-    input_path = os.path.join(output_dir, filename)
-    if not os.path.exists(input_path):
-        raise HTTPException(status_code=404, detail=f"Video file not found: {input_path}")
+    requested_filename = os.path.basename(req.input_filename) if req.input_filename else None
+    if not requested_filename and not _filename_from_clip(clip_data):
+        base_name = os.path.basename(json_files[0]).replace('_metadata.json', '')
+        requested_filename = f"{base_name}_clip_{req.clip_index + 1}.mp4"
+    layer_store, layer_entry = _resolve_clip_layer_state(
+        output_dir, req.clip_index, clip_data, requested_filename,
+    )
+    input_path = _clean_source_path(output_dir, layer_entry)
+    filename = os.path.basename(input_path)
 
     # Output video with language suffix
     base, ext = os.path.splitext(filename)
     generation_id = uuid.uuid4().hex[:12]
-    output_filename = f"translated_{req.target_language}_{generation_id}_{base}{ext}"
-    output_path = os.path.join(output_dir, output_filename)
+    translated_filename = f"translated_{req.target_language}_{generation_id}_{base}{ext}"
+    translated_path = os.path.join(output_dir, translated_filename)
 
     try:
         # Run translation in thread pool (blocking API calls)
         def run_translate():
             return translate_video(
                 video_path=input_path,
-                output_path=output_path,
+                output_path=translated_path,
                 target_language=req.target_language,
                 api_key=x_elevenlabs_key,
                 source_language=req.source_language,
@@ -2186,6 +2323,28 @@ async def _translate_clip_locked(req: TranslateRequest, x_elevenlabs_key: Option
 
         loop = asyncio.get_event_loop()
         await loop.run_in_executor(None, run_translate)
+
+        # A translation changes the spoken language: old subtitles are no
+        # longer valid. Keep the hook, and mark future subtitles to transcribe
+        # the dubbed audio instead of using original metadata timestamps.
+        candidate_entry = _entry_with_clean_source(
+            layer_entry,
+            translated_filename,
+            clear_subtitle=True,
+            transcript_source="media",
+        )
+        if candidate_entry.get("hook"):
+            output_filename = _layered_filename(candidate_entry, uuid.uuid4().hex[:12])
+            rendered_path = os.path.join(output_dir, output_filename)
+            await loop.run_in_executor(
+                None, _render_stored_layers, output_dir, candidate_entry, rendered_path,
+            )
+        else:
+            output_filename = translated_filename
+
+        candidate_entry["current_render"] = output_filename
+        layer_store["clips"][str(req.clip_index)] = candidate_entry
+        _save_clip_layers(output_dir, layer_store)
 
     except HTTPException:
         raise

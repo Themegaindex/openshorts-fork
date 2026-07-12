@@ -2,6 +2,9 @@ import os
 import re
 import subprocess
 import sys
+import math
+from decimal import Decimal, InvalidOperation, ROUND_HALF_UP
+from video_formats import EVEN_PAD_FILTER
 
 
 _STDIO_CONFIGURED = False
@@ -165,22 +168,83 @@ def _collect_word_blocks(transcript, clip_start, clip_end, max_chars=20, max_dur
     from old jobs on disk store unmerged tokens (the leading space is still
     present, so the boundary signal survives).
     """
+    try:
+        clip_start = float(clip_start)
+        clip_end = float(clip_end)
+    except (TypeError, ValueError):
+        return []
+    if not math.isfinite(clip_start) or not math.isfinite(clip_end) or clip_end <= clip_start:
+        return []
+
     flat_words = []
     for segment in transcript.get('segments', []):
-        flat_words.extend(segment.get('words', []))
-    flat_words = merge_continuation_words(flat_words)
+        segment_words = segment.get('words', []) if isinstance(segment, dict) else []
+        if isinstance(segment_words, list):
+            flat_words.extend(segment_words)
+
+    # Old or merged transcript files can contain out-of-order/repeated tokens.
+    # Normalize the timeline once before block building so every subtitle path
+    # receives sorted, clipped and de-duplicated word data.
+    timeline = []
+    for order, word_info in enumerate(flat_words):
+        if not isinstance(word_info, dict):
+            continue
+        try:
+            start = float(word_info.get('start'))
+            end = float(word_info.get('end'))
+        except (TypeError, ValueError):
+            continue
+        if not math.isfinite(start) or not math.isfinite(end):
+            continue
+        if end <= clip_start or start >= clip_end:
+            continue
+        raw_word = str(word_info.get('word', ''))
+        if not _normalize_subtitle_word(raw_word):
+            continue
+        start = min(clip_end, max(clip_start, start))
+        end = min(clip_end, max(start, end))
+        timeline.append({"word": raw_word, "start": start, "end": end, "_order": order})
+
+    timeline.sort(key=lambda item: (item['start'], item['end'], item['_order']))
+    deduped = []
+    for item in timeline:
+        key = _normalize_subtitle_word(item['word']).casefold()
+        duplicate = any(
+            key == previous['_key']
+            and abs(item['start'] - previous['start']) <= 0.020
+            and abs(item['end'] - previous['end']) <= 0.020
+            for previous in deduped[-4:]
+        )
+        if duplicate:
+            continue
+        item['_key'] = key
+        deduped.append(item)
+
+    flat_words = merge_continuation_words(deduped)
 
     words = []
-    for word_info in flat_words:
-        if word_info.get('end', 0) > clip_start and word_info.get('start', 0) < clip_end:
-            cleaned_word = _normalize_subtitle_word(word_info.get('word', ''))
-            if not cleaned_word:
-                continue
-            words.append({
-                'word': cleaned_word,
-                'start': max(0, word_info['start'] - clip_start),
-                'end': max(0, word_info['end'] - clip_start),
-            })
+    for index, word_info in enumerate(flat_words):
+        cleaned_word = _normalize_subtitle_word(word_info.get('word', ''))
+        if not cleaned_word:
+            continue
+        start = max(0.0, word_info['start'] - clip_start)
+        end = max(start, word_info['end'] - clip_start)
+        # A zero-length final token otherwise disappears entirely. Give it one
+        # ASS tick when room exists; adjacent words still share their boundary.
+        if end <= start:
+            end = min(clip_end - clip_start, start + 0.01)
+        words.append({'word': cleaned_word, 'start': start, 'end': end})
+
+    # Whisper occasionally overlaps adjacent word timestamps. Inside one block
+    # the next start already wins, but at a line/block boundary the previous
+    # word's raw end used to overlap the next Dialogue event. Clamp each end to
+    # the following start so the whole clip is globally non-overlapping.
+    for index in range(len(words) - 1):
+        next_start = words[index + 1]['start']
+        words[index]['end'] = max(
+            words[index]['start'],
+            min(words[index]['end'], next_start),
+        )
 
     blocks = []
     current_block = []
@@ -228,16 +292,27 @@ def generate_srt(transcript, clip_start, clip_end, output_path, max_chars=20, ma
     return True
 
 
+def _ass_centiseconds(seconds):
+    """Round seconds to an integer ASS tick with correct second/minute carry."""
+    try:
+        value = Decimal(str(seconds))
+    except (InvalidOperation, TypeError, ValueError):
+        value = Decimal(0)
+    value = max(Decimal(0), value)
+    return int((value * 100).quantize(Decimal("1"), rounding=ROUND_HALF_UP))
+
+
+def _format_ass_centiseconds(total_centiseconds):
+    total_centiseconds = max(0, int(total_centiseconds))
+    total_seconds, centis = divmod(total_centiseconds, 100)
+    hours, remainder = divmod(total_seconds, 3600)
+    minutes, secs = divmod(remainder, 60)
+    return f"{hours}:{minutes:02d}:{secs:02d}.{centis:02d}"
+
+
 def _ass_time(seconds):
     """Format seconds as ASS timestamp H:MM:SS.cc (centiseconds)."""
-    seconds = max(0, seconds)
-    hours = int(seconds // 3600)
-    minutes = int((seconds % 3600) // 60)
-    secs = int(seconds % 60)
-    centis = int(round((seconds - int(seconds)) * 100))
-    if centis >= 100:
-        centis = 99
-    return f"{hours}:{minutes:02d}:{secs:02d}.{centis:02d}"
+    return _format_ass_centiseconds(_ass_centiseconds(seconds))
 
 
 def _hex_to_ass_inline_color(hex_color, fallback="FFFFFF"):
@@ -326,27 +401,27 @@ def generate_ass(transcript, clip_start, clip_end, output_path,
     highlight_inline = _hex_to_ass_inline_color(highlight_color, fallback="FFD700")
 
     # Inline override tags for the active word; {\r} after it resets to the
-    # (dimmed) style so the rest of the block stays untouched.
-    if effect == "glow":
-        glow_bord = max(3, int(outline_width) + 2)
-        active_prefix = (f"{{\\c&HFFFFFF&\\3c{highlight_inline}"
-                         f"\\bord{glow_bord}\\blur4}}")
-    elif effect == "box":
-        box_bord = max(4, int(outline_width) + 3)
-        active_prefix = (f"{{\\c&HFFFFFF&\\3c{highlight_inline}"
-                         f"\\bord{box_bord}\\blur0}}")
-    elif effect == "pop":
-        active_prefix = (f"{{\\c{highlight_inline}"
-                         f"\\fscx75\\fscy75\\t(0,120,\\fscx112\\fscy112)}}")
-    elif effect == "bounce":
-        # Subtle spring feel: one clean overshoot (85% -> 108%) that settles
-        # at 100%. Deliberately gentle — bigger swings read as jittery.
-        active_prefix = (f"{{\\c{highlight_inline}"
-                         f"\\fscx85\\fscy85"
-                         f"\\t(0,90,\\fscx108\\fscy108)"
-                         f"\\t(90,180,\\fscx100\\fscy100)}}")
-    else:
-        active_prefix = f"{{\\c{highlight_inline}}}"
+    # (dimmed) style so the rest of the block stays untouched. Scale effects
+    # are duration-aware: restarting a 180 ms spring on a 20 ms word caused
+    # the visible micro-strobe reported for Bounce subtitles.
+    def active_prefix_for(duration_ms):
+        if effect == "glow":
+            glow_bord = max(3, int(outline_width) + 2)
+            return (f"{{\\c&HFFFFFF&\\3c{highlight_inline}"
+                    f"\\bord{glow_bord}\\blur4}}")
+        if effect == "box":
+            box_bord = max(4, int(outline_width) + 3)
+            return (f"{{\\c&HFFFFFF&\\3c{highlight_inline}"
+                    f"\\bord{box_bord}\\blur0}}")
+        if effect == "pop" and duration_ms >= 120:
+            return (f"{{\\c{highlight_inline}"
+                    f"\\fscx75\\fscy75\\t(0,120,\\fscx112\\fscy112)}}")
+        if effect == "bounce" and duration_ms >= 180:
+            return (f"{{\\c{highlight_inline}"
+                    f"\\fscx85\\fscy85"
+                    f"\\t(0,90,\\fscx108\\fscy108)"
+                    f"\\t(90,180,\\fscx100\\fscy100)}}")
+        return f"{{\\c{highlight_inline}}}"
 
     header = (
         "[Script Info]\n"
@@ -370,13 +445,20 @@ def generate_ass(transcript, clip_start, clip_end, output_path,
 
     events = []
     for block in blocks:
+        # Quantize each boundary once. Adjacent events therefore share the
+        # exact same integer tick and can never overlap after formatting.
+        boundaries = [_ass_centiseconds(block[0]['start'])]
+        boundaries.extend(_ass_centiseconds(word['start']) for word in block[1:])
+        boundaries.append(_ass_centiseconds(block[-1]['end']))
+        for boundary_index in range(1, len(boundaries)):
+            boundaries[boundary_index] = max(boundaries[boundary_index], boundaries[boundary_index - 1])
+
         for i, word in enumerate(block):
-            # Event runs until the next word starts (no flicker in gaps);
-            # the last word holds until the block ends.
-            ev_start = block[0]['start'] if i == 0 else word['start']
-            ev_end = block[i + 1]['start'] if i < len(block) - 1 else block[-1]['end']
-            if ev_end <= ev_start:
+            start_cs = boundaries[i]
+            end_cs = boundaries[i + 1]
+            if end_cs <= start_cs:
                 continue
+            active_prefix = active_prefix_for((end_cs - start_cs) * 10)
 
             parts = []
             for j, other in enumerate(block):
@@ -389,7 +471,8 @@ def generate_ass(transcript, clip_start, clip_end, output_path,
                     parts.append(text)
 
             events.append(
-                f"Dialogue: 0,{_ass_time(ev_start)},{_ass_time(ev_end)},Default,,0,0,0,,{' '.join(parts)}"
+                f"Dialogue: 0,{_format_ass_centiseconds(start_cs)},"
+                f"{_format_ass_centiseconds(end_cs)},Default,,0,0,0,,{' '.join(parts)}"
             )
 
     if not events:
@@ -462,7 +545,7 @@ def build_subtitle_filter(srt_path, alignment=2, fontsize=16,
     if align_lower == 'top':
         ass_alignment = 6
     elif align_lower == 'middle':
-        ass_alignment = 10
+        ass_alignment = 5
     elif align_lower == 'bottom':
         ass_alignment = 2
 
@@ -552,21 +635,25 @@ def build_layer_command(video_path, output_path, subtitle_filter=None,
     if subtitle_filter and hook_png:
         cmd.extend([
             '-filter_complex',
-            f"{hook_pre}[0:v]{subtitle_filter}[v0];[v0]{hook_src}overlay={int(hook_x)}:{y_value}[vout]",
+            f"{hook_pre}[0:v]{subtitle_filter}[v0];"
+            f"[v0]{hook_src}overlay={int(hook_x)}:{y_value}[v1];"
+            f"[v1]{EVEN_PAD_FILTER}[vout]",
             '-map', '[vout]', '-map', '0:a?',
         ])
     elif hook_png:
         cmd.extend([
             '-filter_complex',
-            f"{hook_pre}[0:v]{hook_src}overlay={int(hook_x)}:{y_value}[vout]",
+            f"{hook_pre}[0:v]{hook_src}overlay={int(hook_x)}:{y_value}[v1];"
+            f"[v1]{EVEN_PAD_FILTER}[vout]",
             '-map', '[vout]', '-map', '0:a?',
         ])
     else:
-        cmd.extend(['-vf', subtitle_filter])
+        cmd.extend(['-vf', f"{subtitle_filter},{EVEN_PAD_FILTER}"])
 
     cmd.extend([
         '-c:a', 'copy',
         '-c:v', 'libx264', '-preset', 'fast', '-crf', '23',
+        '-pix_fmt', 'yuv420p',
         '-movflags', '+faststart',
         output_path
     ])

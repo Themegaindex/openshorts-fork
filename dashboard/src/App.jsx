@@ -605,13 +605,13 @@ function App() {
         body = JSON.stringify({
           url: data.payload,
           force_low_quality: forceLowQuality,
-          output_format: data.outputFormat || 'auto',
+          output_format: data.outputFormat || 'vertical',
           layout_style: data.layoutStyle || 'smart',
         });
       } else {
         const formData = new FormData();
         formData.append('file', data.payload);
-        formData.append('output_format', data.outputFormat || 'auto');
+        formData.append('output_format', data.outputFormat || 'vertical');
         formData.append('layout_style', data.layoutStyle || 'smart');
         body = formData;
       }

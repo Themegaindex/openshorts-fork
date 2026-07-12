@@ -1,15 +1,13 @@
 import React, { useState } from 'react';
-import { Youtube, Upload, FileVideo, X, Sparkles, Smartphone, Monitor, Square, Rows2, UserRound, GalleryHorizontal } from 'lucide-react';
+import { Youtube, Upload, FileVideo, X, Sparkles, Smartphone, Monitor, Square, UserRound, GalleryHorizontal, SlidersHorizontal, ChevronDown } from 'lucide-react';
 
 const FORMAT_OPTIONS = [
-    { id: 'auto', label: 'Auto', hint: 'Smart detect', Icon: Sparkles },
     { id: 'vertical', label: '9:16', hint: 'Shorts / Reels', Icon: Smartphone },
-    { id: 'horizontal', label: '16:9', hint: 'Original wide', Icon: Monitor },
+    { id: 'original', label: 'Original', hint: 'Source ratio', Icon: Monitor },
     { id: 'square', label: '1:1', hint: 'Square feed', Icon: Square },
 ];
 
 const LAYOUT_OPTIONS = [
-    { id: 'smart', label: 'Smart Split', hint: '2 people stacked', Icon: Rows2 },
     { id: 'zoom', label: 'Speaker Zoom', hint: 'Always one person', Icon: UserRound },
     { id: 'wide', label: 'Wide', hint: 'Full width + blur', Icon: GalleryHorizontal },
 ];
@@ -18,8 +16,9 @@ export default function MediaInput({ onProcess, isProcessing }) {
     const [mode, setMode] = useState('url'); // 'url' | 'file'
     const [url, setUrl] = useState('');
     const [file, setFile] = useState(null);
-    const [outputFormat, setOutputFormat] = useState('auto');
+    const [outputFormat, setOutputFormat] = useState('vertical');
     const [layoutStyle, setLayoutStyle] = useState('smart');
+    const [showAdvancedLayout, setShowAdvancedLayout] = useState(false);
 
     const handleSubmit = (e) => {
         e.preventDefault();
@@ -113,7 +112,7 @@ export default function MediaInput({ onProcess, isProcessing }) {
                 {/* Output format */}
                 <div className="mt-5">
                     <div className="text-xs font-bold text-zinc-400 uppercase tracking-wider mb-2">Output Format</div>
-                    <div className="grid grid-cols-4 gap-2">
+                    <div className="grid grid-cols-3 gap-2">
                         {FORMAT_OPTIONS.map(({ id, label, hint, Icon }) => (
                             <button
                                 key={id}
@@ -133,27 +132,62 @@ export default function MediaInput({ onProcess, isProcessing }) {
                 </div>
 
                 {/* Reframing layout — only relevant when the output gets reframed */}
-                {outputFormat !== 'horizontal' && (
+                {outputFormat !== 'original' && (
                     <div className="mt-4">
-                        <div className="text-xs font-bold text-zinc-400 uppercase tracking-wider mb-2">Layout</div>
-                        <div className="grid grid-cols-3 gap-2">
-                            {LAYOUT_OPTIONS.map(({ id, label, hint, Icon }) => (
-                                <button
-                                    key={id}
-                                    type="button"
-                                    onClick={() => setLayoutStyle(id)}
-                                    className={`flex flex-col items-center gap-1 py-2.5 px-1 rounded-xl border text-center transition-all ${layoutStyle === id
-                                        ? 'border-primary/60 bg-primary/10 text-white'
-                                        : 'border-white/5 bg-white/5 text-zinc-400 hover:border-white/15 hover:text-white'
-                                        }`}
-                                >
-                                    <Icon size={16} className={layoutStyle === id ? 'text-primary' : ''} />
-                                    <span className="text-xs font-bold">{label}</span>
-                                    <span className="text-[9px] text-zinc-500 leading-tight">{hint}</span>
-                                </button>
-                            ))}
+                        <div className="flex items-center justify-between mb-2">
+                            <div className="text-xs font-bold text-zinc-400 uppercase tracking-wider">Layout</div>
+                            <button
+                                type="button"
+                                onClick={() => setShowAdvancedLayout((open) => !open)}
+                                className="flex items-center gap-1.5 text-[10px] font-semibold text-zinc-500 hover:text-zinc-300 transition-colors"
+                                aria-expanded={showAdvancedLayout}
+                            >
+                                <SlidersHorizontal size={12} />
+                                Advanced
+                                <ChevronDown size={12} className={`transition-transform ${showAdvancedLayout ? 'rotate-180' : ''}`} />
+                            </button>
                         </div>
-                    </div>
+
+                        <button
+                            type="button"
+                            onClick={() => setLayoutStyle('smart')}
+                            className={`w-full flex items-center gap-3 rounded-xl border px-3 py-2.5 text-left transition-all ${layoutStyle === 'smart'
+                                ? 'border-primary/60 bg-primary/10'
+                                : 'border-white/5 bg-white/5 hover:border-white/15'
+                                }`}
+                        >
+                            <div className={`grid h-8 w-8 place-items-center rounded-lg ${layoutStyle === 'smart' ? 'bg-primary/15 text-primary' : 'bg-white/5 text-zinc-500'}`}>
+                                <Sparkles size={16} />
+                            </div>
+                            <div className="min-w-0 flex-1">
+                                <div className="flex items-center gap-2">
+                                    <span className="text-xs font-bold text-white">Smart</span>
+                                    <span className="rounded-full bg-emerald-400/10 px-1.5 py-0.5 text-[8px] font-bold uppercase tracking-wider text-emerald-400">Recommended</span>
+                                </div>
+                                <p className="mt-0.5 text-[10px] leading-snug text-zinc-500">1 person cropped · 2 split · groups wide</p>
+                            </div>
+                        </button>
+
+                        {showAdvancedLayout && (
+                            <div className="grid grid-cols-2 gap-2 mt-2 animate-[fadeIn_0.2s_ease-out]">
+                                {LAYOUT_OPTIONS.map(({ id, label, hint, Icon }) => (
+                                    <button
+                                        key={id}
+                                        type="button"
+                                        onClick={() => setLayoutStyle(id)}
+                                        className={`flex flex-col items-center gap-1 py-2.5 px-1 rounded-xl border text-center transition-all ${layoutStyle === id
+                                            ? 'border-primary/60 bg-primary/10 text-white'
+                                            : 'border-white/5 bg-white/5 text-zinc-400 hover:border-white/15 hover:text-white'
+                                            }`}
+                                    >
+                                        <Icon size={16} className={layoutStyle === id ? 'text-primary' : ''} />
+                                        <span className="text-xs font-bold">{label}</span>
+                                        <span className="text-[9px] text-zinc-500 leading-tight">{hint}</span>
+                                    </button>
+                                ))}
+                            </div>
+                        )}
+                        </div>
                 )}
 
                 <button

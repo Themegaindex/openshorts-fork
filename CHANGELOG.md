@@ -3,10 +3,27 @@
 All notable changes to OpenShorts are documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 
-## [Unreleased] — 2026-07-10
+## [Unreleased] — 2026-07-12
+
+### Added
+
+- **Evidence-based Smart layout planning**: scene analysis now combines MediaPipe faces with YOLO people counts and duration-aware sampling. Stable single-person shots use a calm crop, stable two-person shots use a fixed Opus-style split, and groups or uncertain shots stay wide. Per-scene logs include time ranges, people counts, confidence and the number of artificial camera switches.
+- **Safe Bounce captions**: short words only change highlight color; scale animation runs only when the event is long enough to complete cleanly.
+- Regression coverage for real Clip-10 layout planning, HOLD/LOST tracking semantics, portrait/square/original geometry, legacy layer migration, subtitle timing, odd-size H.264 output and full-render recovery.
+
+### Changed
+
+- **Clear output formats**: 9:16 is the explicit default, with Original and 1:1 as alternatives. Legacy `auto` and `horizontal` job values remain compatible. Speaker Zoom and Wide remain available under Advanced while Smart is the recommended default.
+- **Clip layer state v2** tracks one clean source and one composed render per logical clip. Auto Edit operates on clean pixels and reapplies subtitle/hook layers once; translation clears obsolete language captions while retaining hooks.
+- All H.264 re-encode paths produce broadly compatible `yuv420p` output and safely pad odd source dimensions to even axes.
 
 ### Fixed
 
+- **Review follow-ups**: layered legacy edits/translations are recovered before the original, every unmigrated v1 clip entry is retained, interrupted replacement detections restart their stabilization timer, Square/Original fallback renders recover after missing metadata, and forced Wide/Zoom layouts skip detector work that cannot affect their result.
+- **Smart Split stability**: long/high-confidence split scenes are no longer overwritten by neighboring layouts; detector HOLD can no longer be bypassed by YOLO fallback; tracker thresholds use seconds rather than assumed frame counts; tracker state resets at real source cuts.
+- **Subtitle flicker and duplication**: word timelines are sorted, clipped and de-duplicated, ASS centisecond carry and adjacent boundaries are exact, overlapping Whisper words cannot overlap across blocks, and subtitle/hook/edit/translation sequences always render presentation layers once from the clean source.
+- **Format geometry**: two-axis crops prevent portrait-to-square stretching, GENERAL uses cover/contain geometry without negative slices, and square two-person layouts render side by side.
+- **Auto Edit transitions**: touching zoom effects use non-overlapping frame ranges and `zoom_in` eases back to the base crop instead of snapping at the final frame.
 - **GitHub Actions backend tests**: CI now installs the complete lightweight test dependency set, so application-level regression tests can import the FastAPI backend without pulling in the large video/ML stack. Removed three obsolete manual hook verification scripts; the maintained automated pytest suite remains intact.
 - **Persistent clip versions**: Auto Edit now updates the in-memory result, metadata and `job_state.json` atomically, matching subtitles, hooks and translations. Refresh, ZIP download, resume and social publishing now use the exact version shown in the UI.
 - **Safe stalled-job resume**: a heartbeat-stalled worker is terminated before it can keep a queue slot or race a resumed worker. Execution IDs prevent an old supervisor from overwriting the new queued state, and resume now lets the backend select the correct checkpoint instead of always forcing Gemini analysis.

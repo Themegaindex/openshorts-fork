@@ -73,7 +73,23 @@ class TestBuildFilterString:
         assert "zoompan=" in filter_string
         assert "s=1080x1920" in filter_string
         assert "d=1" in filter_string
-        assert "between(on,60,120)" in filter_string
+        assert "between(on,60,119)" in filter_string
+
+    def test_touching_zoom_ranges_are_half_open(self):
+        filter_string, applied = build_filter_string(
+            [_edit("punch_in", 1, 2), _edit("punch_in", 2, 3)],
+            duration=10, fps=30, width=1080, height=1920,
+        )
+        assert len(applied) == 2
+        assert "between(on,30,59)" in filter_string
+        assert "between(on,60,89)" in filter_string
+
+    def test_zoom_in_eases_back_out_before_end(self):
+        filter_string, _ = build_filter_string(
+            [_edit("zoom_in", 1, 3, 0.1)],
+            duration=10, fps=30, width=1080, height=1920,
+        )
+        assert "min(clip((on-30)/18.0,0,1),clip((90-on)/18.0,0,1))" in filter_string
 
     def test_no_bare_comparison_operators(self):
         edits = [

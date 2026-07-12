@@ -9,6 +9,7 @@ from google.genai import types
 from pydantic import BaseModel
 
 from edit_builder import build_filter_string
+from video_formats import with_even_padding
 
 
 class EditDecision(BaseModel):
@@ -372,11 +373,13 @@ class VideoEditor:
 
         print(f"🎬 Executing AI Filter: {filter_string}")
 
+        output_filter = with_even_padding(filter_string)
+
         cmd = [
             'ffmpeg', '-y',
             '-i', input_path,
-            '-vf', filter_string,
-            '-c:v', 'libx264', '-preset', 'fast', '-crf', '22',
+            '-vf', output_filter,
+            '-c:v', 'libx264', '-preset', 'fast', '-crf', '22', '-pix_fmt', 'yuv420p',
             '-c:a', 'copy',
             '-movflags', '+faststart',
             output_path

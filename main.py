@@ -38,10 +38,21 @@ from typing import List, Optional
 from pydantic import BaseModel
 from clip_selection import build_transcript_windows, snap_clip_to_words
 from render_planning import (
-    decide_scene_layout,
+    SceneLayoutDecision,
+    decide_scene_layout_detailed,
     inherit_split_centers,
+    sample_scene_frames,
     smooth_scene_strategies,
     split_crop_windows,
+)
+from speaker_tracking import SpeakerTracker, TargetState
+from video_formats import (
+    CANONICAL_OUTPUT_FORMATS,
+    EVEN_PAD_FILTER,
+    OUTPUT_FORMAT_CHOICES,
+    fit_even_output_dimensions,
+    normalize_output_format,
+    output_aspect_ratio,
 )
 
 import warnings
@@ -52,7 +63,7 @@ load_dotenv()
 
 # --- Constants ---
 ASPECT_RATIO = 9 / 16
-OUTPUT_FORMATS = ("auto", "vertical", "horizontal", "square")
+OUTPUT_FORMATS = CANONICAL_OUTPUT_FORMATS
 LAYOUT_STYLES = ("smart", "zoom", "wide")
 # Watermark: subtle centered overlay so rendered clips can't be re-uploaded as
 # someone else's work. Configure via env; WATERMARK_TEXT wins over the image.
@@ -829,17 +840,27 @@ class SmoothedCameraman:
         # Initial State
         self.current_center_x = video_width / 2
         self.target_center_x = video_width / 2
+        self.current_center_y = video_height / 2
+        self.target_center_y = video_height / 2
 
-        # Calculate crop dimensions once
-        self.crop_height = video_height
-        self.crop_width = int(self.crop_height * aspect_ratio)
-        if self.crop_width > video_width:
-             self.crop_width = video_width
-             self.crop_height = int(self.crop_width / aspect_ratio)
+        # Calculate a crop that fits on BOTH axes. The previous implementation
+        # always returned the full source height even when a narrow portrait
+        # source required a shorter crop, which stretched portrait/square video.
+        self.crop_width, self.crop_height = fit_even_output_dimensions(
+            video_width, video_height, aspect_ratio,
+        )
              
         # Safe Zone: 20% of the video width
         # As long as the target is within this zone relative to current center, DO NOT MOVE.
         self.safe_zone_radius = self.crop_width * 0.25
+        self.safe_zone_radius_y = self.crop_height * 0.25
+
+    def reset(self):
+        """Return to a neutral crop before acquiring a target in a new shot."""
+        self.current_center_x = self.video_width / 2
+        self.target_center_x = self.video_width / 2
+        self.current_center_y = self.video_height / 2
+        self.target_center_y = self.video_height / 2
 
     def update_target(self, face_box):
         """
@@ -848,6 +869,20 @@ class SmoothedCameraman:
         if face_box:
             x, y, w, h = face_box
             self.target_center_x = x + w / 2
+            self.target_center_y = y + h / 2
+
+    @staticmethod
+    def _advance_axis(current, target, crop_span, safe_radius):
+        diff = target - current
+        if abs(diff) > crop_span * 0.6:
+            return target
+        if abs(diff) > safe_radius:
+            direction = 1 if diff > 0 else -1
+            next_value = current + direction * 3.0
+            if (direction > 0 and next_value > target) or (direction < 0 and next_value < target):
+                return target
+            return next_value
+        return current
     
     def get_crop_box(self, force_snap=False):
         """
@@ -855,29 +890,16 @@ class SmoothedCameraman:
         """
         if force_snap:
             self.current_center_x = self.target_center_x
+            self.current_center_y = self.target_center_y
         else:
-            diff = self.target_center_x - self.current_center_x
-            
-            # SIMPLIFIED LOGIC:
-            # 1. Is the target outside the safe zone?
-            if abs(diff) > self.crop_width * 0.6:
-                # Speaker switch or big jump: hard cut like a real editor.
-                # Panning across the studio at 15px/frame read as cheap
-                # wobble — cuts are the norm in edited shorts.
-                self.current_center_x = self.target_center_x
-            elif abs(diff) > self.safe_zone_radius:
-                # 2. Small drift: move towards it slowly (Linear Speed)
-                direction = 1 if diff > 0 else -1
-                speed = 3.0  # Slow, steady pan
-
-                self.current_center_x += direction * speed
-
-                # Check if we overshot (prevent oscillation)
-                new_diff = self.target_center_x - self.current_center_x
-                if (direction == 1 and new_diff < 0) or (direction == -1 and new_diff > 0):
-                    self.current_center_x = self.target_center_x
-            
-            # If inside safe zone, DO NOTHING (Stationary Camera)
+            self.current_center_x = self._advance_axis(
+                self.current_center_x, self.target_center_x,
+                self.crop_width, self.safe_zone_radius,
+            )
+            self.current_center_y = self._advance_axis(
+                self.current_center_y, self.target_center_y,
+                self.crop_height, self.safe_zone_radius_y,
+            )
                 
         # Clamp center
         half_crop = self.crop_width / 2
@@ -886,6 +908,12 @@ class SmoothedCameraman:
             self.current_center_x = half_crop
         if self.current_center_x + half_crop > self.video_width:
             self.current_center_x = self.video_width - half_crop
+
+        half_crop_y = self.crop_height / 2
+        if self.current_center_y - half_crop_y < 0:
+            self.current_center_y = half_crop_y
+        if self.current_center_y + half_crop_y > self.video_height:
+            self.current_center_y = self.video_height - half_crop_y
             
         x1 = int(self.current_center_x - half_crop)
         x2 = int(self.current_center_x + half_crop)
@@ -893,145 +921,11 @@ class SmoothedCameraman:
         x1 = max(0, x1)
         x2 = min(self.video_width, x2)
         
-        y1 = 0
-        y2 = self.video_height
+        y1 = max(0, int(self.current_center_y - half_crop_y))
+        y2 = min(self.video_height, y1 + self.crop_height)
+        y1 = max(0, y2 - self.crop_height)
         
         return x1, y1, x2, y2
-
-class SpeakerTracker:
-    """
-    Tracks speakers over time to prevent rapid switching and handle temporary obstructions.
-    """
-    def __init__(self, stabilization_frames=15, cooldown_frames=30):
-        self.active_speaker_id = None
-        self.speaker_scores = {}  # {id: score}
-        self.last_seen = {}       # {id: frame_number}
-        self.locked_counter = 0   # How long we've been locked on current speaker
-        
-        # Hyperparameters
-        self.stabilization_threshold = stabilization_frames # Frames needed to confirm a new speaker
-        self.switch_cooldown = cooldown_frames              # Minimum frames before switching again
-        self.last_switch_frame = -1000
-        self.pending_switch_id = None   # Candidate waiting to take over
-        self.pending_switch_count = 0   # Consecutive decisions it has dominated
-        
-        # ID tracking
-        self.next_id = 0
-        self.known_faces = [] # [{'id': 0, 'center': x, 'last_frame': 123}]
-
-    def get_target(self, face_candidates, frame_number, width):
-        """
-        Decides which face to focus on.
-        face_candidates: list of {'box': [x,y,w,h], 'score': float}
-        """
-        current_candidates = []
-        
-        # 1. Match faces to known IDs (simple distance tracking)
-        for face in face_candidates:
-            x, y, w, h = face['box']
-            center_x = x + w / 2
-            
-            best_match_id = -1
-            min_dist = width * 0.15 # Reduced matching radius to avoid jumping in groups
-            
-            # Try to match with known faces seen recently
-            for kf in self.known_faces:
-                if frame_number - kf['last_frame'] > 30: # Forgot faces older than 1s (was 2s)
-                    continue
-                    
-                dist = abs(center_x - kf['center'])
-                if dist < min_dist:
-                    min_dist = dist
-                    best_match_id = kf['id']
-            
-            # If no match, assign new ID
-            if best_match_id == -1:
-                best_match_id = self.next_id
-                self.next_id += 1
-            
-            # Update known face
-            self.known_faces = [kf for kf in self.known_faces if kf['id'] != best_match_id]
-            self.known_faces.append({'id': best_match_id, 'center': center_x, 'last_frame': frame_number})
-            
-            current_candidates.append({
-                'id': best_match_id,
-                'box': face['box'],
-                'score': face['score']
-            })
-
-        # 2. Update Scores with decay
-        for pid in list(self.speaker_scores.keys()):
-             self.speaker_scores[pid] *= 0.85 # Faster decay (was 0.9)
-             if self.speaker_scores[pid] < 0.1:
-                 del self.speaker_scores[pid]
-
-        # Add new scores
-        for cand in current_candidates:
-            pid = cand['id']
-            # Score is purely based on size (proximity) now that we don't have mouth
-            raw_score = cand['score'] / (width * width * 0.05)
-            self.speaker_scores[pid] = self.speaker_scores.get(pid, 0) + raw_score
-
-        # 3. Determine Best Speaker
-        if not current_candidates:
-            # If no one found, maintain last active speaker if cooldown allows
-            # to avoid black screen or jump to 0,0
-            return None 
-            
-        best_candidate = None
-        max_score = -1
-        
-        for cand in current_candidates:
-            pid = cand['id']
-            total_score = self.speaker_scores.get(pid, 0)
-            
-            # Hysteresis: HUGE Bonus for current active speaker
-            if pid == self.active_speaker_id:
-                total_score *= 3.0 # Sticky factor
-                
-            if total_score > max_score:
-                max_score = total_score
-                best_candidate = cand
-
-        # 4. Decide Switch
-        if best_candidate:
-            target_id = best_candidate['id']
-
-            if target_id == self.active_speaker_id:
-                self.locked_counter += 1
-                self.pending_switch_id = None
-                self.pending_switch_count = 0
-                return best_candidate['box']
-
-            # New person wants focus. Adopt instantly only when nobody is
-            # active yet; otherwise require SUSTAINED dominance (the
-            # stabilization threshold) on top of the switch cooldown — a
-            # single score flip must never move the camera.
-            if self.active_speaker_id is not None:
-                if target_id == self.pending_switch_id:
-                    self.pending_switch_count += 1
-                else:
-                    self.pending_switch_id = target_id
-                    self.pending_switch_count = 1
-
-                within_cooldown = frame_number - self.last_switch_frame < self.switch_cooldown
-                if within_cooldown or self.pending_switch_count < self.stabilization_threshold:
-                    old_cand = next((c for c in current_candidates if c['id'] == self.active_speaker_id), None)
-                    if old_cand:
-                        return old_cand['box']
-                    # Active speaker briefly lost (occlusion / detector
-                    # dropout): hold the camera instead of instantly
-                    # snapping to another person.
-                    return None
-
-            self.active_speaker_id = target_id
-            self.last_switch_frame = frame_number
-            self.locked_counter = 0
-            self.pending_switch_id = None
-            self.pending_switch_count = 0
-            return best_candidate['box']
-
-        return None
 
 def detect_face_candidates(frame):
     """
@@ -1100,6 +994,12 @@ def detect_person_yolo(frame):
     for result in results:
         boxes = result.boxes
         for box in boxes:
+            try:
+                confidence = float(box.conf[0])
+            except (TypeError, IndexError):
+                confidence = 1.0
+            if confidence < 0.5:
+                continue
             x1, y1, x2, y2 = [int(i) for i in box.xyxy[0]]
             w = x2 - x1
             h = y2 - y1
@@ -1122,33 +1022,33 @@ def create_general_frame(frame, output_width, output_height):
     """
     orig_h, orig_w = frame.shape[:2]
     
-    # 1. Background (Fill Height)
-    # Crop center to aspect ratio
-    bg_scale = output_height / orig_h
-    bg_w = int(orig_w * bg_scale)
-    bg_resized = cv2.resize(frame, (bg_w, output_height))
-    
-    # Crop center of background
-    start_x = (bg_w - output_width) // 2
-    if start_x < 0: start_x = 0
-    background = bg_resized[:, start_x:start_x+output_width]
-    if background.shape[1] != output_width:
-        background = cv2.resize(background, (output_width, output_height))
+    # 1. Background: generic "cover" scaling works for landscape, portrait
+    # and square sources without negative slices or distortion.
+    bg_scale = max(output_width / orig_w, output_height / orig_h)
+    bg_w = max(output_width, int(round(orig_w * bg_scale)))
+    bg_h = max(output_height, int(round(orig_h * bg_scale)))
+    bg_resized = cv2.resize(frame, (bg_w, bg_h))
+    start_x = max(0, (bg_w - output_width) // 2)
+    start_y = max(0, (bg_h - output_height) // 2)
+    background = bg_resized[start_y:start_y + output_height,
+                            start_x:start_x + output_width]
         
     # Blur background
     background = cv2.GaussianBlur(background, (51, 51), 0)
     
-    # 2. Foreground (Fit Width)
-    scale = output_width / orig_w
-    fg_h = int(orig_h * scale)
-    foreground = cv2.resize(frame, (output_width, fg_h))
+    # 2. Foreground: generic "contain" scaling preserves the whole source.
+    scale = min(output_width / orig_w, output_height / orig_h)
+    fg_w = max(1, min(output_width, int(round(orig_w * scale))))
+    fg_h = max(1, min(output_height, int(round(orig_h * scale))))
+    foreground = cv2.resize(frame, (fg_w, fg_h))
     
     # 3. Overlay
     y_offset = (output_height - fg_h) // 2
+    x_offset = (output_width - fg_w) // 2
     
     # Clone background to avoid modifying it
     final_frame = background.copy()
-    final_frame[y_offset:y_offset+fg_h, :] = foreground
+    final_frame[y_offset:y_offset + fg_h, x_offset:x_offset + fg_w] = foreground
     
     return final_frame
 
@@ -1277,25 +1177,31 @@ def analyze_scenes_strategy(video_path, scenes, layout_style="smart"):
     """
     Analyzes each scene to pick a layout: TRACK (zoom on one person),
     SPLIT (two people stacked) or GENERAL (blurred wide shot).
-    Returns (strategies, split_centers) — one entry per scene; split_centers
-    holds the two face centers for SPLIT scenes, None otherwise.
+    Returns one evidence-backed SceneLayoutDecision per source shot.
     """
+    if layout_style == "wide":
+        return [
+            SceneLayoutDecision("GENERAL", None, 1.0, "wide layout requested")
+            for _ in scenes
+        ]
+
     cap = cv2.VideoCapture(video_path)
-    strategies = []
-    split_centers = []
+    decisions = []
 
     if not cap.isOpened():
-        return ['TRACK'] * len(scenes), [None] * len(scenes)
+        return []
 
     frame_width = int(cap.get(cv2.CAP_PROP_FRAME_WIDTH) or 0) or 1920
+    fps = float(cap.get(cv2.CAP_PROP_FPS) or 0) or 30.0
 
     for start, end in tqdm(scenes, desc="   Analyzing Scenes"):
-        # Sample 5 frames spread across the scene for a stable statistic.
-        span = max(0, end.get_frames() - start.get_frames())
-        frames_to_check = sorted({
-            int(start.get_frames() + span * fraction)
-            for fraction in (0.1, 0.3, 0.5, 0.7, 0.9)
-        })
+        # Duration-aware coverage: short shots still get five observations;
+        # long shots get up to 24 instead of being judged from five snapshots.
+        frames_to_check = sample_scene_frames(
+            start.get_frames(),
+            end.get_frames(),
+            fps,
+        )
 
         face_samples = []
         person_samples = []
@@ -1306,17 +1212,17 @@ def analyze_scenes_strategy(video_path, scenes, layout_style="smart"):
 
             candidates = detect_face_candidates(frame)
             face_samples.append([c['box'] for c in candidates])
-            person_samples.append(detect_person_boxes(frame))
+            if layout_style != "zoom":
+                person_samples.append(detect_person_boxes(frame))
 
-        strategy, centers = decide_scene_layout(
+        decision = decide_scene_layout_detailed(
             face_samples, frame_width, layout_style=layout_style,
             person_samples=person_samples,
         )
-        strategies.append(strategy)
-        split_centers.append(centers)
+        decisions.append(decision)
 
     cap.release()
-    return strategies, split_centers
+    return decisions
 
 def detect_scenes(video_path):
     scene_manager = SceneManager()
@@ -1586,7 +1492,7 @@ Technical Details: {str(last_error)}
     return downloaded_file, sanitized_title
 
 def _finalize_clip_passthrough(input_video, final_output_video, progress_callback=None):
-    """Finish a clip without reframing (horizontal output, or source already in
+    """Finish a clip without reframing (original output, or source already in
     the target aspect). Applies the watermark via FFmpeg overlay if enabled;
     otherwise remuxes with faststart only."""
     if os.path.exists(final_output_video):
@@ -1607,8 +1513,9 @@ def _finalize_clip_passthrough(input_video, final_output_video, progress_callbac
     if wm_png:
         command = [
             'ffmpeg', '-y', '-i', input_video, '-i', wm_png,
-            '-filter_complex', '[0:v][1:v]overlay=(W-w)/2:(H-h)/2:format=auto',
-            '-c:v', 'libx264', '-preset', 'fast', '-crf', '20',
+            '-filter_complex',
+            f'[0:v][1:v]overlay=(W-w)/2:(H-h)/2:format=auto,{EVEN_PAD_FILTER}',
+            '-c:v', 'libx264', '-preset', 'fast', '-crf', '20', '-pix_fmt', 'yuv420p',
             '-c:a', 'copy', '-movflags', '+faststart', final_output_video,
         ]
     else:
@@ -1636,15 +1543,21 @@ def _finalize_clip_passthrough(input_video, final_output_video, progress_callbac
     return True
 
 
-def _render_clip(input_video, final_output_video, output_format="auto", layout_style="smart", progress_callback=None):
+def _render_clip(input_video, final_output_video, output_format="vertical", layout_style="smart", progress_callback=None):
     """Route a cut clip through the right renderer for the chosen output format.
-    'auto' behaves like 'vertical'; the vertical renderer itself detects sources
-    that already match the target aspect and skips reframing for them."""
-    if output_format == "horizontal":
+    Legacy ``auto``/``horizontal`` values are accepted for saved jobs and map
+    to the explicit ``vertical``/``original`` choices."""
+    output_format = normalize_output_format(output_format)
+    if output_format == "original":
         return _finalize_clip_passthrough(input_video, final_output_video, progress_callback)
-    aspect = 1.0 if output_format == "square" else ASPECT_RATIO
+    aspect = output_aspect_ratio(output_format)
     return process_video_to_vertical(input_video, final_output_video, progress_callback,
                                      aspect_ratio=aspect, layout_style=layout_style)
+
+
+def _full_render_filename(output_dir, video_title, output_format):
+    suffix = normalize_output_format(output_format)
+    return os.path.join(output_dir, f"{video_title}_{suffix}.mp4")
 
 
 def process_video_to_vertical(input_video, final_output_video, progress_callback=None, aspect_ratio=ASPECT_RATIO, layout_style="smart"):
@@ -1693,17 +1606,9 @@ def process_video_to_vertical(input_video, final_output_video, progress_callback
         progress_callback(8.0, "Preparing active tracking...")
     original_width, original_height = src_width, src_height
 
-    OUTPUT_HEIGHT = original_height
-    OUTPUT_WIDTH = int(OUTPUT_HEIGHT * aspect_ratio)
-    if OUTPUT_WIDTH > original_width:
-        # Never upscale beyond the source width (e.g. square target from a
-        # narrow portrait source) — shrink the output instead.
-        OUTPUT_WIDTH = original_width
-        OUTPUT_HEIGHT = int(OUTPUT_WIDTH / aspect_ratio)
-    if OUTPUT_WIDTH % 2 != 0:
-        OUTPUT_WIDTH += 1
-    if OUTPUT_HEIGHT % 2 != 0:
-        OUTPUT_HEIGHT += 1
+    OUTPUT_WIDTH, OUTPUT_HEIGHT = fit_even_output_dimensions(
+        original_width, original_height, aspect_ratio,
+    )
 
     # Initialize Cameraman
     cameraman = SmoothedCameraman(OUTPUT_WIDTH, OUTPUT_HEIGHT, original_width, original_height, aspect_ratio=aspect_ratio)
@@ -1713,28 +1618,61 @@ def process_video_to_vertical(input_video, final_output_video, progress_callback
     print("\n   🤖 Step 3: Analyzing Scenes for Strategy (Single vs Group)...")
     if progress_callback:
         progress_callback(14.0, "Analyzing scene strategy...")
-    scene_strategies, scene_split_centers = analyze_scenes_strategy(input_video, scenes, layout_style=layout_style)
-    # One strategy ('TRACK' | 'SPLIT' | 'GENERAL') per scene.
+    scene_decisions = analyze_scenes_strategy(input_video, scenes, layout_style=layout_style)
+    if len(scene_decisions) != len(scenes):
+        # A failed analysis must not guess a tight crop.  GENERAL preserves
+        # everyone until a future run can collect valid evidence.
+        scene_decisions = [
+            SceneLayoutDecision("GENERAL", None, 0.0, "scene analysis unavailable")
+            for _ in scenes
+        ]
+    scene_strategies = [decision.strategy for decision in scene_decisions]
+    scene_split_centers = [decision.split_centers for decision in scene_decisions]
+    scene_confidences = [decision.confidence for decision in scene_decisions]
 
-    # Interview footage cuts between wide shots and close-ups every few
-    # seconds; raw per-scene decisions made the layout flip constantly.
-    # Smooth the plan: short scenes inherit their predecessor, single-scene
-    # islands are flattened.
+    # Only low-confidence, short GENERAL islands may be widened.  Confident
+    # close-ups and long SPLIT shots are source edits and must survive.
     scene_seconds = [
         max(0.0, (s_end.get_frames() - s_start.get_frames()) / max(float(fps or 0), 1.0))
         for s_start, s_end in scenes
     ]
-    smoothed = smooth_scene_strategies(scene_strategies, scene_seconds)
+    smoothed = smooth_scene_strategies(
+        scene_strategies,
+        scene_seconds,
+        scene_confidences=scene_confidences,
+    )
     if smoothed != scene_strategies:
         flips = sum(1 for a, b in zip(smoothed, scene_strategies) if a != b)
         print(f"   🧘 Stabilized layout plan: {flips} scene(s) smoothed to avoid layout flicker.")
-    # Scenes that inherited SPLIT during smoothing need face centers too.
     scene_strategies, scene_split_centers = inherit_split_centers(smoothed, scene_split_centers)
-    layout_counts = {}
-    for s in scene_strategies:
-        layout_counts[s] = layout_counts.get(s, 0) + 1
-    layout_summary = ", ".join(f"{count}x{name}" for name, count in sorted(layout_counts.items()))
+
+    layout_seconds = {}
+    for strategy, duration in zip(scene_strategies, scene_seconds):
+        layout_seconds[strategy] = layout_seconds.get(strategy, 0.0) + duration
+    total_planned_seconds = max(sum(scene_seconds), 0.001)
+    layout_summary = ", ".join(
+        f"{seconds:.1f}s {name} ({seconds / total_planned_seconds:.0%})"
+        for name, seconds in sorted(layout_seconds.items())
+    )
     print(f"   🎛️ Layout plan ({layout_style}): {layout_summary}")
+    for index, ((scene_start, scene_end), strategy, confidence, decision) in enumerate(zip(
+        scenes,
+        scene_strategies,
+        scene_confidences,
+        scene_decisions,
+    )):
+        start_seconds = scene_start.get_frames() / max(float(fps or 0), 1.0)
+        end_seconds = scene_end.get_frames() / max(float(fps or 0), 1.0)
+        reason = decision.reason if strategy == decision.strategy else f"safe smoothing from {decision.strategy}"
+        observed_counts = decision.person_counts or decision.face_counts
+        observed_people = (
+            sorted(observed_counts)[len(observed_counts) // 2]
+            if observed_counts else 0
+        )
+        print(
+            f"      {index + 1:02d} {start_seconds:06.2f}-{end_seconds:06.2f}s "
+            f"{strategy:<7} people={observed_people} confidence={confidence:.2f} | {reason}"
+        )
     
     print("\n   ✂️ Step 4: Processing video frames...")
     if progress_callback:
@@ -1744,7 +1682,8 @@ def process_video_to_vertical(input_video, final_output_video, progress_callback
         'ffmpeg', '-y', '-f', 'rawvideo', '-vcodec', 'rawvideo',
         '-s', f'{OUTPUT_WIDTH}x{OUTPUT_HEIGHT}', '-pix_fmt', 'bgr24',
         '-r', str(fps), '-i', '-', '-c:v', 'libx264',
-        '-preset', 'fast', '-crf', '23', '-an', temp_video_output
+        '-preset', 'fast', '-crf', '23', '-pix_fmt', 'yuv420p',
+        '-an', temp_video_output
     ]
 
     ffmpeg_process = subprocess.Popen(command, stdin=subprocess.PIPE, stdout=subprocess.DEVNULL, stderr=subprocess.PIPE)
@@ -1760,10 +1699,18 @@ def process_video_to_vertical(input_video, final_output_video, progress_callback
     for s_start, s_end in scenes:
         scene_boundaries.append((s_start.get_frames(), s_end.get_frames()))
 
-    # Global tracker for single-person shots. Long cooldown/stabilization:
-    # with two similarly sized faces the pure size score flips easily, and a
-    # 1s cooldown made the camera pendulum between people every second.
-    speaker_tracker = SpeakerTracker(stabilization_frames=25, cooldown_frames=90)
+    # Seconds, not frame counts: the source may be 24, 30, 50 or 60 fps.
+    # HOLD is a first-class state and therefore never invokes YOLO fallback.
+    speaker_tracker = SpeakerTracker(
+        stabilization_seconds=2.0,
+        cooldown_seconds=3.0,
+        lost_timeout_seconds=2.0,
+        fallback_stabilization_seconds=1.0,
+    )
+    previous_scene_index = None
+    fps_value = max(float(fps or 0), 1.0)
+    artificial_switches = 0
+    scene_had_target = False
 
     last_progress_emit = time.time()
     try:
@@ -1773,13 +1720,22 @@ def process_video_to_vertical(input_video, final_output_video, progress_callback
                 break
 
             # Update Scene Index
-            if current_scene_index < len(scene_boundaries):
-                start_f, end_f = scene_boundaries[current_scene_index]
-                if frame_number >= end_f and current_scene_index < len(scene_boundaries) - 1:
-                    current_scene_index += 1
+            while current_scene_index < len(scene_boundaries) - 1:
+                _, end_f = scene_boundaries[current_scene_index]
+                if frame_number < end_f:
+                    break
+                current_scene_index += 1
 
             # Determine Strategy for current frame based on scene
             current_strategy = scene_strategies[current_scene_index] if current_scene_index < len(scene_strategies) else 'TRACK'
+            is_scene_start = current_scene_index != previous_scene_index
+            if is_scene_start:
+                # A source cut is a legitimate new composition.  Stale face
+                # IDs, fallback candidates and camera centers must not cross it.
+                speaker_tracker.reset()
+                cameraman.reset()
+                scene_had_target = False
+                previous_scene_index = current_scene_index
 
             # Apply Strategy
             split_centers = (
@@ -1792,33 +1748,45 @@ def process_video_to_vertical(input_video, final_output_video, progress_callback
                 # side by side (1:1). Fixed per scene = calm framing.
                 output_frame = create_split_frame(
                     frame, OUTPUT_WIDTH, OUTPUT_HEIGHT, split_centers,
-                    stacked=(OUTPUT_HEIGHT >= OUTPUT_WIDTH),
+                    stacked=(OUTPUT_HEIGHT > OUTPUT_WIDTH),
                 )
-                cameraman.current_center_x = original_width / 2
-                cameraman.target_center_x = original_width / 2
 
             elif current_strategy == 'GENERAL' or current_strategy == 'SPLIT':
                 # "Plano General" -> Blur Background + Fit Width
                 # (also the fallback for SPLIT scenes without face centers)
                 output_frame = create_general_frame(frame, OUTPUT_WIDTH, OUTPUT_HEIGHT)
 
-                # Reset cameraman/tracker so they don't drift while inactive
-                cameraman.current_center_x = original_width / 2
-                cameraman.target_center_x = original_width / 2
-
             else:
                 # "Single Speaker" -> Track & Crop
-                if frame_number % 2 == 0:
+                if is_scene_start or frame_number % 2 == 0:
+                    timestamp_seconds = frame_number / fps_value
                     candidates = detect_face_candidates(frame)
-                    target_box = speaker_tracker.get_target(candidates, frame_number, original_width)
-                    if target_box:
-                        cameraman.update_target(target_box)
-                    else:
+                    target_decision = speaker_tracker.get_target(
+                        candidates,
+                        timestamp_seconds,
+                        original_width,
+                    )
+                    if target_decision.state == TargetState.TARGET:
+                        if scene_had_target and target_decision.reason == "replacement face stayed stable":
+                            artificial_switches += 1
+                        cameraman.update_target(target_decision.box)
+                        scene_had_target = True
+                    elif target_decision.state == TargetState.LOST:
+                        # LOST means the previous subject is genuinely gone.
+                        # HOLD intentionally does nothing and can never reach
+                        # this fallback branch.
                         person_box = detect_person_yolo(frame)
-                        if person_box:
-                            cameraman.update_target(person_box)
+                        fallback_decision = speaker_tracker.consider_person_fallback(
+                            person_box,
+                            timestamp_seconds,
+                            original_width,
+                        )
+                        if fallback_decision.state == TargetState.TARGET:
+                            if scene_had_target and fallback_decision.reason == "stable YOLO fallback target":
+                                artificial_switches += 1
+                            cameraman.update_target(fallback_decision.box)
+                            scene_had_target = True
 
-                is_scene_start = (frame_number == scene_boundaries[current_scene_index][0])
                 x1, y1, x2, y2 = cameraman.get_crop_box(force_snap=is_scene_start)
                 if y2 > y1 and x2 > x1:
                     cropped = frame[y1:y2, x1:x2]
@@ -1848,6 +1816,8 @@ def process_video_to_vertical(input_video, final_output_video, progress_callback
                 ffmpeg_process.wait(timeout=5)
             except subprocess.TimeoutExpired:
                 ffmpeg_process.kill()
+
+    print(f"   🎥 Artificial camera switches: {artificial_switches}")
 
     if ffmpeg_process.returncode != 0:
         print("\n   ❌ FFmpeg frame processing failed.")
@@ -2218,7 +2188,9 @@ def _find_source_video(resume_dir: str):
         name = os.path.basename(path)
         if name.startswith(skip_prefixes):
             continue
-        if re.search(r"_clip_\d+\.mp4$", name) or name.endswith("_vertical.mp4"):
+        if re.search(r"_clip_\d+\.mp4$", name) or name.endswith((
+            "_vertical.mp4", "_square.mp4", "_original.mp4",
+        )):
             continue
         candidates.append(path)
     # If several remain, the source is by far the largest one.
@@ -2356,8 +2328,8 @@ if __name__ == '__main__':
     parser.add_argument('--skip-analysis', action='store_true', help="Skip AI analysis and convert the whole video.")
     parser.add_argument('--resume-dir', type=str, help="Resume a previous job from its output directory.")
     parser.add_argument('--resume-phase', choices=['transcribe', 'analyze', 'render'], help="Force resume from a specific phase.")
-    parser.add_argument('--format', dest='output_format', choices=list(OUTPUT_FORMATS), default='auto',
-                        help="Output format: auto (smart), vertical (9:16), horizontal (original), square (1:1).")
+    parser.add_argument('--format', dest='output_format', choices=list(OUTPUT_FORMAT_CHOICES), default='vertical',
+                        help="Output format: vertical (9:16), original (source geometry), square (1:1). Legacy auto/horizontal values remain accepted.")
     parser.add_argument('--layout', dest='layout_style', choices=list(LAYOUT_STYLES), default='smart',
                         help="Reframing layout: smart (split two-person shots), zoom (speaker zoom only), wide (always blurred wide).")
     parser.add_argument('--job-id', type=str, help="Optional job id for structured worker events.")
@@ -2383,9 +2355,9 @@ if __name__ == '__main__':
             output_dir = _ensure_dir(args.resume_dir)
             resume_context = _load_resume_context(output_dir)
             _render_config = _load_render_config(output_dir)
-            output_format = _render_config.get("output_format") or args.output_format
-            if output_format not in OUTPUT_FORMATS:
-                output_format = "auto"
+            output_format = normalize_output_format(
+                _render_config.get("output_format") or args.output_format
+            )
             layout_style = _render_config.get("layout_style") or args.layout_style
             if layout_style not in LAYOUT_STYLES:
                 layout_style = "smart"
@@ -2406,7 +2378,7 @@ if __name__ == '__main__':
                 input_video, video_title = download_youtube_video(source_url, output_dir)
             reporter.emit("resume", "Resuming previous job from saved checkpoints.", important=True, resumable=True)
         else:
-            output_format = args.output_format
+            output_format = normalize_output_format(args.output_format)
             layout_style = args.layout_style
             if args.url:
                 if args.output and not args.skip_analysis:
@@ -2456,7 +2428,9 @@ if __name__ == '__main__':
 
         if args.skip_analysis and not args.resume_dir:
             reporter.set_phase("render", "Rendering full video", message="Skipping AI analysis and rendering the full video.")
-            output_file = args.output if args.output else os.path.join(output_dir, f"{video_title}_vertical.mp4")
+            output_file = args.output if args.output else _full_render_filename(
+                output_dir, video_title, output_format,
+            )
             success = _render_clip(
                 input_video,
                 output_file,
@@ -2502,7 +2476,7 @@ if __name__ == '__main__':
             reporter.set_phase("render", "Rendering clips", message="Starting vertical render...")
             if not clips_data or 'shorts' not in clips_data:
                 print("❌ Failed to identify clips. Converting whole video as fallback.")
-                output_file = os.path.join(output_dir, f"{video_title}_vertical.mp4")
+                output_file = _full_render_filename(output_dir, video_title, output_format)
                 success = _render_clip(
                     input_video,
                     output_file,
