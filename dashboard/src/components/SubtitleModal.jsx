@@ -29,7 +29,7 @@ const HIGHLIGHT_PRESETS = [
 ];
 
 // Ready-made caption looks (inspired by remotion-captioneer): dimmed base
-// text + strong active word, optional glow/pop/box effect.
+// text + strong active word, optional glow/pop/box/safe-bounce effect.
 const CAPTION_PRESETS = [
     { id: 'tiktok',  label: 'TikTok',    style: 'karaoke', effect: 'none', highlightColor: '#FE2C55', baseOpacity: 0.75, uppercase: false, fontName: 'Verdana', borderWidth: 2 },
     { id: 'reels',   label: 'Reels',     style: 'karaoke', effect: 'none', highlightColor: '#E1306C', baseOpacity: 0.7,  uppercase: false, fontName: 'Verdana', borderWidth: 2 },
@@ -68,10 +68,11 @@ export default function SubtitleModal({ isOpen, onClose, onGenerate, isProcessin
     const [bgOpacity, setBgOpacity] = useState(0.0);
     const [style, setStyle] = useState('karaoke'); // classic | karaoke (word highlight)
     const [highlightColor, setHighlightColor] = useState('#FFD700');
-    const [effect, setEffect] = useState('none'); // none | glow | pop | box
+    const [effect, setEffect] = useState('none'); // none | glow | pop | box | bounce
     const [baseOpacity, setBaseOpacity] = useState(1.0);
     const [uppercase, setUppercase] = useState(false);
     const [activePreset, setActivePreset] = useState(null);
+    const [videoAspect, setVideoAspect] = useState(9 / 16);
 
     if (!isOpen) return null;
 
@@ -130,8 +131,20 @@ export default function SubtitleModal({ isOpen, onClose, onGenerate, isProcessin
                 </button>
 
                 {/* Left: Preview */}
-                <div className="flex-1 flex flex-col items-center justify-center bg-black rounded-lg border border-white/5 overflow-hidden relative aspect-[9/16] max-h-[600px]">
-                     <video src={videoUrl} className="w-full h-full object-contain opacity-50" muted playsInline />
+                <div
+                    className="flex-1 w-full flex flex-col items-center justify-center bg-black rounded-lg border border-white/5 overflow-hidden relative max-h-[600px]"
+                    style={{ aspectRatio: videoAspect }}
+                >
+                     <video
+                        src={videoUrl}
+                        className="w-full h-full object-contain opacity-50"
+                        muted
+                        playsInline
+                        onLoadedMetadata={(event) => {
+                            const { videoWidth, videoHeight } = event.currentTarget;
+                            if (videoWidth > 0 && videoHeight > 0) setVideoAspect(videoWidth / videoHeight);
+                        }}
+                     />
 
                      {/* Subtitle Overlay Preview */}
                      <div className={`absolute w-full px-8 text-center transition-all duration-300 pointer-events-none flex flex-col items-center justify-center
@@ -147,7 +160,7 @@ export default function SubtitleModal({ isOpen, onClose, onGenerate, isProcessin
                                         color: effect === 'glow' || effect === 'box' ? '#FFFFFF' : highlightColor,
                                         textShadow: effectShadow(effect, highlightColor),
                                         ...(effect === 'pop' ? { display: 'inline-block', transform: 'scale(1.12)' } : {}),
-                                        ...(effect === 'bounce' ? { display: 'inline-block', animation: 'subtitle-bounce 1.6s ease-out infinite' } : {}),
+                                        ...(effect === 'bounce' ? { display: 'inline-block', animation: 'subtitle-bounce 0.6s ease-out both' } : {}),
                                         ...(effect === 'box' ? { backgroundColor: highlightColor, borderRadius: '4px', padding: '0 4px' } : {}),
                                     }}>how</span>
                                     <span style={{ color: dimmedWhite(baseOpacity) }}> your subtitles<br/>will appear on the video</span>
@@ -231,7 +244,7 @@ export default function SubtitleModal({ isOpen, onClose, onGenerate, isProcessin
                                         { id: 'none', label: 'None' },
                                         { id: 'glow', label: 'Glow' },
                                         { id: 'pop', label: 'Pop' },
-                                        { id: 'bounce', label: 'Bounce' },
+                                        { id: 'bounce', label: 'Safe Bounce' },
                                         { id: 'box', label: 'Box' },
                                     ].map((e) => (
                                         <button
@@ -243,6 +256,9 @@ export default function SubtitleModal({ isOpen, onClose, onGenerate, isProcessin
                                         </button>
                                     ))}
                                 </div>
+                                {effect === 'bounce' && (
+                                    <p className="mt-2 text-[10px] leading-snug text-zinc-500">Short words stay still and only highlight, preventing micro-flicker.</p>
+                                )}
                                 <div className="flex items-center justify-between mt-3">
                                     <label className="text-[10px] text-zinc-500">Dim inactive words</label>
                                     <input

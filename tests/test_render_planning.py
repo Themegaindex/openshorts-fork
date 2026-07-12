@@ -10,17 +10,22 @@ class TestSmoothSceneStrategies:
         durations = [5.0, 4.0, 6.0, 3.0]
         assert smooth_scene_strategies(strategies, durations) == strategies
 
-    def test_short_scene_inherits_previous(self):
-        # A 0.8s reaction cut must not flip the layout.
+    def test_short_confident_source_cut_survives(self):
+        # Short reaction shots are legitimate edits when detection is clear.
         strategies = ["TRACK", "GENERAL", "TRACK"]
         durations = [5.0, 0.8, 5.0]
-        assert smooth_scene_strategies(strategies, durations) == ["TRACK", "TRACK", "TRACK"]
+        assert smooth_scene_strategies(strategies, durations) == strategies
 
-    def test_single_island_flattened(self):
-        # One odd detection between two agreeing neighbors is noise.
+    def test_long_single_island_is_never_flattened(self):
         strategies = ["GENERAL", "TRACK", "GENERAL"]
         durations = [4.0, 4.0, 4.0]
-        assert smooth_scene_strategies(strategies, durations) == ["GENERAL", "GENERAL", "GENERAL"]
+        assert smooth_scene_strategies(strategies, durations) == strategies
+
+    def test_short_low_confidence_island_widens_safely(self):
+        strategies = ["GENERAL", "TRACK", "GENERAL"]
+        durations = [4.0, 0.8, 4.0]
+        confidences = [0.9, 0.2, 0.9]
+        assert smooth_scene_strategies(strategies, durations, confidences) == ["GENERAL"] * 3
 
     def test_real_layout_change_survives(self):
         # A sustained switch (long scenes, consistent) must be kept.
@@ -28,11 +33,16 @@ class TestSmoothSceneStrategies:
         durations = [4.0, 4.0, 8.0, 5.0, 6.0]
         assert smooth_scene_strategies(strategies, durations) == strategies
 
-    def test_rapid_interview_cuts_calm_down(self):
-        # Wide shot <-> close-up ping-pong with short cuts collapses into one layout.
+    def test_confident_interview_cuts_are_preserved(self):
         strategies = ["GENERAL", "TRACK", "GENERAL", "TRACK", "GENERAL"]
         durations = [3.0, 1.0, 1.2, 0.9, 1.4]
-        assert smooth_scene_strategies(strategies, durations) == ["GENERAL"] * 5
+        assert smooth_scene_strategies(strategies, durations) == strategies
+
+    def test_clip_10_long_split_regression(self):
+        strategies = ["TRACK", "TRACK", "SPLIT", "TRACK", "SPLIT"]
+        durations = [0.417, 1.635, 27.494, 2.386, 7.191]
+        confidences = [1.0, 1.0, 1.0, 1.0, 1.0]
+        assert smooth_scene_strategies(strategies, durations, confidences) == strategies
 
     def test_missing_durations_are_tolerated(self):
         strategies = ["TRACK", "GENERAL", "GENERAL"]
@@ -44,7 +54,13 @@ class TestSmoothSceneStrategies:
         assert smooth_scene_strategies(strategies, durations) == ["GENERAL", "TRACK"]
 
 
-from render_planning import decide_scene_layout, inherit_split_centers, split_crop_windows
+from render_planning import (
+    decide_scene_layout,
+    decide_scene_layout_detailed,
+    inherit_split_centers,
+    sample_scene_frames,
+    split_crop_windows,
+)
 
 
 def _face(x, y, w=100, h=100):
@@ -118,23 +134,23 @@ class TestSplitCropWindows:
 
 
 class TestInheritSplitCenters:
-    def test_inherited_split_gets_neighbor_centers(self):
+    def test_split_without_local_centers_downgrades(self):
         strategies = ["SPLIT", "SPLIT", "TRACK"]
         centers = [[(100, 200), (900, 200)], None, None]
         out_strats, out_centers = inherit_split_centers(strategies, centers)
-        assert out_strats == ["SPLIT", "SPLIT", "TRACK"]
-        assert out_centers[1] == [(100, 200), (900, 200)]
+        assert out_strats == ["SPLIT", "GENERAL", "TRACK"]
+        assert out_centers[1] is None
 
     def test_split_without_any_donor_downgrades(self):
         out_strats, out_centers = inherit_split_centers(["SPLIT", "TRACK"], [None, None])
         assert out_strats == ["GENERAL", "TRACK"]
 
-    def test_backward_donor_used(self):
+    def test_centers_are_not_copied_backward_across_a_cut(self):
         strategies = ["SPLIT", "SPLIT"]
         centers = [None, [(300, 100), (1200, 100)]]
         out_strats, out_centers = inherit_split_centers(strategies, centers)
-        assert out_strats == ["SPLIT", "SPLIT"]
-        assert out_centers[0] == [(300, 100), (1200, 100)]
+        assert out_strats == ["GENERAL", "SPLIT"]
+        assert out_centers[0] is None
 
 
 from render_planning import person_head_center
@@ -199,3 +215,34 @@ class TestDecideSceneLayoutWithPersons:
         faces = [[(250, 350, 90, 90)]] * 3
         persons = [[_person(200, 300), _person(1300, 320)]] * 3
         assert decide_scene_layout(faces, 1920, layout_style="zoom", person_samples=persons)[0] == "TRACK"
+
+    def test_ambiguous_multi_person_evidence_goes_wide_not_track(self):
+        faces = [[_face(900, 300)]] * 5
+        persons = [
+            [_person(800, 200)],
+            [_person(800, 200)],
+            [_person(800, 200)],
+            [_person(200, 300), _person(1300, 320)],
+            [_person(200, 300), _person(1300, 320)],
+        ]
+        decision = decide_scene_layout_detailed(
+            faces,
+            1920,
+            layout_style="smart",
+            person_samples=persons,
+        )
+        assert decision.strategy == "GENERAL"
+        assert decision.confidence == 0.4
+
+
+class TestSceneSampling:
+    def test_long_scene_gets_more_than_five_samples(self):
+        frames = sample_scene_frames(0, 1800, fps=60.0)
+        assert len(frames) == 24
+        assert frames == sorted(frames)
+        assert all(0 <= frame < 1800 for frame in frames)
+
+    def test_short_scene_still_gets_coverage(self):
+        frames = sample_scene_frames(100, 220, fps=60.0)
+        assert len(frames) == 5
+        assert frames[0] >= 100 and frames[-1] < 220

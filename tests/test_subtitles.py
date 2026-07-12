@@ -1,5 +1,7 @@
 """Tests for subtitle word merging, SRT generation and style sanitizing."""
 from subtitles import (
+    _ass_time,
+    _collect_word_blocks,
     merge_continuation_words,
     generate_srt,
     hex_to_ass_color,
@@ -69,6 +71,25 @@ class TestGenerateSrt:
         out = tmp_path / "subs.srt"
         words = [_w(" spaet", 50.0, 50.5)]
         assert generate_srt(self._transcript(words), 0, 10, str(out)) is False
+
+    def test_timeline_is_sorted_clipped_and_deduplicated(self):
+        transcript = self._transcript([
+            _w(" spaet", 1.0, 1.2),
+            _w(" frueh", -0.2, 0.3),
+            _w(" frueh", -0.195, 0.305),  # same token within 20 ms
+            _w(" mitte", 0.5, 0.7),
+        ])
+        blocks = _collect_word_blocks(transcript, 0, 2, max_chars=100)
+        words = [word for block in blocks for word in block]
+        assert [word["word"] for word in words] == ["frueh", "mitte", "spaet"]
+        assert words[0]["start"] == 0.0
+        assert all(a["start"] <= b["start"] for a, b in zip(words, words[1:]))
+
+
+class TestAssTiming:
+    def test_centisecond_rounding_carries_into_next_second(self):
+        assert _ass_time(0.995) == "0:00:01.00"
+        assert _ass_time(59.995) == "0:01:00.00"
 
 
 class TestStyleSanitizing:
@@ -185,6 +206,44 @@ class TestGenerateAss:
         assert "\\t(0,90,\\fscx108\\fscy108)" in content  # gentle overshoot
         assert "\\t(90,180,\\fscx100\\fscy100)" in content  # settles at 100%
 
+    def test_short_bounce_word_only_highlights_without_scale_restart(self, tmp_path):
+        from subtitles import generate_ass
+        out = tmp_path / "subs.ass"
+        words = [_w(" kurz", 0.0, 0.08), _w(" lang", 0.08, 0.50)]
+        assert generate_ass(self._transcript(words), 0, 10, str(out), effect="bounce") is True
+        events = [line for line in out.read_text(encoding="utf-8-sig").splitlines()
+                  if line.startswith("Dialogue:")]
+        assert "\\fscx" not in events[0]
+        assert "\\fscx85" in events[1]
+
+    def test_short_pop_word_only_highlights(self, tmp_path):
+        from subtitles import generate_ass
+        out = tmp_path / "subs.ass"
+        words = [_w(" kurz", 0.0, 0.08)]
+        assert generate_ass(self._transcript(words), 0, 10, str(out), effect="pop") is True
+        assert "\\fscx" not in out.read_text(encoding="utf-8-sig")
+
+    def test_adjacent_events_share_exact_formatted_boundary(self, tmp_path):
+        from subtitles import generate_ass
+        out = tmp_path / "subs.ass"
+        words = [_w(" eins", 0.0, 0.333), _w(" zwei", 0.333, 0.667)]
+        assert generate_ass(self._transcript(words), 0, 10, str(out)) is True
+        events = [line.split(",") for line in out.read_text(encoding="utf-8-sig").splitlines()
+                  if line.startswith("Dialogue:")]
+        assert events[0][2] == events[1][1]
+
+    def test_overlapping_whisper_words_cannot_overlap_across_blocks(self, tmp_path):
+        from subtitles import generate_ass
+        out = tmp_path / "subs.ass"
+        words = [
+            _w(" ersteslangeswort", 0.0, 0.60),
+            _w(" zweiteslangeswort", 0.50, 1.00),
+        ]
+        assert generate_ass(self._transcript(words), 0, 10, str(out), max_chars=10) is True
+        events = [line.split(",") for line in out.read_text(encoding="utf-8-sig").splitlines()
+                  if line.startswith("Dialogue:")]
+        assert events[0][2] == events[1][1] == "0:00:00.50"
+
     def test_uppercase_transform(self, tmp_path):
         from subtitles import generate_ass
         out = tmp_path / "subs.ass"
@@ -215,3 +274,24 @@ class TestGenerateAss:
                             font_color="#FFFFFF", base_opacity=1.0) is True
         content = out.read_text(encoding="utf-8-sig")
         assert "&H00FFFFFF" in content  # pure white, no dimming
+
+
+class TestBuildSubtitleFilterAlignment:
+    """ASS v4.00+ numpad alignment: 2=bottom, 5=middle, 8=top center.
+
+    'top' used to map to 6 (middle right in v4.00+), pinning subtitles to the
+    right edge — keep both burn paths on the same numpad codes.
+    """
+
+    def test_top_maps_to_numpad_top_center(self):
+        from subtitles import build_subtitle_filter
+        assert "Alignment=8" in build_subtitle_filter("subs.srt", alignment="top")
+
+    def test_middle_and_bottom_mappings(self):
+        from subtitles import build_subtitle_filter
+        assert "Alignment=5" in build_subtitle_filter("subs.srt", alignment="middle")
+        assert "Alignment=2" in build_subtitle_filter("subs.srt", alignment="bottom")
+
+    def test_unknown_alignment_defaults_to_bottom(self):
+        from subtitles import build_subtitle_filter
+        assert "Alignment=2" in build_subtitle_filter("subs.srt", alignment="diagonal")

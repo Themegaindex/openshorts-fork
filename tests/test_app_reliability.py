@@ -59,6 +59,19 @@ def test_clip_version_is_persisted_to_metadata_and_job_state(monkeypatch, tmp_pa
     assert persisted["result"]["clips"][0]["video_url"] == new_url
 
 
+@pytest.mark.parametrize("output_format", ["vertical", "square", "original"])
+def test_full_video_artifact_recovery_supports_every_canonical_format(tmp_path, output_format):
+    filename = f"My_Show_{output_format}.mp4"
+    (tmp_path / filename).write_bytes(b"video")
+
+    result = app._build_result_from_video_artifacts("job-format", str(tmp_path))
+
+    assert result is not None
+    assert result["clips"][0]["output_filename"] == filename
+    assert result["clips"][0]["video_url"] == f"/videos/job-format/{filename}"
+    assert result["clips"][0]["video_title_for_youtube_short"] == "My Show"
+
+
 @pytest.mark.parametrize(
     "model,payload",
     [
@@ -74,6 +87,28 @@ def test_clip_version_is_persisted_to_metadata_and_job_state(monkeypatch, tmp_pa
 def test_negative_clip_indices_are_rejected(model, payload):
     with pytest.raises(ValidationError):
         model(**payload)
+
+
+@pytest.mark.parametrize(
+    "field,value",
+    [
+        ("position", "center-ish"),
+        ("style", "animated"),
+        ("effect", "shake"),
+        ("font_color", "red"),
+        ("font_size", 500),
+        ("bg_opacity", 1.5),
+    ],
+)
+def test_invalid_subtitle_options_are_rejected(field, value):
+    payload = {"job_id": "j", "clip_index": 0, field: value}
+    with pytest.raises(ValidationError):
+        app.SubtitleRequest(**payload)
+
+
+def test_safe_bounce_is_a_valid_subtitle_effect():
+    request = app.SubtitleRequest(job_id="j", clip_index=0, effect="bounce", style="karaoke")
+    assert request.effect == "bounce"
 
 
 def test_worker_summary_does_not_publish_completed_before_validation(monkeypatch, tmp_path):
