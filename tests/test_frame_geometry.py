@@ -204,3 +204,45 @@ def test_blocked_gemini_batch_rescues_each_window_once(monkeypatch):
     assert len(calls) == 3
     assert len(costs) == 3
     assert [attempt["status"] for attempt in attempts] == ["success", "failed", "success"]
+
+
+def test_null_detail_rescue_payload_becomes_window_failure(monkeypatch, tmp_path):
+    monkeypatch.setenv("GEMINI_API_KEY", "test-key")
+    monkeypatch.setattr(main, "GEMINI_WORKER_SCRIPT", __file__)
+    monkeypatch.setattr(main, "_build_transcript_windows", lambda *_args, **_kwargs: [{
+        "id": "window_001",
+        "start": 0.0,
+        "end": 90.0,
+        "text": "Test transcript",
+    }])
+
+    def fake_worker(mode, payload, **kwargs):
+        if mode == "score":
+            return {
+                "payload": {"windows": [{
+                    "id": "window_001",
+                    "start": 0.0,
+                    "end": 90.0,
+                    "score": 90,
+                    "reason": "strong",
+                }]},
+                "cost_analysis": None,
+            }
+        if kwargs.get("artifact_suffix"):
+            return {"payload": None, "cost_analysis": None}
+        raise main.GeminiWorkerError(
+            "empty detail response",
+            {"error_type": "empty_response", "payload": None},
+        )
+
+    monkeypatch.setattr(main, "_call_gemini_worker", fake_worker)
+    result = main.get_viral_clips(
+        {"language": "de", "segments": [], "text": "Test transcript"},
+        90.0,
+        output_dir=str(tmp_path),
+        video_title="null_payload",
+    )
+
+    assert result["clips_data"] is None
+    assert result["analysis_coverage"]["detail_windows_processed"] == 0
+    assert result["analysis_coverage"]["detail_windows_skipped"] == ["window_001"]

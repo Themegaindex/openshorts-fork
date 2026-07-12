@@ -2275,7 +2275,7 @@ def get_viral_clips(transcript_result, video_duration, output_dir=None, video_ti
             all_costs.extend(rescue_costs)
             attempts.extend(rescue_attempts)
             for window, worker_result in rescued:
-                payload = worker_result.get("payload", {})
+                payload = worker_result.get("payload") or {}
                 if isinstance(payload.get("shorts"), list):
                     collected_clips.extend(payload["shorts"])
                     detailed_input_ids.add(str(window.get("id")))
