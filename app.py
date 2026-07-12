@@ -1,3 +1,4 @@
+import copy
 import os
 import sys
 import uuid
@@ -76,6 +77,7 @@ job_processes_lock = threading.Lock()
 # could corrupt both results. Locks live only for the process lifetime; every
 # output name is unique as a second line of defense across restarts/workers.
 clip_operation_locks: Dict[tuple[str, int], asyncio.Lock] = {}
+job_state_locks: Dict[str, asyncio.Lock] = {}
 
 # TTLs for in-memory dicts that would otherwise grow unbounded.
 THUMBNAIL_SESSION_TTL_SECONDS = int(os.environ.get("THUMBNAIL_SESSION_TTL_SECONDS", str(2 * 3600)))
@@ -293,15 +295,34 @@ def _get_clip_operation_lock(job_id: str, clip_index: int) -> asyncio.Lock:
     return lock
 
 
+def _get_job_state_lock(job_id: str) -> asyncio.Lock:
+    """Serializes read-modify-write cycles on job-wide files.
+
+    clip_layers.json and metadata.json cover the whole job while operations
+    only lock per clip, so two clips encoding in parallel would otherwise
+    overwrite each other's saved state (lost update). Always acquired inside
+    an already-held clip lock, never the other way around — no deadlock.
+    """
+    lock = job_state_locks.get(job_id)
+    if lock is None:
+        lock = asyncio.Lock()
+        job_state_locks[job_id] = lock
+    return lock
+
+
 def _update_clip_version(
     job_id: str,
     clip_index: int,
     video_url: str,
     *,
     metadata_path: Optional[str] = None,
-    metadata: Optional[dict] = None,
 ) -> None:
-    """Atomically persist the selected derivative in memory and metadata."""
+    """Atomically persist the selected derivative in memory and metadata.
+
+    metadata.json is always re-read from disk here: a caller-supplied snapshot
+    from before a minutes-long encode would silently roll back the video_url a
+    concurrent operation on another clip of the same job just persisted.
+    """
     job = _get_job(job_id)
     if not job or not isinstance(job.get("result"), dict):
         raise HTTPException(status_code=400, detail="Job result not available")
@@ -318,7 +339,7 @@ def _update_clip_version(
     if not metadata_path:
         raise HTTPException(status_code=404, detail="Metadata not found")
 
-    metadata = metadata if metadata is not None else _read_json(metadata_path)
+    metadata = _read_json(metadata_path)
     metadata_clips = metadata.get("shorts") if isinstance(metadata, dict) else None
     if not isinstance(metadata_clips, list) or not 0 <= clip_index < len(metadata_clips):
         raise HTTPException(status_code=404, detail="Clip metadata not found")
@@ -935,6 +956,7 @@ async def cleanup_jobs():
                 jobs.pop(job_id, None)
                 for lock_key in [key for key in clip_operation_locks if key[0] == job_id]:
                     clip_operation_locks.pop(lock_key, None)
+                job_state_locks.pop(job_id, None)
 
             # Cleanup SaaSShorts jobs from memory
             try:
@@ -1641,8 +1663,8 @@ async def _edit_clip_locked(req: EditRequest, x_gemini_key: Optional[str]):
         
     try:
         requested_filename = os.path.basename(req.input_filename) if req.input_filename else None
-        layer_store, layer_entry = _resolve_clip_layer_state(
-            output_dir, req.clip_index, clip_data, requested_filename,
+        layer_entry = await _resolve_clip_layer_entry(
+            req.job_id, output_dir, req.clip_index, clip_data, requested_filename,
         )
         input_path = _clean_source_path(output_dir, layer_entry)
         filename = os.path.basename(input_path)
@@ -1729,20 +1751,18 @@ async def _edit_clip_locked(req: EditRequest, x_gemini_key: Optional[str]):
             output_filename = edited_filename
 
         candidate_entry["current_render"] = output_filename
-        layer_store["clips"][str(req.clip_index)] = candidate_entry
-        _save_clip_layers(output_dir, layer_store)
-
         new_video_url = f"/videos/{req.job_id}/{output_filename}"
-        _update_clip_version(
+        await _commit_clip_layer_state(
             req.job_id,
+            output_dir,
             req.clip_index,
+            candidate_entry,
             new_video_url,
             metadata_path=json_files[0],
-            metadata=metadata,
         )
-        
+
         return {
-            "success": True, 
+            "success": True,
             "new_video_url": new_video_url,
             "edit_plan": plan
         }
@@ -1807,6 +1827,20 @@ def _new_clip_layer_store(legacy_entries: Optional[dict] = None) -> dict:
     }
 
 
+def _coerce_layer_store(raw: dict) -> dict:
+    """Bring whatever is on disk into v2 shape without losing v1 entries."""
+    if isinstance(raw, dict) and raw.get("version") == CLIP_LAYERS_VERSION and isinstance(raw.get("clips"), dict):
+        if not isinstance(raw.get("legacy_entries"), dict):
+            raw["legacy_entries"] = {}
+        return raw
+    legacy_entries = {
+        key: value
+        for key, value in (raw.items() if isinstance(raw, dict) else [])
+        if isinstance(value, dict)
+    }
+    return _new_clip_layer_store(legacy_entries)
+
+
 def _filename_from_clip(clip_data: dict, requested_filename: Optional[str] = None) -> str:
     if requested_filename:
         return os.path.basename(requested_filename)
@@ -1851,20 +1885,8 @@ def _resolve_clip_layer_state(
     if not fallback_clean:
         fallback_clean = stripped_current
 
-    if raw.get("version") == CLIP_LAYERS_VERSION and isinstance(raw.get("clips"), dict):
-        store = raw
-        legacy_entries = store.get("legacy_entries")
-        if not isinstance(legacy_entries, dict):
-            legacy_entries = {}
-            store["legacy_entries"] = legacy_entries
-    else:
-        legacy_entries = {
-            key: value
-            for key, value in (raw.items() if isinstance(raw, dict) else [])
-            if isinstance(value, dict)
-        }
-        store = _new_clip_layer_store(legacy_entries)
-        legacy_entries = store["legacy_entries"]
+    store = _coerce_layer_store(raw)
+    legacy_entries = store["legacy_entries"]
 
     clip_key = str(clip_index)
     if clip_key not in store["clips"]:
@@ -1898,6 +1920,52 @@ def _resolve_clip_layer_state(
     entry.setdefault("subtitle", None)
     entry.setdefault("hook", None)
     return store, entry
+
+
+async def _resolve_clip_layer_entry(
+    job_id: str,
+    output_dir: str,
+    clip_index: int,
+    clip_data: dict,
+    requested_filename: Optional[str] = None,
+) -> dict:
+    """Read + lazily migrate one clip's layer entry under the job lock.
+
+    The migration is persisted immediately so a concurrent operation on
+    another clip of the same job re-reads the already-migrated store instead
+    of racing its own migration against ours. Only the (deep-copied) entry is
+    returned — the store snapshot must not be written back after the encode.
+    """
+    async with _get_job_state_lock(job_id):
+        store, entry = _resolve_clip_layer_state(
+            output_dir, clip_index, clip_data, requested_filename,
+        )
+        _save_clip_layers(output_dir, store)
+        return copy.deepcopy(entry)
+
+
+async def _commit_clip_layer_state(
+    job_id: str,
+    output_dir: str,
+    clip_index: int,
+    entry: dict,
+    video_url: str,
+    *,
+    metadata_path: Optional[str] = None,
+) -> None:
+    """Persist one finished clip operation without clobbering parallel clips.
+
+    Encoding ran unlocked and possibly for minutes, so the store read at the
+    start is stale by now. Under the job lock: re-read clip_layers.json,
+    merge only this clip's entry (all other clip and legacy entries stay
+    untouched), save atomically, then update metadata.json/video_url in the
+    same critical section since it is job-wide too.
+    """
+    async with _get_job_state_lock(job_id):
+        store = _coerce_layer_store(_load_clip_layers(output_dir))
+        store["clips"][str(clip_index)] = entry
+        _save_clip_layers(output_dir, store)
+        _update_clip_version(job_id, clip_index, video_url, metadata_path=metadata_path)
 
 
 def _clean_source_path(output_dir: str, entry: dict) -> str:
@@ -2035,8 +2103,8 @@ async def _add_subtitles_locked(req: SubtitleRequest):
     if not requested_filename and not _filename_from_clip(clip_data):
         base_name = os.path.basename(json_files[0]).replace('_metadata.json', '')
         requested_filename = f"{base_name}_clip_{req.clip_index + 1}.mp4"
-    layer_store, layer_entry = _resolve_clip_layer_state(
-        output_dir, req.clip_index, clip_data, requested_filename,
+    layer_entry = await _resolve_clip_layer_entry(
+        req.job_id, output_dir, req.clip_index, clip_data, requested_filename,
     )
     input_path = _clean_source_path(output_dir, layer_entry)
     clean_filename = os.path.basename(input_path)
@@ -2104,24 +2172,23 @@ async def _add_subtitles_locked(req: SubtitleRequest):
         loop = asyncio.get_event_loop()
         await loop.run_in_executor(None, run_burn)
         candidate_entry["current_render"] = output_filename
-        layer_store["clips"][str(req.clip_index)] = candidate_entry
-        _save_clip_layers(output_dir, layer_store)
-        
+
     except HTTPException:
         raise
     except Exception as e:
         print(f"❌ Subtitle Error: {e}")
         raise HTTPException(status_code=500, detail="Subtitle rendering failed. Check the server logs for details.")
-        
+
     # 3. Atomically persist the selected derivative for refresh, ZIP download,
     # social posting and restart recovery.
     new_video_url = f"/videos/{req.job_id}/{output_filename}"
-    _update_clip_version(
+    await _commit_clip_layer_state(
         req.job_id,
+        output_dir,
         req.clip_index,
+        candidate_entry,
         new_video_url,
         metadata_path=json_files[0],
-        metadata=data,
     )
 
     return {
@@ -2208,8 +2275,8 @@ async def _add_hook_locked(req: HookRequest):
     if not requested_filename and not _filename_from_clip(clip_data):
         base_name = os.path.basename(json_files[0]).replace('_metadata.json', '')
         requested_filename = f"{base_name}_clip_{req.clip_index + 1}.mp4"
-    layer_store, layer_entry = _resolve_clip_layer_state(
-        output_dir, req.clip_index, clip_data, requested_filename,
+    layer_entry = await _resolve_clip_layer_entry(
+        req.job_id, output_dir, req.clip_index, clip_data, requested_filename,
     )
     _clean_source_path(output_dir, layer_entry)
 
@@ -2226,22 +2293,21 @@ async def _add_hook_locked(req: HookRequest):
         loop = asyncio.get_event_loop()
         await loop.run_in_executor(None, run_hook)
         candidate_entry["current_render"] = output_filename
-        layer_store["clips"][str(req.clip_index)] = candidate_entry
-        _save_clip_layers(output_dir, layer_store)
-        
+
     except HTTPException:
         raise
     except Exception as e:
         print(f"❌ Hook Error: {e}")
         raise HTTPException(status_code=500, detail="Hook rendering failed. Check the server logs for details.")
-        
+
     new_video_url = f"/videos/{req.job_id}/{output_filename}"
-    _update_clip_version(
+    await _commit_clip_layer_state(
         req.job_id,
+        output_dir,
         req.clip_index,
+        candidate_entry,
         new_video_url,
         metadata_path=json_files[0],
-        metadata=data,
     )
 
     return {
@@ -2298,8 +2364,8 @@ async def _translate_clip_locked(req: TranslateRequest, x_elevenlabs_key: Option
     if not requested_filename and not _filename_from_clip(clip_data):
         base_name = os.path.basename(json_files[0]).replace('_metadata.json', '')
         requested_filename = f"{base_name}_clip_{req.clip_index + 1}.mp4"
-    layer_store, layer_entry = _resolve_clip_layer_state(
-        output_dir, req.clip_index, clip_data, requested_filename,
+    layer_entry = await _resolve_clip_layer_entry(
+        req.job_id, output_dir, req.clip_index, clip_data, requested_filename,
     )
     input_path = _clean_source_path(output_dir, layer_entry)
     filename = os.path.basename(input_path)
@@ -2343,8 +2409,6 @@ async def _translate_clip_locked(req: TranslateRequest, x_elevenlabs_key: Option
             output_filename = translated_filename
 
         candidate_entry["current_render"] = output_filename
-        layer_store["clips"][str(req.clip_index)] = candidate_entry
-        _save_clip_layers(output_dir, layer_store)
 
     except HTTPException:
         raise
@@ -2353,12 +2417,13 @@ async def _translate_clip_locked(req: TranslateRequest, x_elevenlabs_key: Option
         raise HTTPException(status_code=500, detail="Translation failed. Check the server logs for details.")
 
     new_video_url = f"/videos/{req.job_id}/{output_filename}"
-    _update_clip_version(
+    await _commit_clip_layer_state(
         req.job_id,
+        output_dir,
         req.clip_index,
+        candidate_entry,
         new_video_url,
         metadata_path=json_files[0],
-        metadata=data,
     )
 
     return {

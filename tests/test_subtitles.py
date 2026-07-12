@@ -274,3 +274,24 @@ class TestGenerateAss:
                             font_color="#FFFFFF", base_opacity=1.0) is True
         content = out.read_text(encoding="utf-8-sig")
         assert "&H00FFFFFF" in content  # pure white, no dimming
+
+
+class TestBuildSubtitleFilterAlignment:
+    """ASS v4.00+ numpad alignment: 2=bottom, 5=middle, 8=top center.
+
+    'top' used to map to 6 (middle right in v4.00+), pinning subtitles to the
+    right edge — keep both burn paths on the same numpad codes.
+    """
+
+    def test_top_maps_to_numpad_top_center(self):
+        from subtitles import build_subtitle_filter
+        assert "Alignment=8" in build_subtitle_filter("subs.srt", alignment="top")
+
+    def test_middle_and_bottom_mappings(self):
+        from subtitles import build_subtitle_filter
+        assert "Alignment=5" in build_subtitle_filter("subs.srt", alignment="middle")
+        assert "Alignment=2" in build_subtitle_filter("subs.srt", alignment="bottom")
+
+    def test_unknown_alignment_defaults_to_bottom(self):
+        from subtitles import build_subtitle_filter
+        assert "Alignment=2" in build_subtitle_filter("subs.srt", alignment="diagonal")

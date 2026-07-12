@@ -539,11 +539,12 @@ def build_subtitle_filter(srt_path, alignment=2, fontsize=16,
     - Outline mode (bg_opacity=0): Text with colored outline/border
     - Box mode (bg_opacity>0): Text with semi-transparent background box
     """
-    # Position mapping
+    # Position mapping (ASS v4.00+ numpad alignment: 8 = top center,
+    # 6 would be middle right — keep in sync with generate_ass)
     ass_alignment = 2
     align_lower = str(alignment).lower()
     if align_lower == 'top':
-        ass_alignment = 6
+        ass_alignment = 8
     elif align_lower == 'middle':
         ass_alignment = 5
     elif align_lower == 'bottom':

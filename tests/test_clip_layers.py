@@ -1,3 +1,4 @@
+import asyncio
 import json
 import os
 
@@ -181,3 +182,95 @@ def test_layer_state_save_is_atomic_and_versioned(tmp_path):
     app._save_clip_layers(str(tmp_path), payload)
     assert json.loads((tmp_path / app.CLIP_LAYERS_FILE).read_text(encoding="utf-8")) == payload
     assert not [name for name in os.listdir(tmp_path) if name.endswith(".tmp")]
+
+
+def _race_job(monkeypatch, tmp_path, job_id="job-race"):
+    """Two-clip job fixture for the job-wide lost-update regression tests."""
+    output_dir = tmp_path / job_id
+    output_dir.mkdir()
+    (output_dir / "clip_a.mp4").write_bytes(b"a")
+    (output_dir / "clip_b.mp4").write_bytes(b"b")
+    shorts = [
+        {"output_filename": "clip_a.mp4", "video_url": f"/videos/{job_id}/clip_a.mp4"},
+        {"output_filename": "clip_b.mp4", "video_url": f"/videos/{job_id}/clip_b.mp4"},
+    ]
+    metadata_path = output_dir / "video_metadata.json"
+    metadata_path.write_text(json.dumps({"shorts": shorts}), encoding="utf-8")
+    monkeypatch.setattr(app, "jobs", {
+        job_id: {
+            "job_id": job_id,
+            "status": "completed",
+            "output_dir": str(output_dir),
+            "result": {"clips": [dict(short) for short in shorts]},
+            "raw_logs": [],
+            "important_logs": [],
+        }
+    })
+    monkeypatch.setattr(app, "job_state_locks", {})
+    return job_id, output_dir, metadata_path, shorts
+
+
+def test_parallel_clip_commits_do_not_lose_each_other(monkeypatch, tmp_path):
+    """clip_layers.json and metadata.json are job-wide while locking is
+    per clip: both operations read the initial state before either one
+    saves, exactly like two clips encoding in parallel."""
+    job_id, output_dir, metadata_path, shorts = _race_job(monkeypatch, tmp_path)
+
+    async def scenario():
+        entry_a = await app._resolve_clip_layer_entry(job_id, str(output_dir), 0, shorts[0])
+        entry_b = await app._resolve_clip_layer_entry(job_id, str(output_dir), 1, shorts[1])
+
+        entry_a["subtitle"] = {"path": "subs_a.ass"}
+        entry_a["current_render"] = "subtitled_x_clip_a.mp4"
+        await app._commit_clip_layer_state(
+            job_id, str(output_dir), 0, entry_a,
+            f"/videos/{job_id}/subtitled_x_clip_a.mp4",
+            metadata_path=str(metadata_path),
+        )
+
+        entry_b["hook"] = {"text": "Zweiter Hook"}
+        entry_b["current_render"] = "hook_y_clip_b.mp4"
+        await app._commit_clip_layer_state(
+            job_id, str(output_dir), 1, entry_b,
+            f"/videos/{job_id}/hook_y_clip_b.mp4",
+            metadata_path=str(metadata_path),
+        )
+
+    asyncio.run(scenario())
+
+    store = json.loads((output_dir / app.CLIP_LAYERS_FILE).read_text(encoding="utf-8"))
+    assert store["clips"]["0"]["subtitle"] == {"path": "subs_a.ass"}
+    assert store["clips"]["0"]["current_render"] == "subtitled_x_clip_a.mp4"
+    assert store["clips"]["1"]["hook"] == {"text": "Zweiter Hook"}
+
+    metadata = json.loads(metadata_path.read_text(encoding="utf-8"))
+    assert metadata["shorts"][0]["video_url"] == f"/videos/{job_id}/subtitled_x_clip_a.mp4"
+    assert metadata["shorts"][1]["video_url"] == f"/videos/{job_id}/hook_y_clip_b.mp4"
+    assert app.jobs[job_id]["result"]["clips"][0]["video_url"].endswith("subtitled_x_clip_a.mp4")
+
+
+def test_resolve_entry_persists_migration_and_returns_a_copy(monkeypatch, tmp_path):
+    """v1 migration is persisted immediately under the job lock, and the
+    returned entry is a copy — mutating it before commit must not leak
+    into what another clip reads from disk."""
+    job_id, output_dir, _metadata_path, shorts = _race_job(monkeypatch, tmp_path)
+    (output_dir / app.CLIP_LAYERS_FILE).write_text(json.dumps({
+        "clip_a.mp4": {"subtitle": {"path": "legacy_a.ass"}},
+        "clip_b.mp4": {"hook": {"text": "Legacy-Hook B"}},
+    }), encoding="utf-8")
+
+    async def scenario():
+        return await app._resolve_clip_layer_entry(job_id, str(output_dir), 0, shorts[0])
+
+    entry = asyncio.run(scenario())
+    assert entry["subtitle"] == {"path": "legacy_a.ass"}
+
+    on_disk = json.loads((output_dir / app.CLIP_LAYERS_FILE).read_text(encoding="utf-8"))
+    assert on_disk["version"] == app.CLIP_LAYERS_VERSION
+    assert on_disk["clips"]["0"]["subtitle"] == {"path": "legacy_a.ass"}
+    # clip_b's unresolved v1 entry survives for its own later migration
+    assert on_disk["legacy_entries"] == {"clip_b.mp4": {"hook": {"text": "Legacy-Hook B"}}}
+
+    entry["subtitle"]["path"] = "mutated.ass"
+    unchanged = json.loads((output_dir / app.CLIP_LAYERS_FILE).read_text(encoding="utf-8"))
+    assert unchanged["clips"]["0"]["subtitle"] == {"path": "legacy_a.ass"}
