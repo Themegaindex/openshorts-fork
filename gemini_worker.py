@@ -229,6 +229,45 @@ def _get_response_text(response) -> str:
     return "\n".join(parts).strip()
 
 
+def _enum_text(value) -> Optional[str]:
+    if value is None:
+        return None
+    raw = getattr(value, "value", value)
+    text = str(raw)
+    return text if text else None
+
+
+def _response_diagnostics(response) -> dict:
+    """Keep the reason for empty Gemini bodies instead of losing the batch."""
+    prompt_feedback = getattr(response, "prompt_feedback", None)
+    diagnostics = {
+        "prompt_feedback": {
+            "block_reason": _enum_text(getattr(prompt_feedback, "block_reason", None)),
+            "block_reason_message": getattr(prompt_feedback, "block_reason_message", None),
+        },
+        "candidates": [],
+    }
+    for candidate in getattr(response, "candidates", []) or []:
+        safety_ratings = []
+        for rating in getattr(candidate, "safety_ratings", []) or []:
+            safety_ratings.append({
+                "category": _enum_text(getattr(rating, "category", None)),
+                "probability": _enum_text(getattr(rating, "probability", None)),
+                "blocked": bool(getattr(rating, "blocked", False)),
+            })
+        diagnostics["candidates"].append({
+            "finish_reason": _enum_text(getattr(candidate, "finish_reason", None)),
+            "finish_message": getattr(candidate, "finish_message", None),
+            "safety_ratings": safety_ratings,
+        })
+    return diagnostics
+
+
+def _write_worker_result(path: str, result: dict) -> None:
+    with open(path, "w", encoding="utf-8") as f:
+        json.dump(result, f, indent=2, ensure_ascii=False)
+
+
 def _calculate_cost_analysis(response, model_name: str) -> Optional[dict]:
     usage = getattr(response, "usage_metadata", None)
     if not usage:
@@ -333,28 +372,66 @@ def main() -> int:
     )
 
     _log(f"🤖 Gemini worker request: mode={args.mode} strategy={args.strategy} model={model_name} items={len(payload.get('windows', []))}")
-    response = client.models.generate_content(
-        model=model_name,
-        contents=prompt,
-        config=config,
-    )
+    try:
+        response = client.models.generate_content(
+            model=model_name,
+            contents=prompt,
+            config=config,
+        )
+    except Exception as exc:
+        result = {
+            "status": "error",
+            "mode": args.mode,
+            "error_type": "api_error",
+            "error": str(exc),
+            "payload": None,
+            "cost_analysis": None,
+            "raw_text": "",
+            "diagnostics": {},
+        }
+        _write_worker_result(args.output_path, result)
+        _log(f"❌ Gemini worker API error: {exc}")
+        return 2
 
     raw_text = _get_response_text(response)
+    diagnostics = _response_diagnostics(response)
+    cost_analysis = _calculate_cost_analysis(response, model_name)
     # With response_schema the SDK returns an already-validated object; fall
     # back to the text-repair path only when that is unavailable.
-    parsed_obj = getattr(response, "parsed", None)
-    if parsed_obj is not None:
-        parsed = parsed_obj.model_dump() if hasattr(parsed_obj, "model_dump") else parsed_obj
-    else:
-        parsed = _parse_json_response_text(raw_text)
+    try:
+        parsed_obj = getattr(response, "parsed", None)
+        if parsed_obj is not None:
+            parsed = parsed_obj.model_dump() if hasattr(parsed_obj, "model_dump") else parsed_obj
+        else:
+            parsed = _parse_json_response_text(raw_text)
+    except Exception as exc:
+        block_reason = diagnostics.get("prompt_feedback", {}).get("block_reason")
+        explicitly_blocked = bool(block_reason and "UNSPECIFIED" not in block_reason.upper())
+        error_type = "blocked_response" if explicitly_blocked else (
+            "empty_response" if not raw_text else "invalid_response"
+        )
+        result = {
+            "status": "error",
+            "mode": args.mode,
+            "error_type": error_type,
+            "error": str(exc),
+            "payload": None,
+            "cost_analysis": cost_analysis,
+            "raw_text": raw_text,
+            "diagnostics": diagnostics,
+        }
+        _write_worker_result(args.output_path, result)
+        _log(f"❌ Gemini worker response error ({error_type}): {exc}")
+        return 3
     result = {
+        "status": "success",
         "mode": args.mode,
         "payload": parsed,
-        "cost_analysis": _calculate_cost_analysis(response, model_name),
+        "cost_analysis": cost_analysis,
         "raw_text": raw_text,
+        "diagnostics": diagnostics,
     }
-    with open(args.output_path, "w", encoding="utf-8") as f:
-        json.dump(result, f, indent=2, ensure_ascii=False)
+    _write_worker_result(args.output_path, result)
     _log(f"✅ Gemini worker success: mode={args.mode}")
     return 0
 

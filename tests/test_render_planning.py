@@ -168,6 +168,33 @@ class TestPersonHeadCenter:
 
 
 class TestDecideSceneLayoutWithPersons:
+    def test_arafat_clip_one_regression_uses_spatially_stable_split(self):
+        # Real 24-sample pattern from job 13e85fdc: the wide-shot detector
+        # alternates between one and two people, but every valid pair lands in
+        # the same left/right seats. One duplicate detection on the right must
+        # be ignored rather than poisoning the pair centers.
+        pair_indices = {0, 6, 7, 12, 13, 17, 18, 19, 20, 21, 22, 23}
+        persons = []
+        for index in range(24):
+            if index == 0:
+                persons.append([_person(1313, 300), _person(1394, 300)])
+            elif index in pair_indices:
+                persons.append([_person(390, 300), _person(1315, 320)])
+            else:
+                persons.append([_person(1315, 320)])
+
+        decision = decide_scene_layout_detailed(
+            [[] for _ in range(24)],
+            1920,
+            layout_style="smart",
+            person_samples=persons,
+        )
+
+        assert decision.strategy == "SPLIT"
+        assert decision.split_centers[0][0] == 540
+        assert decision.split_centers[1][0] == 1465
+        assert decision.confidence == 11 / 24
+
     def test_wide_shot_two_persons_no_faces_splits(self):
         # The podcast bug: face model sees nothing on the wide shot, but YOLO
         # reliably sees two people -> must SPLIT with head centers.

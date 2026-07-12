@@ -17,6 +17,12 @@ LOW_LAYOUT_CONFIDENCE = 0.55
 DUO_STABLE_RATIO = 0.60
 MULTI_PERSON_AMBIGUITY_RATIO = 0.40
 GROUP_STABLE_RATIO = 0.40
+LONG_SCENE_SAMPLE_THRESHOLD = 10
+LONG_SCENE_MIN_PAIR_SAMPLES = 6
+LONG_SCENE_PAIR_RATIO = 0.30
+LONG_SCENE_SINGLE_RATIO = 0.70
+LONG_SCENE_MAX_TRACK_PAIR_SAMPLES = 2
+PAIR_CENTER_TOLERANCE_FRACTION = 0.12
 
 # SPLIT requirements: two faces in most samples, horizontally separated by at
 # least this fraction of the frame width (otherwise the two crops would show
@@ -97,6 +103,26 @@ def _median_pair_centers(pair_samples):
     return left_center, right_center
 
 
+def _consistent_pair_samples(pair_samples, frame_width):
+    """Discard spatial outliers before deciding that two seats persist.
+
+    Wide interview shots often miss one guest in many samples.  A smaller set
+    of detections is still strong evidence when the left and right centers
+    repeatedly land in the same two places.  Conversely, duplicate boxes on
+    one person or unrelated passers-by should not create a split.
+    """
+    if not pair_samples:
+        return []
+    median_left, median_right = _median_pair_centers(pair_samples)
+    tolerance = max(1.0, float(frame_width) * PAIR_CENTER_TOLERANCE_FRACTION)
+    return [
+        pair
+        for pair in pair_samples
+        if abs(pair[0][0] - median_left[0]) <= tolerance
+        and abs(pair[1][0] - median_right[0]) <= tolerance
+    ]
+
+
 def _ratio_matching(samples, predicate):
     return (sum(1 for sample in samples if predicate(sample)) / len(samples)) if samples else 0.0
 
@@ -171,18 +197,41 @@ def decide_scene_layout_detailed(face_samples, frame_width, layout_style="smart"
     if group_ratio >= GROUP_STABLE_RATIO or avg > 2.5:
         return decision("GENERAL", None, max(group_ratio, min(1.0, avg / 3.0)), "three or more people")
 
-    face_pairs = _separated_face_pairs(samples, frame_width)
-    person_pairs = _separated_person_pairs(p_samples, frame_width)
+    face_pairs = _consistent_pair_samples(
+        _separated_face_pairs(samples, frame_width), frame_width,
+    )
+    person_pairs = _consistent_pair_samples(
+        _separated_person_pairs(p_samples, frame_width), frame_width,
+    )
     face_pair_ratio = (len(face_pairs) / len(samples)) if samples else 0.0
     person_pair_ratio = (len(person_pairs) / len(p_samples)) if p_samples else 0.0
     duo_ratio = max(face_pair_ratio, person_pair_ratio)
 
-    if duo_ratio >= DUO_STABLE_RATIO:
+    def pair_signal_is_stable(pair_count, pair_ratio, sample_count):
+        if sample_count >= LONG_SCENE_SAMPLE_THRESHOLD:
+            return (
+                pair_count >= LONG_SCENE_MIN_PAIR_SAMPLES
+                and pair_ratio >= LONG_SCENE_PAIR_RATIO
+            )
+        return pair_count >= 3 and pair_ratio >= DUO_STABLE_RATIO
+
+    face_pair_stable = pair_signal_is_stable(
+        len(face_pairs), face_pair_ratio, len(samples),
+    )
+    person_pair_stable = pair_signal_is_stable(
+        len(person_pairs), person_pair_ratio, len(p_samples),
+    )
+
+    if face_pair_stable or person_pair_stable:
         # Faces give the best head anchor when they are themselves stable;
         # otherwise use profile-safe whole-person detections.
-        pairs = face_pairs if face_pair_ratio >= DUO_STABLE_RATIO else person_pairs
+        pairs = face_pairs if face_pair_stable else person_pairs
+        confidence = face_pair_ratio if face_pair_stable else person_pair_ratio
         centers = _median_pair_centers(pairs)
-        return decision("SPLIT", [centers[0], centers[1]], duo_ratio, "two separated people persist")
+        return decision(
+            "SPLIT", [centers[0], centers[1]], confidence,
+            "two spatially stable people persist",
+        )
 
     face_multi_ratio = _ratio_matching(samples, lambda sample: len(sample) >= 2)
     person_multi_ratio = _ratio_matching(p_samples, lambda sample: len(sample) >= 2)
@@ -193,6 +242,18 @@ def decide_scene_layout_detailed(face_samples, frame_width, layout_style="smart"
     face_single_ratio = _ratio_matching(samples, lambda sample: len(sample) == 1)
     person_single_ratio = _ratio_matching(p_samples, lambda sample: len(sample) == 1)
     single_ratio = max(face_single_ratio, person_single_ratio)
+    evidence_sample_count = max(len(samples), len(p_samples))
+    consistent_pair_count = max(len(face_pairs), len(person_pairs))
+    if evidence_sample_count >= LONG_SCENE_SAMPLE_THRESHOLD:
+        if (
+            single_ratio >= LONG_SCENE_SINGLE_RATIO
+            and consistent_pair_count <= LONG_SCENE_MAX_TRACK_PAIR_SAMPLES
+        ):
+            return decision("TRACK", None, single_ratio, "one person dominates a long scene")
+        return decision(
+            "GENERAL", None, max(multi_ratio, min(1.0, duo_ratio)),
+            "long-scene people evidence is uncertain",
+        )
     if single_ratio >= DUO_STABLE_RATIO:
         return decision("TRACK", None, single_ratio, "one person persists")
 

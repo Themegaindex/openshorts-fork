@@ -416,10 +416,16 @@ def _serialize_job(job: dict) -> dict:
         "phase_progress_percent",
         "created_at",
         "started_at",
+        "finished_at",
         "updated_at",
         "last_heartbeat_at",
         "elapsed_seconds",
+        "actual_duration_seconds",
         "eta_seconds",
+        "phase_eta_seconds",
+        "eta_state",
+        "phase_durations_seconds",
+        "worker_duration_seconds",
         "attempt",
         "resume_count",
         "stall_state",
@@ -440,6 +446,7 @@ def _serialize_job(job: dict) -> dict:
         "processing_mode",
         "analysis_error",
         "analysis_status",
+        "analysis_coverage",
         "archive_status",
         "job_type",
     }
@@ -476,10 +483,15 @@ def _build_job_state(job_id: str, *, output_dir: str, source_type: Optional[str]
         "phase_progress_percent": 0.0,
         "created_at": now,
         "started_at": None,
+        "finished_at": None,
         "updated_at": now,
         "last_heartbeat_at": now,
         "elapsed_seconds": 0.0,
+        "actual_duration_seconds": None,
         "eta_seconds": None,
+        "phase_eta_seconds": None,
+        "eta_state": "calculating",
+        "phase_durations_seconds": {},
         "attempt": 0,
         "resume_count": 0,
         "stall_state": "healthy",
@@ -499,6 +511,7 @@ def _build_job_state(job_id: str, *, output_dir: str, source_type: Optional[str]
         "result": None,
         "analysis_status": None,
         "analysis_error": None,
+        "analysis_coverage": None,
         "processing_mode": None,
     }
 
@@ -536,6 +549,20 @@ def _mark_job_status(job_id: str, status: str, *, error_summary: Optional[str] =
     job["updated_at"] = now
     if status == "processing" and not job.get("started_at"):
         job["started_at"] = now
+    if status == "processing":
+        job["finished_at"] = None
+        job["actual_duration_seconds"] = None
+        job["eta_state"] = "calculating"
+    elif status in TERMINAL_JOB_STATUSES:
+        finished_at = float(job.get("finished_at") or now)
+        job["finished_at"] = finished_at
+        started_at = job.get("started_at")
+        job["actual_duration_seconds"] = (
+            max(0, int(finished_at - float(started_at))) if started_at else None
+        )
+        job["phase_eta_seconds"] = 0
+        job["eta_seconds"] = 0
+        job["eta_state"] = "done"
     if error_summary is not None:
         job["error_summary"] = error_summary
     if resumable is not None:
@@ -590,8 +617,22 @@ def _apply_job_event(job_id: str, event: dict) -> None:
         job["progress_percent"] = max(0.0, min(100.0, float(event["progress_percent"])))
     if event.get("phase_progress_percent") is not None:
         job["phase_progress_percent"] = max(0.0, min(100.0, float(event["phase_progress_percent"])))
-    if event.get("eta_seconds") is not None:
-        job["eta_seconds"] = max(0, int(event["eta_seconds"]))
+    if "phase_eta_seconds" in event:
+        value = event.get("phase_eta_seconds")
+        job["phase_eta_seconds"] = None if value is None else max(0, int(value))
+    if "eta_seconds" in event:
+        value = event.get("eta_seconds")
+        job["eta_seconds"] = None if value is None else max(0, int(value))
+    if event.get("eta_state") in {"calculating", "live", "done"}:
+        job["eta_state"] = event["eta_state"]
+    if isinstance(event.get("phase_durations_seconds"), dict):
+        job["phase_durations_seconds"] = {
+            str(key): max(0.0, float(value))
+            for key, value in event["phase_durations_seconds"].items()
+            if isinstance(value, (int, float))
+        }
+    if event.get("worker_duration_seconds") is not None:
+        job["worker_duration_seconds"] = max(0.0, float(event["worker_duration_seconds"]))
     if event.get("attempt") is not None:
         job["attempt"] = int(event["attempt"])
     if event.get("resume_count") is not None:
@@ -609,6 +650,8 @@ def _apply_job_event(job_id: str, event: dict) -> None:
     if event.get("analysis_error") is not None:
         job["analysis_error"] = event["analysis_error"]
         job["error_summary"] = event["analysis_error"]
+    if isinstance(event.get("analysis_coverage"), dict):
+        job["analysis_coverage"] = event["analysis_coverage"]
 
     artifact = event.get("artifact")
     if isinstance(artifact, dict):
@@ -838,7 +881,7 @@ def _build_result_from_metadata(job_id: str, metadata_path: str, output_dir: str
         return None
 
     result = {'clips': clips, 'cost_analysis': data.get('cost_analysis')}
-    for extra_key in ('analysis_status', 'analysis_error', 'processing_mode'):
+    for extra_key in ('analysis_status', 'analysis_error', 'analysis_coverage', 'processing_mode'):
         if extra_key in data:
             result[extra_key] = data.get(extra_key)
 
@@ -1137,13 +1180,25 @@ def _refresh_job_result(job_id: str, output_dir: str) -> Optional[dict]:
 def _build_status_payload(job: dict) -> dict:
     now = _now_ts()
     started_at = job.get("started_at")
+    finished_at = job.get("finished_at")
+    if not finished_at and job.get("status") in TERMINAL_JOB_STATUSES:
+        # Backward-compatible freeze for jobs completed before finished_at was
+        # persisted. updated_at is the supervisor's last validated job write.
+        finished_at = job.get("updated_at") or job.get("last_heartbeat_at")
     last_heartbeat_at = job.get("last_heartbeat_at")
     elapsed_seconds = None
     if started_at:
-        elapsed_seconds = max(0, int(now - float(started_at)))
+        elapsed_end = float(finished_at) if finished_at else now
+        elapsed_seconds = max(0, int(elapsed_end - float(started_at)))
+    actual_duration_seconds = job.get("actual_duration_seconds")
+    if actual_duration_seconds is None and finished_at and started_at:
+        actual_duration_seconds = elapsed_seconds
     seconds_since_heartbeat = None
     if last_heartbeat_at:
         seconds_since_heartbeat = max(0, int(now - float(last_heartbeat_at)))
+    seconds_since_finish = None
+    if finished_at:
+        seconds_since_finish = max(0, int(now - float(finished_at)))
 
     display_raw_logs = [_display_log_entry(entry) for entry in job.get("raw_logs", [])][-JOB_LOG_LIMIT:]
     display_important_logs = [entry for entry in display_raw_logs if entry.get("important")][-IMPORTANT_LOG_LIMIT:]
@@ -1156,11 +1211,16 @@ def _build_status_payload(job: dict) -> dict:
         "progress_percent": job.get("progress_percent"),
         "phase_progress_percent": job.get("phase_progress_percent"),
         "eta_seconds": job.get("eta_seconds"),
+        "phase_eta_seconds": job.get("phase_eta_seconds"),
+        "eta_state": job.get("eta_state") or "calculating",
         "elapsed_seconds": elapsed_seconds,
+        "actual_duration_seconds": actual_duration_seconds,
         "created_at": job.get("created_at"),
+        "finished_at": finished_at,
         "updated_at": job.get("updated_at"),
         "last_heartbeat_at": last_heartbeat_at,
         "seconds_since_heartbeat": seconds_since_heartbeat,
+        "seconds_since_finish": seconds_since_finish,
         "attempt": job.get("attempt"),
         "resume_count": job.get("resume_count"),
         "stall_state": job.get("stall_state"),
@@ -1171,12 +1231,15 @@ def _build_status_payload(job: dict) -> dict:
         "source_url": job.get("source_url"),
         "video_duration_seconds": job.get("video_duration_seconds"),
         "total_estimate_seconds": job.get("total_estimate_seconds"),
+        "phase_durations_seconds": job.get("phase_durations_seconds", {}),
+        "worker_duration_seconds": job.get("worker_duration_seconds"),
         "important_logs": display_important_logs,
         "raw_logs": display_raw_logs,
         "logs": [entry.get("message", "") for entry in display_raw_logs],
         "result": job.get("result"),
         "analysis_status": job.get("analysis_status"),
         "analysis_error": job.get("analysis_error"),
+        "analysis_coverage": job.get("analysis_coverage"),
         "processing_mode": job.get("processing_mode"),
         "artifacts": job.get("artifacts", {}),
     }
@@ -1479,8 +1542,13 @@ def _build_support_log_text(job: dict) -> str:
         f"Status: {job.get('status')}",
         f"Phase: {job.get('phase_label') or job.get('phase')}",
         f"Progress: {job.get('progress_percent')}",
-        f"ETA Seconds: {job.get('eta_seconds')}",
+        f"Phase ETA Seconds: {job.get('phase_eta_seconds')}",
+        f"ETA State: {job.get('eta_state')}",
         f"Elapsed Seconds: {job.get('elapsed_seconds')}",
+        f"Actual Duration Seconds: {job.get('actual_duration_seconds')}",
+        f"Finished At: {job.get('finished_at')}",
+        f"Phase Durations Seconds: {job.get('phase_durations_seconds') or {}}",
+        f"Seconds Since Completion: {job.get('seconds_since_finish')}",
         f"Last Heartbeat Age: {job.get('seconds_since_heartbeat')}",
         f"Stall State: {job.get('stall_state')}",
         f"Attempt: {job.get('attempt')}",
@@ -1490,6 +1558,7 @@ def _build_support_log_text(job: dict) -> str:
         f"Source URL: {job.get('source_url') or ''}",
         f"Processing Mode: {job.get('processing_mode') or ''}",
         f"Analysis Status: {job.get('analysis_status') or ''}",
+        f"Analysis Coverage: {job.get('analysis_coverage') or {}}",
         f"Error Summary: {job.get('error_summary') or ''}",
         "Warnings:",
     ]
@@ -1608,6 +1677,14 @@ async def resume_job(job_id: str, request: Request, body: Optional[ResumeRequest
     # Restart the elapsed clock: counting from the original start (incl. a
     # possible multi-hour freeze) makes runtime and ETA meaningless.
     job["started_at"] = job["updated_at"]
+    job["finished_at"] = None
+    job["actual_duration_seconds"] = None
+    job["phase_eta_seconds"] = None
+    job["eta_seconds"] = None
+    job["eta_state"] = "calculating"
+    job["phase_durations_seconds"] = {}
+    job.pop("worker_duration_seconds", None)
+    job.pop("total_estimate_seconds", None)
     job["is_resumable"] = True
     _append_log(job_id, "Job re-queued for resume.", category="resume", important=True)
     await job_queue.put(job_id)
