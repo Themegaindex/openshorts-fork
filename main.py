@@ -36,7 +36,12 @@ import json
 import shutil
 from typing import List, Optional
 from pydantic import BaseModel
-from clip_selection import build_transcript_windows, snap_clip_to_words
+from clip_selection import (
+    build_transcript_windows,
+    choose_distinct_clips,
+    selection_limits,
+    snap_clip_to_words,
+)
 from render_planning import (
     SceneLayoutDecision,
     decide_scene_layout_detailed,
@@ -96,6 +101,9 @@ GEMINI_ANALYSIS_MODEL = (
 GEMINI_SCORE_BATCH_SIZE = int(os.environ.get("GEMINI_SCORE_BATCH_SIZE", "8"))
 GEMINI_DETAIL_BATCH_SIZE = int(os.environ.get("GEMINI_DETAIL_BATCH_SIZE", "4"))
 GEMINI_SHORTLIST_LIMIT = int(os.environ.get("GEMINI_SHORTLIST_LIMIT", "10"))
+GEMINI_LONG_VIDEO_SECONDS = float(os.environ.get("GEMINI_LONG_VIDEO_SECONDS", "7200"))
+GEMINI_LONG_SHORTLIST_LIMIT = int(os.environ.get("GEMINI_LONG_SHORTLIST_LIMIT", "15"))
+GEMINI_MAX_CLIPS = int(os.environ.get("GEMINI_MAX_CLIPS", "10"))
 GEMINI_WORKER_SCRIPT = os.path.join(os.path.dirname(os.path.abspath(__file__)), "gemini_worker.py")
 PHASE_RANGES = {
     "queued": (0.0, 2.0),
@@ -107,50 +115,15 @@ PHASE_RANGES = {
     "completed": (100.0, 100.0),
 }
 
-# ETA model: learned from THIS machine's finished jobs (.phase_stats.json).
-# Factors are processing-seconds per second of source video; analyze is
-# roughly constant per job. Defaults seed the estimate until data exists.
-PHASE_STATS_FILE = os.path.join(os.path.dirname(os.path.abspath(__file__)), ".phase_stats.json")
+# ETA is measured from the running job only. Cross-job history mixed full
+# renders with short-clip jobs and produced misleading multi-hour totals.
 PHASE_ETA_ORDER = ["download", "transcribe", "analyze", "render", "finalize"]
-PHASE_DEFAULT_FACTORS = {"download": 0.05, "transcribe": 0.85, "render": 0.35, "finalize": 0.005}
-ANALYZE_DEFAULT_SECONDS = 60.0
-
-
-def _load_phase_factors():
-    """Median factor per phase from the last finished jobs; defaults otherwise."""
-    factors = dict(PHASE_DEFAULT_FACTORS)
-    factors["analyze"] = ANALYZE_DEFAULT_SECONDS
-    try:
-        with open(PHASE_STATS_FILE, "r", encoding="utf-8") as f:
-            history = json.load(f)
-        for phase, samples in history.items():
-            values = sorted(float(v) for v in samples if v is not None)
-            if values:
-                factors[phase] = values[len(values) // 2]
-    except Exception:
-        pass
-    return factors
-
-
-def _record_phase_stats(phase_durations, video_duration):
-    """Persist per-phase timing of a finished job (keeps the last 10 samples)."""
-    if not video_duration or video_duration <= 0:
-        return
-    try:
-        history = {}
-        if os.path.exists(PHASE_STATS_FILE):
-            with open(PHASE_STATS_FILE, "r", encoding="utf-8") as f:
-                history = json.load(f)
-        for phase, seconds in phase_durations.items():
-            if phase not in PHASE_ETA_ORDER or seconds <= 0:
-                continue
-            value = seconds if phase == "analyze" else seconds / float(video_duration)
-            history.setdefault(phase, []).append(round(value, 4))
-            history[phase] = history[phase][-10:]
-        with open(PHASE_STATS_FILE, "w", encoding="utf-8") as f:
-            json.dump(history, f)
-    except Exception:
-        pass  # stats are best-effort; never break a job over them
+LIVE_ETA_THRESHOLDS = {
+    "transcribe": (120.0, 10.0),
+    "analyze": (5.0, 5.0),
+    "render": (10.0, 10.0),
+    "finalize": (2.0, 5.0),
+}
 
 
 class JobReporter:
@@ -165,10 +138,6 @@ class JobReporter:
         self.last_heartbeat_at = 0.0
         self.video_duration = None
         self.phase_durations = {}
-        self.phase_factors = _load_phase_factors()
-        self._estimate_announced = False
-        self._persisted_phases = set()
-        self._last_total_update = 0.0
 
     def _overall_progress(self, phase: Optional[str] = None, phase_progress_percent: Optional[float] = None) -> float:
         current_phase = phase or self.phase
@@ -179,69 +148,22 @@ class JobReporter:
             return max(0.0, min(100.0, end))
         return round(start + ((end - start) * (phase_percent / 100.0)), 2)
 
-    def _phase_total_estimate(self, phase: str) -> Optional[float]:
-        """Expected total duration of a phase on this machine, in seconds."""
-        if phase == "analyze":
-            return float(self.phase_factors.get("analyze", ANALYZE_DEFAULT_SECONDS))
-        factor = self.phase_factors.get(phase)
-        if factor is None or not self.video_duration:
-            return None
-        return float(factor) * float(self.video_duration)
+    def _estimate_live_phase_seconds(self) -> Optional[int]:
+        """Estimate only the running phase from this job's measured progress.
 
-    def _estimate_remaining_seconds(self) -> Optional[int]:
-        """Per-phase ETA: live measured rate for the current phase plus learned
-        estimates for the phases still ahead. Far more accurate than the old
-        linear extrapolation over the (arbitrarily weighted) global percent."""
+        Cross-job totals mixed full-video renders with short-clip renders and
+        could be wrong by hours.  A live phase ETA is intentionally withheld
+        until enough of the current job has been measured.
+        """
         if self.phase not in PHASE_ETA_ORDER:
             return None
         now = time.time()
         in_phase = max(0.0, now - self.phase_started_at)
         phase_percent = max(0.0, min(100.0, self.phase_progress_percent))
-
-        if phase_percent >= 3.0 and in_phase >= 5.0:
-            # Real measured speed of the running phase.
-            remaining = max(0.0, (in_phase * 100.0 / phase_percent) - in_phase)
-        else:
-            estimate = self._phase_total_estimate(self.phase)
-            if estimate is None:
-                return None
-            remaining = max(0.0, estimate - in_phase)
-
-        for upcoming in PHASE_ETA_ORDER[PHASE_ETA_ORDER.index(self.phase) + 1:]:
-            estimate = self._phase_total_estimate(upcoming)
-            if estimate:
-                remaining += estimate
-        return int(remaining)
-
-    def _default_eta_seconds(self, overall_progress: float) -> Optional[int]:
-        estimated = self._estimate_remaining_seconds()
-        if estimated is not None:
-            return estimated
-        elapsed = time.time() - self.started_at
-        if overall_progress <= 0.0:
+        min_elapsed, min_percent = LIVE_ETA_THRESHOLDS.get(self.phase, (5.0, 10.0))
+        if in_phase < min_elapsed or phase_percent < min_percent:
             return None
-        remaining = elapsed * ((100.0 - overall_progress) / overall_progress)
-        return max(0, int(remaining))
-
-    def _maybe_announce_total_estimate(self):
-        """Once the video duration is known, tell the user the expected total."""
-        if self._estimate_announced or not self.video_duration:
-            return
-        self._estimate_announced = True
-        total = 0.0
-        for phase in PHASE_ETA_ORDER:
-            estimate = self._phase_total_estimate(phase)
-            if estimate:
-                total += estimate
-        if total <= 0:
-            return
-        minutes = max(1, int(round(total / 60.0)))
-        self.emit(
-            "estimate",
-            f"⏱️ Estimated total processing time: ~{minutes} min for this video.",
-            important=True,
-            total_estimate_seconds=int(total),
-        )
+        return max(0, int((in_phase * 100.0 / phase_percent) - in_phase))
 
     def emit(self, event_type: str, message: Optional[str] = None, **extra):
         if extra.get("video_duration_seconds"):
@@ -255,40 +177,37 @@ class JobReporter:
             "phase_progress_percent": extra.pop("phase_progress_percent", self.phase_progress_percent),
             "progress_percent": extra.pop("progress_percent", self.progress_percent),
         }
-        eta_seconds = extra.pop("eta_seconds", None)
-        if eta_seconds is None:
-            eta_seconds = self._default_eta_seconds(payload["progress_percent"])
-        payload["eta_seconds"] = eta_seconds
+        phase_eta_seconds = extra.pop("phase_eta_seconds", None)
+        # Backward-compatible input for callers that supplied yt-dlp's live
+        # ETA before phase_eta_seconds existed.
+        if phase_eta_seconds is None:
+            phase_eta_seconds = extra.pop("eta_seconds", None)
+        if event_type == "summary" and extra.get("status") == "completed":
+            phase_eta_seconds = 0
+            eta_state = "done"
+        else:
+            if phase_eta_seconds is None:
+                phase_eta_seconds = self._estimate_live_phase_seconds()
+            eta_state = "live" if phase_eta_seconds is not None else "calculating"
+        payload["phase_eta_seconds"] = phase_eta_seconds
+        payload["eta_state"] = eta_state
+        # Keep the legacy field populated for older clients.  New clients use
+        # phase_eta_seconds and its explicit phase-only label.
+        payload["eta_seconds"] = phase_eta_seconds
         if message:
             payload["message"] = message
-        # Keep the announced total honest: refresh it every ~15s from the REAL
-        # elapsed time plus the live remaining estimate, so the dashboard total
-        # converges to reality instead of freezing at the initial guess.
-        if (self._estimate_announced and eta_seconds is not None
-                and "total_estimate_seconds" not in extra
-                and time.time() - self._last_total_update >= 15.0):
-            elapsed = sum(self.phase_durations.values()) + max(0.0, time.time() - self.phase_started_at)
-            payload["total_estimate_seconds"] = int(elapsed + eta_seconds)
-            self._last_total_update = time.time()
         payload.update(extra)
         # Leading newline: yt-dlp writes \r-progress into the same stdout, and
         # an event glued behind such a fragment would not be recognized by the
         # server — its heartbeat would be lost and the stall monitor could
         # kill a healthy download.
         print(f"\n{EVENT_PREFIX}{json.dumps(payload, ensure_ascii=False)}", flush=True)
-        if event_type != "estimate":
-            self._maybe_announce_total_estimate()
 
     def set_phase(self, phase: str, label: str, *, message: Optional[str] = None, phase_progress_percent: float = 0.0, **extra):
-        # Record how long the finished phase actually took (feeds the ETA model).
+        # Record the finished phase for the exact completion breakdown.
         if self.phase in PHASE_ETA_ORDER:
             duration = time.time() - self.phase_started_at
             self.phase_durations[self.phase] = duration
-            # Learn each phase the moment it completes — even crashed or
-            # aborted jobs then calibrate the ETA model for this machine.
-            if self.phase not in self._persisted_phases and self.video_duration:
-                _record_phase_stats({self.phase: duration}, self.video_duration)
-                self._persisted_phases.add(self.phase)
         self.phase = phase
         self.phase_label = label
         self.phase_started_at = time.time()
@@ -301,6 +220,9 @@ class JobReporter:
             phase_label=label,
             phase_progress_percent=phase_progress_percent,
             progress_percent=self.progress_percent,
+            phase_durations_seconds={
+                key: round(value, 3) for key, value in self.phase_durations.items()
+            },
             **extra,
         )
 
@@ -340,13 +262,10 @@ class JobReporter:
 
     def summary(self, status: str, message: str, *, resumable: bool = False, **extra):
         if status == "completed":
-            # Close the timing of the final phase and persist what we measured,
-            # so the next job's ETA is calibrated to THIS machine. Phases that
-            # were already recorded at their phase switch are skipped.
+            # Close the final phase so the server can persist an exact phase
+            # breakdown alongside its independently validated wall-clock end.
             if self.phase in PHASE_ETA_ORDER:
                 self.phase_durations[self.phase] = time.time() - self.phase_started_at
-            leftover = {p: d for p, d in self.phase_durations.items() if p not in self._persisted_phases}
-            _record_phase_stats(leftover, self.video_duration)
         phase = "completed" if status == "completed" else self.phase
         progress_percent = 100.0 if status == "completed" else self.progress_percent
         self.emit(
@@ -358,6 +277,10 @@ class JobReporter:
             progress_percent=progress_percent,
             phase_progress_percent=100.0 if status == "completed" else self.phase_progress_percent,
             resumable=resumable,
+            worker_duration_seconds=round(time.time() - self.started_at, 3),
+            phase_durations_seconds={
+                key: round(value, 3) for key, value in self.phase_durations.items()
+            },
             **extra,
         )
 
@@ -531,9 +454,24 @@ def _normalize_scored_windows(payload, video_duration):
     return normalized
 
 
-def _call_gemini_worker(mode, payload, *, output_dir, video_title, strategy, batch_index, total_batches, attempt, timeout_seconds=GEMINI_REQUEST_TIMEOUT_SECONDS):
-    request_path = os.path.join(output_dir, f"{video_title}_{mode}_batch_{batch_index + 1}_attempt_{attempt}.request.json")
-    response_path = os.path.join(output_dir, f"{video_title}_{mode}_batch_{batch_index + 1}_attempt_{attempt}.response.json")
+class GeminiWorkerError(RuntimeError):
+    def __init__(self, message, result=None):
+        super().__init__(message)
+        self.result = result if isinstance(result, dict) else {}
+        self.error_type = str(self.result.get("error_type") or "worker_error")
+
+
+def _call_gemini_worker(
+    mode, payload, *, output_dir, video_title, strategy, batch_index,
+    total_batches, attempt, timeout_seconds=GEMINI_REQUEST_TIMEOUT_SECONDS,
+    artifact_suffix=None,
+):
+    suffix = f"_{sanitize_filename(str(artifact_suffix))}" if artifact_suffix else ""
+    artifact_stem = f"{video_title}_{mode}_batch_{batch_index + 1}{suffix}_attempt_{attempt}"
+    request_path = os.path.join(output_dir, f"{artifact_stem}.request.json")
+    response_path = os.path.join(output_dir, f"{artifact_stem}.response.json")
+    if os.path.exists(response_path):
+        os.remove(response_path)
     _save_json_file(request_path, payload)
 
     worker_cmd = [
@@ -591,14 +529,28 @@ def _call_gemini_worker(mode, payload, *, output_dir, video_title, strategy, bat
             except subprocess.TimeoutExpired:
                 process.kill()
 
+    worker_result = None
+    if os.path.exists(response_path):
+        try:
+            with open(response_path, "r", encoding="utf-8") as f:
+                worker_result = json.load(f)
+        except Exception:
+            worker_result = None
     if process.returncode != 0:
-        raise RuntimeError(
-            f"Gemini worker failed for {mode} batch {batch_index + 1}/{total_batches} with exit code {process.returncode}."
+        detail = (worker_result or {}).get("error")
+        error_type = (worker_result or {}).get("error_type")
+        reason = f" ({error_type}: {detail})" if error_type or detail else ""
+        raise GeminiWorkerError(
+            f"Gemini worker failed for {mode} batch {batch_index + 1}/{total_batches} "
+            f"with exit code {process.returncode}{reason}.",
+            worker_result,
         )
-    if not os.path.exists(response_path):
-        raise RuntimeError(f"Gemini worker did not produce a response file for {mode} batch {batch_index + 1}/{total_batches}.")
-    with open(response_path, "r", encoding="utf-8") as f:
-        return json.load(f)
+    if worker_result is None:
+        raise GeminiWorkerError(
+            f"Gemini worker did not produce a readable response file for {mode} "
+            f"batch {batch_index + 1}/{total_batches}.",
+        )
+    return worker_result
 
 
 def _strip_code_fences(text):
@@ -704,7 +656,18 @@ def _calculate_cost_analysis(response, model_name):
     }
 
 
-def _normalize_shorts_payload(payload, video_duration, words=None):
+def _selection_limits(video_duration):
+    """Keep normal jobs unchanged; inspect a wider pool only for 2h+ sources."""
+    return selection_limits(
+        video_duration,
+        normal_shortlist=GEMINI_SHORTLIST_LIMIT,
+        long_shortlist=GEMINI_LONG_SHORTLIST_LIMIT,
+        long_video_seconds=GEMINI_LONG_VIDEO_SECONDS,
+        max_clips=GEMINI_MAX_CLIPS,
+    )
+
+
+def _normalize_shorts_payload(payload, video_duration, words=None, max_clips=None):
     if isinstance(payload, BaseModel):
         payload = payload.model_dump()
 
@@ -771,7 +734,8 @@ def _normalize_shorts_payload(payload, video_duration, words=None):
     if not normalized_shorts:
         raise ValueError("Gemini did not return any valid clips after validation.")
 
-    return {"shorts": normalized_shorts[:15]}
+    clip_limit = max(1, int(max_clips if max_clips is not None else GEMINI_MAX_CLIPS))
+    return {"shorts": choose_distinct_clips(normalized_shorts, max_clips=clip_limit)}
 
 
 def _build_fallback_metadata(video_title, transcript, duration, output_filename, analysis_error, attempts, cost_analysis=None):
@@ -1591,8 +1555,8 @@ def process_video_to_vertical(input_video, final_output_video, progress_callback
     scenes, fps = detect_scenes(input_video)
     
     if not scenes:
-        print("   ❌ No scenes were detected. Using full video as one scene.")
-        # If scene detection fails or finds nothing, treat whole video as one scene
+        print("   ℹ️ No cuts detected. Analyzing the full clip as one scene.")
+        # A continuous shot is valid input: treat the whole clip as one scene.
         cap = cv2.VideoCapture(input_video)
         total_frames = int(cap.get(cv2.CAP_PROP_FRAME_COUNT))
         cap.release()
@@ -1933,6 +1897,85 @@ def transcribe_video(video_path, video_duration=None):
         'language': info.language
     }
 
+
+RESCUABLE_GEMINI_ERROR_TYPES = {
+    "empty_response",
+    "blocked_response",
+    "invalid_response",
+}
+
+
+def _cost_from_worker_error(exc):
+    if isinstance(exc, GeminiWorkerError):
+        cost = exc.result.get("cost_analysis")
+        return cost if isinstance(cost, dict) else None
+    return None
+
+
+def _rescue_gemini_windows(
+    mode, batch_windows, *, video_duration, language, output_dir,
+    video_title, batch_index, total_batches,
+):
+    """Retry a response-blocked batch one window at a time, once each.
+
+    Formatting retries cannot repair a safety/empty-body response caused by a
+    single window. Isolation keeps the other windows instead of dropping the
+    whole batch, while the one-attempt bound prevents runaway API cost.
+    """
+    successes = []
+    failures = []
+    costs = []
+    attempt_records = []
+    for window in batch_windows:
+        window_id = str(window.get("id") or "unknown")
+        payload = {
+            "video_duration": round(float(video_duration), 3),
+            "language": language,
+            "windows": [window],
+        }
+        print(f"🩹 Gemini {mode} rescue: {window_id}")
+        try:
+            result = _call_gemini_worker(
+                mode,
+                payload,
+                output_dir=output_dir or ".",
+                video_title=video_title or "analysis",
+                strategy="structured-schema",
+                batch_index=batch_index,
+                total_batches=total_batches,
+                attempt=1,
+                artifact_suffix=f"rescue_{window_id}",
+            )
+            successes.append((window, result))
+            cost = result.get("cost_analysis")
+            if cost:
+                costs.append(cost)
+            attempt_records.append({
+                "stage": mode,
+                "batch": batch_index + 1,
+                "window_id": window_id,
+                "attempt": 1,
+                "name": "single-window-rescue",
+                "status": "success",
+            })
+        except Exception as exc:
+            failures.append(window_id)
+            cost = _cost_from_worker_error(exc)
+            if cost:
+                costs.append(cost)
+            attempt_records.append({
+                "stage": mode,
+                "batch": batch_index + 1,
+                "window_id": window_id,
+                "attempt": 1,
+                "name": "single-window-rescue",
+                "status": "failed",
+                "error": str(exc),
+                "error_type": getattr(exc, "error_type", "worker_error"),
+            })
+    return successes, failures, costs, attempt_records
+
+
 def get_viral_clips(transcript_result, video_duration, output_dir=None, video_title=None):
     print("🤖  Analyzing with Gemini...")
 
@@ -1976,6 +2019,8 @@ def get_viral_clips(transcript_result, video_duration, output_dir=None, video_ti
     attempts = []
     all_costs = []
     scored_windows = []
+    scored_input_ids = set()
+    skipped_score_ids = set()
     total_score_batches = max(1, math.ceil(len(windows) / GEMINI_SCORE_BATCH_SIZE))
 
     for batch_index, batch_windows in _iter_batches(windows, GEMINI_SCORE_BATCH_SIZE):
@@ -1992,6 +2037,7 @@ def get_viral_clips(transcript_result, video_duration, output_dir=None, video_ti
         }
         batch_result = None
         last_error = None
+        last_error_type = None
         for attempt_number, attempt in enumerate(attempt_specs[:GEMINI_MAX_ATTEMPTS], start=1):
             print(f"🤖  Gemini scoring attempt {attempt_number}/{GEMINI_MAX_ATTEMPTS}: batch {batch_index + 1}/{total_score_batches} ({attempt['name']})")
             try:
@@ -2020,6 +2066,10 @@ def get_viral_clips(transcript_result, video_duration, output_dir=None, video_ti
                 break
             except Exception as e:
                 last_error = str(e)
+                last_error_type = getattr(e, "error_type", "worker_error")
+                failed_cost = _cost_from_worker_error(e)
+                if failed_cost:
+                    all_costs.append(failed_cost)
                 JOB_REPORTER.warning(
                     f"Gemini scoring attempt {attempt_number} failed for batch {batch_index + 1}/{total_score_batches}: {last_error}",
                     category="gemini",
@@ -2032,10 +2082,55 @@ def get_viral_clips(transcript_result, video_duration, output_dir=None, video_ti
                     "name": attempt["name"],
                     "status": "failed",
                     "error": last_error,
+                    "error_type": last_error_type,
                 })
-        if batch_result:
+                if last_error_type in {"empty_response", "blocked_response"}:
+                    break
+                if last_error_type == "api_error" and attempt_number < GEMINI_MAX_ATTEMPTS:
+                    time.sleep(min(10.0, float(2 ** attempt_number)))
+        if batch_result is not None:
+            scored_input_ids.update(str(window.get("id")) for window in batch_windows)
             scored_windows.extend(batch_result)
+        elif last_error_type in RESCUABLE_GEMINI_ERROR_TYPES:
+            JOB_REPORTER.warning(
+                f"Recovering score batch {batch_index + 1}/{total_score_batches} one window at a time.",
+                category="gemini",
+            )
+            rescued, failed_ids, rescue_costs, rescue_attempts = _rescue_gemini_windows(
+                "score",
+                batch_windows,
+                video_duration=video_duration,
+                language=transcript_language,
+                output_dir=output_dir,
+                video_title=video_title,
+                batch_index=batch_index,
+                total_batches=total_score_batches,
+            )
+            all_costs.extend(rescue_costs)
+            attempts.extend(rescue_attempts)
+            for window, worker_result in rescued:
+                window_id = str(window.get("id"))
+                try:
+                    normalized_scores = _normalize_scored_windows(
+                        worker_result.get("payload", {}), video_duration,
+                    )
+                except Exception as exc:
+                    failed_ids.append(window_id)
+                    JOB_REPORTER.warning(
+                        f"Rescued score window {window_id} returned invalid data: {exc}",
+                        category="gemini",
+                    )
+                    continue
+                scored_windows.extend(normalized_scores)
+                scored_input_ids.add(window_id)
+            skipped_score_ids.update(failed_ids)
+            if failed_ids:
+                JOB_REPORTER.warning(
+                    f"Score coverage incomplete: {len(failed_ids)} individual window(s) still failed in batch {batch_index + 1}.",
+                    category="gemini",
+                )
         elif last_error:
+            skipped_score_ids.update(str(window.get("id")) for window in batch_windows)
             JOB_REPORTER.warning(
                 f"Skipping score batch {batch_index + 1}/{total_score_batches} after repeated Gemini failures.",
                 category="gemini",
@@ -2050,16 +2145,30 @@ def get_viral_clips(transcript_result, video_duration, output_dir=None, video_ti
             "error": error_message,
             "attempts": attempts,
             "cost_analysis": _merge_cost_analyses(all_costs),
+            "analysis_coverage": {
+                "score_windows_total": len(windows),
+                "score_windows_processed": len(scored_input_ids),
+                "score_windows_skipped": sorted(skipped_score_ids),
+                "detail_windows_total": 0,
+                "detail_windows_processed": 0,
+                "detail_windows_skipped": [],
+            },
         }
 
     by_id = {}
     for window in sorted(scored_windows, key=lambda item: item.get("score", 0), reverse=True):
         if window["id"] not in by_id:
             by_id[window["id"]] = window
-    shortlisted = list(by_id.values())[:GEMINI_SHORTLIST_LIMIT]
+    shortlist_limit, max_clips = _selection_limits(video_duration)
+    shortlisted = list(by_id.values())[:shortlist_limit]
     shortlist_lookup = {window["id"]: window for window in windows}
     if output_dir and video_title:
-        _save_json_checkpoint(output_dir, video_title, "analysis_shortlist", {"windows": shortlisted})
+        _save_json_checkpoint(output_dir, video_title, "analysis_shortlist", {
+            "windows": shortlisted,
+            "shortlist_limit": shortlist_limit,
+            "max_clips": max_clips,
+            "long_video_policy": float(video_duration) >= GEMINI_LONG_VIDEO_SECONDS,
+        })
 
     detailed_windows = []
     for item in shortlisted:
@@ -2077,6 +2186,8 @@ def get_viral_clips(transcript_result, video_duration, output_dir=None, video_ti
         })
 
     collected_clips = []
+    detailed_input_ids = set()
+    skipped_detail_ids = set()
     total_detail_batches = max(1, math.ceil(len(detailed_windows) / GEMINI_DETAIL_BATCH_SIZE))
     for batch_index, batch_windows in _iter_batches(detailed_windows, GEMINI_DETAIL_BATCH_SIZE):
         batch_progress = 45.0 + ((batch_index / max(total_detail_batches, 1)) * 45.0)
@@ -2093,6 +2204,7 @@ def get_viral_clips(transcript_result, video_duration, output_dir=None, video_ti
         }
         batch_result = None
         last_error = None
+        last_error_type = None
         for attempt_number, attempt in enumerate(attempt_specs[:GEMINI_MAX_ATTEMPTS], start=1):
             print(f"🤖  Gemini detail attempt {attempt_number}/{GEMINI_MAX_ATTEMPTS}: batch {batch_index + 1}/{total_detail_batches} ({attempt['name']})")
             try:
@@ -2120,6 +2232,10 @@ def get_viral_clips(transcript_result, video_duration, output_dir=None, video_ti
                 break
             except Exception as e:
                 last_error = str(e)
+                last_error_type = getattr(e, "error_type", "worker_error")
+                failed_cost = _cost_from_worker_error(e)
+                if failed_cost:
+                    all_costs.append(failed_cost)
                 JOB_REPORTER.warning(
                     f"Gemini detail attempt {attempt_number} failed for batch {batch_index + 1}/{total_detail_batches}: {last_error}",
                     category="gemini",
@@ -2132,10 +2248,47 @@ def get_viral_clips(transcript_result, video_duration, output_dir=None, video_ti
                     "name": attempt["name"],
                     "status": "failed",
                     "error": last_error,
+                    "error_type": last_error_type,
                 })
-        if batch_result and isinstance(batch_result.get("shorts"), list):
+                if last_error_type in {"empty_response", "blocked_response"}:
+                    break
+                if last_error_type == "api_error" and attempt_number < GEMINI_MAX_ATTEMPTS:
+                    time.sleep(min(10.0, float(2 ** attempt_number)))
+        if batch_result is not None and isinstance(batch_result.get("shorts"), list):
+            detailed_input_ids.update(str(window.get("id")) for window in batch_windows)
             collected_clips.extend(batch_result["shorts"])
+        elif last_error_type in RESCUABLE_GEMINI_ERROR_TYPES:
+            JOB_REPORTER.warning(
+                f"Recovering detail batch {batch_index + 1}/{total_detail_batches} one window at a time.",
+                category="gemini",
+            )
+            rescued, failed_ids, rescue_costs, rescue_attempts = _rescue_gemini_windows(
+                "detail",
+                batch_windows,
+                video_duration=video_duration,
+                language=transcript_language,
+                output_dir=output_dir,
+                video_title=video_title,
+                batch_index=batch_index,
+                total_batches=total_detail_batches,
+            )
+            all_costs.extend(rescue_costs)
+            attempts.extend(rescue_attempts)
+            for window, worker_result in rescued:
+                payload = worker_result.get("payload", {})
+                if isinstance(payload.get("shorts"), list):
+                    collected_clips.extend(payload["shorts"])
+                    detailed_input_ids.add(str(window.get("id")))
+                else:
+                    failed_ids.append(str(window.get("id")))
+            skipped_detail_ids.update(failed_ids)
+            if failed_ids:
+                JOB_REPORTER.warning(
+                    f"Detail coverage incomplete: {len(failed_ids)} individual window(s) still failed in batch {batch_index + 1}.",
+                    category="gemini",
+                )
         elif last_error:
+            skipped_detail_ids.update(str(window.get("id")) for window in batch_windows)
             JOB_REPORTER.warning(
                 f"Skipping detail batch {batch_index + 1}/{total_detail_batches} after repeated Gemini failures.",
                 category="gemini",
@@ -2150,18 +2303,45 @@ def get_viral_clips(transcript_result, video_duration, output_dir=None, video_ti
             "error": error_message,
             "attempts": attempts,
             "cost_analysis": _merge_cost_analyses(all_costs),
+            "analysis_coverage": {
+                "score_windows_total": len(windows),
+                "score_windows_processed": len(scored_input_ids),
+                "score_windows_skipped": sorted(skipped_score_ids),
+                "detail_windows_total": len(detailed_windows),
+                "detail_windows_processed": len(detailed_input_ids),
+                "detail_windows_skipped": sorted(skipped_detail_ids),
+            },
         }
 
-    normalized_payload = _normalize_shorts_payload({"shorts": collected_clips}, video_duration, words=words)
+    normalized_payload = _normalize_shorts_payload(
+        {"shorts": collected_clips}, video_duration, words=words,
+        max_clips=max_clips,
+    )
     cost_analysis = _merge_cost_analyses(all_costs)
+    analysis_coverage = {
+        "score_windows_total": len(windows),
+        "score_windows_processed": len(scored_input_ids),
+        "score_windows_skipped": sorted(skipped_score_ids),
+        "detail_windows_total": len(detailed_windows),
+        "detail_windows_processed": len(detailed_input_ids),
+        "detail_windows_skipped": sorted(skipped_detail_ids),
+    }
+    normalized_payload["analysis_coverage"] = analysis_coverage
     if cost_analysis:
         normalized_payload["cost_analysis"] = cost_analysis
-    JOB_REPORTER.progress(95.0, message=f"Gemini analysis complete. Found {len(normalized_payload['shorts'])} candidate clips.", important=True, category="analyze")
+    JOB_REPORTER.progress(
+        95.0,
+        message=f"Gemini analysis complete. Found {len(normalized_payload['shorts'])} candidate clips.",
+        important=True,
+        category="analyze",
+        analysis_coverage=analysis_coverage,
+    )
     return {
         "clips_data": normalized_payload,
         "error": None,
         "attempts": attempts,
         "cost_analysis": cost_analysis,
+        "analysis_coverage": analysis_coverage,
     }
 
 def _ensure_dir(path: str) -> str:
@@ -2512,6 +2692,12 @@ if __name__ == '__main__':
                 reporter.artifact("metadata", metadata_file)
 
                 total_clips = len(clips_data['shorts'])
+                clip_render_weights = [
+                    max(0.001, float(item['end']) - float(item['start']))
+                    for item in clips_data['shorts']
+                ]
+                total_render_weight = sum(clip_render_weights)
+                completed_render_weight = 0.0
                 for i, clip in enumerate(clips_data['shorts']):
                     start = clip['start']
                     end = clip['end']
@@ -2522,7 +2708,7 @@ if __name__ == '__main__':
                     clip_final_path = os.path.join(output_dir, clip_filename)
 
                     reporter.progress(
-                        (i / max(total_clips, 1)) * 100.0,
+                        (completed_render_weight / total_render_weight) * 100.0,
                         message=f"Preparing clip {i + 1}/{total_clips}",
                         important=True,
                         category="render",
@@ -2542,8 +2728,14 @@ if __name__ == '__main__':
                     except subprocess.TimeoutExpired:
                         raise RuntimeError(f"FFmpeg clip cut timed out after 1800s for {clip_filename}")
 
+                    current_render_weight = clip_render_weights[i]
+                    weight_before_clip = completed_render_weight
+
                     def _clip_progress(inner_percent, message, clip_index=i, clip_count=total_clips):
-                        render_percent = ((clip_index / max(clip_count, 1)) * 100.0) + ((inner_percent / 100.0) * (100.0 / max(clip_count, 1)))
+                        render_percent = (
+                            weight_before_clip
+                            + (current_render_weight * (inner_percent / 100.0))
+                        ) / total_render_weight * 100.0
                         reporter.progress(
                             render_percent,
                             message=f"Rendering clip {clip_index + 1}/{clip_count}: {message}",
@@ -2555,6 +2747,7 @@ if __name__ == '__main__':
                                            layout_style=layout_style, progress_callback=_clip_progress)
                     if not success:
                         raise RuntimeError(f"Clip render failed for {clip_filename}")
+                    completed_render_weight += current_render_weight
                     reporter.artifact(f"clip_{i + 1}", clip_final_path, message=f"Clip {i + 1} ready: {clip_final_path}")
                     if os.path.exists(clip_temp_path):
                         os.remove(clip_temp_path)

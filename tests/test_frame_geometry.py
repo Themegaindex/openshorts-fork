@@ -138,3 +138,69 @@ def test_watermarked_passthrough_pads_odd_dimensions(monkeypatch, tmp_path):
     ) is True
     filter_complex = commands[0][commands[0].index("-filter_complex") + 1]
     assert EVEN_PAD_FILTER in filter_complex
+
+
+def test_live_transcription_eta_waits_for_real_job_progress(monkeypatch):
+    clock = [1000.0]
+    monkeypatch.setattr(main.time, "time", lambda: clock[0])
+    reporter = main.JobReporter(job_id="eta-live")
+    reporter.phase = "transcribe"
+    reporter.phase_started_at = 1000.0
+
+    clock[0] = 1119.0
+    reporter.phase_progress_percent = 20.0
+    assert reporter._estimate_live_phase_seconds() is None
+
+    clock[0] = 1120.0
+    reporter.phase_progress_percent = 9.9
+    assert reporter._estimate_live_phase_seconds() is None
+
+    reporter.phase_progress_percent = 10.0
+    assert reporter._estimate_live_phase_seconds() == 1080
+
+
+def test_blocked_gemini_batch_rescues_each_window_once(monkeypatch):
+    calls = []
+
+    def fake_worker(mode, payload, **kwargs):
+        window_id = payload["windows"][0]["id"]
+        calls.append((mode, window_id, kwargs["artifact_suffix"]))
+        if window_id == "blocked":
+            raise main.GeminiWorkerError(
+                "blocked",
+                {"error_type": "blocked_response", "cost_analysis": {"total_cost": 0.01}},
+            )
+        return {
+            "payload": {"windows": [{
+                "id": window_id,
+                "start": 0,
+                "end": 90,
+                "score": 90,
+                "reason": "strong",
+            }]},
+            "cost_analysis": {"total_cost": 0.02},
+        }
+
+    monkeypatch.setattr(main, "_call_gemini_worker", fake_worker)
+    windows = [
+        {"id": "good-a", "start": 0, "end": 90, "text": "a"},
+        {"id": "blocked", "start": 90, "end": 180, "text": "b"},
+        {"id": "good-c", "start": 180, "end": 270, "text": "c"},
+    ]
+
+    successes, failures, costs, attempts = main._rescue_gemini_windows(
+        "score",
+        windows,
+        video_duration=270,
+        language="de",
+        output_dir=".",
+        video_title="test",
+        batch_index=0,
+        total_batches=1,
+    )
+
+    assert [window["id"] for window, _ in successes] == ["good-a", "good-c"]
+    assert failures == ["blocked"]
+    assert len(calls) == 3
+    assert len(costs) == 3
+    assert [attempt["status"] for attempt in attempts] == ["success", "failed", "success"]

@@ -1,6 +1,8 @@
 """Tests for the pure clip-selection helpers (windows, snapping, pricing)."""
 from clip_selection import (
     build_transcript_windows,
+    choose_distinct_clips,
+    selection_limits,
     snap_clip_to_words,
     compact_words,
     lookup_model_prices,
@@ -47,6 +49,35 @@ class TestBuildTranscriptWindows:
         transcript = {"segments": [_seg(0, 500, "long monolog")]}
         windows = build_transcript_windows(transcript, 500, window_seconds=90, overlap_seconds=30)
         assert len(windows) == 1
+
+
+class TestSelectionPolicy:
+    def test_normal_video_keeps_current_shortlist(self):
+        assert selection_limits(7199) == (10, 10)
+
+    def test_two_hour_video_uses_wider_pool_but_caps_output(self):
+        assert selection_limits(8809.16) == (15, 10)
+
+    def test_overlapping_candidate_keeps_higher_score(self):
+        clips = [
+            {"start": 10.0, "end": 40.0, "predicted_score": 80, "name": "weak"},
+            {"start": 12.0, "end": 39.0, "predicted_score": 92, "name": "strong"},
+            {"start": 100.0, "end": 130.0, "predicted_score": 85, "name": "other"},
+        ]
+        selected = choose_distinct_clips(clips, max_clips=10)
+        assert [clip["name"] for clip in selected] == ["strong", "other"]
+
+    def test_output_is_never_padded_and_never_exceeds_ten(self):
+        few = [
+            {"start": index * 100.0, "end": index * 100.0 + 20.0, "predicted_score": 90}
+            for index in range(8)
+        ]
+        many = [
+            {"start": index * 100.0, "end": index * 100.0 + 20.0, "predicted_score": 90 - index}
+            for index in range(15)
+        ]
+        assert len(choose_distinct_clips(few, max_clips=10)) == 8
+        assert len(choose_distinct_clips(many, max_clips=10)) == 10
 
 
 class TestSnapClipToWords:

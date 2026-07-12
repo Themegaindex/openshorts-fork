@@ -133,6 +133,74 @@ def test_worker_summary_does_not_publish_completed_before_validation(monkeypatch
     assert app.jobs[job_id]["worker_summary_received"] is True
 
 
+def test_legacy_completed_job_elapsed_time_is_frozen(monkeypatch):
+    # The reported job was polled 799s after completion. Before the fix those
+    # 799s were incorrectly added to its real runtime on every status request.
+    monkeypatch.setattr(app, "_now_ts", lambda: 6119.0)
+    payload = app._build_status_payload({
+        "job_id": "legacy-complete",
+        "status": "completed",
+        "started_at": 1000.0,
+        "updated_at": 5320.0,
+        "last_heartbeat_at": 5314.0,
+        "raw_logs": [],
+    })
+
+    assert payload["elapsed_seconds"] == 4320
+    assert payload["actual_duration_seconds"] == 4320
+    assert payload["finished_at"] == 5320.0
+
+
+def test_mark_completed_persists_exact_duration_and_live_eta_state(monkeypatch, tmp_path):
+    job_id = "timed-complete"
+    monkeypatch.setattr(app, "_now_ts", lambda: 5320.0)
+    monkeypatch.setattr(app, "_persist_job_state", lambda _job_id: None)
+    monkeypatch.setattr(app, "jobs", {
+        job_id: {
+            "job_id": job_id,
+            "status": "processing",
+            "started_at": 1000.0,
+            "output_dir": str(tmp_path),
+        }
+    })
+
+    app._mark_job_status(job_id, "completed", resumable=False)
+    job = app.jobs[job_id]
+
+    assert job["finished_at"] == 5320.0
+    assert job["actual_duration_seconds"] == 4320
+    assert job["phase_eta_seconds"] == 0
+    assert job["eta_state"] == "done"
+
+
+def test_job_event_persists_phase_timing_fields(monkeypatch, tmp_path):
+    job_id = "phase-timing"
+    monkeypatch.setattr(app, "_persist_job_state", lambda _job_id: None)
+    monkeypatch.setattr(app, "jobs", {
+        job_id: {
+            "job_id": job_id,
+            "status": "processing",
+            "output_dir": str(tmp_path),
+            "raw_logs": [],
+            "important_logs": [],
+        }
+    })
+
+    app._apply_job_event(job_id, {
+        "type": "progress",
+        "timestamp": 2000.0,
+        "phase_eta_seconds": 900,
+        "eta_seconds": 900,
+        "eta_state": "live",
+        "phase_durations_seconds": {"download": 75.2, "transcribe": 3900.5},
+    })
+
+    job = app.jobs[job_id]
+    assert job["phase_eta_seconds"] == 900
+    assert job["eta_state"] == "live"
+    assert job["phase_durations_seconds"]["transcribe"] == 3900.5
+
+
 def test_run_job_validates_result_before_completed(monkeypatch, tmp_path):
     job_id = "job-order"
     execution_id = "execution-1"
@@ -219,6 +287,11 @@ def test_resume_stops_old_process_and_uses_automatic_phase(monkeypatch, tmp_path
         "progress_percent": 50,
         "raw_logs": [],
         "important_logs": [],
+        "finished_at": 123.0,
+        "actual_duration_seconds": 100,
+        "eta_state": "done",
+        "phase_eta_seconds": 0,
+        "phase_durations_seconds": {"transcribe": 90.0},
     }
     monkeypatch.setattr(app, "jobs", {job_id: job})
     monkeypatch.setattr(app, "job_processes", {job_id: {process}})
@@ -233,6 +306,10 @@ def test_resume_stops_old_process_and_uses_automatic_phase(monkeypatch, tmp_path
     assert process.terminated is True
     assert result["status"] == "queued"
     assert "--resume-phase" not in job["cmd"]
+    assert job["finished_at"] is None
+    assert job["actual_duration_seconds"] is None
+    assert job["eta_state"] == "calculating"
+    assert job["phase_durations_seconds"] == {}
 
 
 def test_auxiliary_jobs_recover_after_restart(monkeypatch, tmp_path):

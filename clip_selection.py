@@ -26,6 +26,54 @@ def lookup_model_prices(model_name):
     return MODEL_PRICES[best_key] if best_key else None
 
 
+def selection_limits(
+    video_duration,
+    *,
+    normal_shortlist=10,
+    long_shortlist=15,
+    long_video_seconds=7200.0,
+    max_clips=10,
+):
+    """Return the candidate-pool and output caps for one source duration."""
+    shortlist = int(normal_shortlist)
+    if float(video_duration or 0.0) >= float(long_video_seconds):
+        shortlist = max(shortlist, int(long_shortlist))
+    return max(1, shortlist), max(1, int(max_clips))
+
+
+def choose_distinct_clips(clips, max_clips=10, overlap_threshold=0.50):
+    """Keep the strongest non-overlapping clips, with stable output ordering."""
+    indexed = list(enumerate(clips))
+    ranked = sorted(
+        indexed,
+        key=lambda item: (-int(item[1].get("predicted_score", 0) or 0), item[0]),
+    )
+    selected = []
+    limit = max(1, int(max_clips))
+
+    def overlap_ratio(first, second):
+        overlap = max(
+            0.0,
+            min(float(first["end"]), float(second["end"]))
+            - max(float(first["start"]), float(second["start"])),
+        )
+        shorter = min(
+            float(first["end"]) - float(first["start"]),
+            float(second["end"]) - float(second["start"]),
+        )
+        return (overlap / shorter) if shorter > 0 else 0.0
+
+    for original_index, clip in ranked:
+        if any(overlap_ratio(clip, kept_clip) >= overlap_threshold for _, kept_clip in selected):
+            continue
+        selected.append((original_index, clip))
+        if len(selected) >= limit:
+            break
+
+    selected.sort(key=lambda item: item[0])
+    return [clip for _, clip in selected]
+
+
 def compact_words(words, precision=2):
     """Round word timestamps for prompts — full float precision wastes tokens."""
     return [

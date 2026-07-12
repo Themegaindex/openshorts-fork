@@ -771,6 +771,19 @@ function App() {
   const renderedLogs = displayLogs.length > 0 ? displayLogs : fallbackLogs;
   const progressPercent = Number(jobMeta?.progress_percent || 0);
   const phaseLabel = jobMeta?.phase_label || (status === 'queued' ? 'Queued' : status === 'processing' ? 'Processing' : 'Idle');
+  const isTerminalJob = status === 'complete' || status === 'error' || status === 'archived';
+  const phaseEtaText = jobMeta?.eta_state === 'live'
+    ? formatDuration(jobMeta?.phase_eta_seconds)
+    : jobMeta?.eta_state === 'done'
+      ? 'Fertig'
+      : 'Wird berechnet …';
+  const phaseDurationLabels = {
+    download: 'Download',
+    transcribe: 'Transkription',
+    analyze: 'Gemini-Analyse',
+    render: 'Rendering',
+    finalize: 'Abschluss',
+  };
 
   return (
     <div className="flex h-screen bg-background overflow-hidden selection:bg-primary/30">
@@ -1127,27 +1140,47 @@ function App() {
 
                   <div className="grid grid-cols-2 gap-3 text-xs">
                     <div className="p-3 rounded-xl bg-white/5 border border-white/5">
-                      <div className="text-zinc-500 mb-1">ETA</div>
-                      <div className="text-white font-medium">{formatDuration(jobMeta?.eta_seconds)}</div>
-                      {jobMeta?.total_estimate_seconds ? (
-                        <div className="text-[10px] text-zinc-500 mt-0.5">
-                          Gesamt geschätzt: ~{formatDuration(jobMeta.total_estimate_seconds)}
-                        </div>
-                      ) : null}
+                      <div className="text-zinc-500 mb-1">
+                        {isTerminalJob ? 'Tatsächliche Gesamtdauer' : 'Restzeit dieser Phase'}
+                      </div>
+                      <div className="text-white font-medium">
+                        {isTerminalJob
+                          ? formatDuration(jobMeta?.actual_duration_seconds ?? jobMeta?.elapsed_seconds)
+                          : phaseEtaText}
+                      </div>
+                      {!isTerminalJob && jobMeta?.eta_state === 'live' && (
+                        <div className="text-[10px] text-zinc-500 mt-0.5">live geschätzt</div>
+                      )}
                     </div>
                     <div className="p-3 rounded-xl bg-white/5 border border-white/5">
-                      <div className="text-zinc-500 mb-1">Laufzeit</div>
+                      <div className="text-zinc-500 mb-1">{isTerminalJob ? 'Verstrichene Zeit' : 'Bisher vergangen'}</div>
                       <div className="text-white font-medium">{formatDuration(jobMeta?.elapsed_seconds)}</div>
                     </div>
                     <div className="p-3 rounded-xl bg-white/5 border border-white/5">
-                      <div className="text-zinc-500 mb-1">Letzte Aktivität</div>
-                      <div className="text-white font-medium">{formatLastSeen(jobMeta?.seconds_since_heartbeat)}</div>
+                      <div className="text-zinc-500 mb-1">{isTerminalJob ? 'Abgeschlossen' : 'Letzte Aktivität'}</div>
+                      <div className="text-white font-medium">
+                        {formatLastSeen(isTerminalJob ? jobMeta?.seconds_since_finish : jobMeta?.seconds_since_heartbeat)}
+                      </div>
                     </div>
                     <div className="p-3 rounded-xl bg-white/5 border border-white/5">
                       <div className="text-zinc-500 mb-1">Gemini / Resume</div>
                       <div className="text-white font-medium">{jobMeta?.attempt || 0} / {jobMeta?.resume_count || 0}</div>
                     </div>
                   </div>
+
+                  {isTerminalJob && Object.keys(jobMeta?.phase_durations_seconds || {}).length > 0 && (
+                    <div className="rounded-xl bg-white/[0.03] border border-white/5 p-3">
+                      <div className="text-[10px] uppercase tracking-wider text-zinc-500 mb-2">Gemessene Phasen</div>
+                      <div className="grid grid-cols-2 gap-x-4 gap-y-1.5 text-xs">
+                        {Object.entries(jobMeta.phase_durations_seconds).map(([phase, seconds]) => (
+                          <div key={phase} className="flex items-center justify-between gap-3">
+                            <span className="text-zinc-500">{phaseDurationLabels[phase] || phase}</span>
+                            <span className="text-zinc-200 tabular-nums">{formatDuration(seconds)}</span>
+                          </div>
+                        ))}
+                      </div>
+                    </div>
+                  )}
 
                   <div className="flex flex-wrap gap-2">
                     {jobMeta?.stall_state === 'slow' && (
