@@ -3,10 +3,35 @@
 *Erstellt: 25.07.2026 · Basis: `main` inkl. nicht committeter Änderungen*
 *Alle kritischen Befunde wurden mit echten FFmpeg-Renderings überprüft (nicht nur Code-Lektüre).*
 
-> **Stand 25.07.2026 — Phasen 1 bis 3 sind umgesetzt.** Die dort aufgeführten
-> Punkte sind erledigt und mit Tests sowie echten Renderings abgesichert; die
-> Befundbeschreibungen bleiben als Begründung stehen. Offen sind nur noch
-> Phase 4 und die Ideen in Abschnitt 6/10.
+---
+
+## Stand: was ist erledigt, was fehlt noch?
+
+*Aktualisiert am 25.07.2026. Jeder Befund unten trägt eine Markierung:*
+**✅ BEHOBEN** · **🟨 TEILWEISE** · **⬜ OFFEN**
+
+**Phasen 1 bis 3 sind vollständig umgesetzt** — alle 14 Punkte im Code
+verifiziert, mit 30 neuen Tests und echten FFmpeg-Renderings abgesichert.
+
+### Was jetzt noch offen ist
+
+| Punkt | Wo im Bericht | Warum offen |
+|---|---|---|
+| Verzerrung bei Format 1:1 und Original ungeprüft | Abschnitt 3 | Phase 4; braucht einen Testrender pro Format |
+| Zeile 1 springt beim Zeilenwechsel zurück auf Weiß | Abschnitt 3 | Designfrage — bewusst nicht ohne deine Entscheidung geändert |
+| Rand-Regler „Keine" erzeugt weiter einen Rand von 1 | Abschnitt 3 | Kleinigkeit, war in keiner der drei Phasen |
+| Toter Code: `add_hook_to_video`, `burn_subtitles`, Gallery (~350 Zeilen) | Abschnitt 3 | Phase 4. Der tote Neon-Konstantenblock ist weg |
+| Offene CORS-Freigabe und offenes `/videos`-Verzeichnis | Abschnitt 3 | Nur relevant, wenn die Instanz öffentlich erreichbar wird |
+| Hook und Untertitel können sich überlagern | Abschnitt 4 | Braucht eine Design-Entscheidung zur Ausweichrichtung |
+| Gemischte Sprache im UI, Doppelname „Neon", Vorschau-Beispieltexte | Abschnitt 4 | Kosmetik, in keiner der drei Phasen |
+| Vorschau ≠ Render (Buchstabenabstand, Umbruch) | Abschnitt 5 | Vollständig erst mit der Server-Vorschau lösbar (Phase 4) |
+| Signature-Presets bleiben rechenintensiver als der klassische Pfad | Abschnitt 5 | Von 26,8 s auf 11,9 s halbiert; weiter geht nur mit weniger Glüh-Ebenen |
+| Neue Presets, Untertitel-Editor, Server-Vorschau, Betonungserkennung | Abschnitte 6, 7, 10 | Phase 4 und größere Vorhaben |
+
+Der einzige Punkt, der aus einer der drei Phasen **nicht** vollständig
+abgehakt ist: die Renderzeit der Signature-Presets. Sie war als „auf 2 Ebenen
+reduzieren" formuliert — das ist umgesetzt und hat die Zeit mehr als halbiert,
+aber sie liegt weiter über dem klassischen Pfad. Deshalb 🟨 statt ✅.
 
 ---
 
@@ -51,20 +76,20 @@ Technisch: Python/FastAPI im Hintergrund, React im Browser, FFmpeg für alles Vi
 
 ## 2. Wichtigste gefundene Probleme
 
-| # | Problem | Wirkung | Schwere | Status |
+| # | Problem | Wirkung | Schwere | Stand |
 |---|---|---|---|---|
-| 1 | **Neon Sweep: Untertitel werden am Bildrand abgeschnitten** | Ab Schriftgröße 26 betrifft es die Mehrheit aller Blöcke | 🔴 | ✅ gerendert |
-| 2 | **Schriftarten existieren im Docker-Container nicht** | Browser-Vorschau ≠ fertiges Video | 🔴 | ✅ gemessen |
-| 3 | **Ton kann komplett verschwinden** | Stummer Clip ohne Warnung im UI | 🟠 | ✅ im Code belegt |
-| 4 | **Untertitel lassen sich nie wieder entfernen** | Kein „Zurück" nach dem Einbrennen | 🟠 | ✅ im Code belegt |
-| 5 | **Fehler bei „Für alle Clips" werden verschluckt** | 3 von 10 fehlgeschlagen = keine Meldung | 🟠 | ✅ im Code belegt |
-| 6 | **Signature-Presets rendern ~6× langsamer** | 27 s statt 4,5 s pro 45-s-Clip | 🟡 | ✅ gemessen |
+| 1 | **Neon Sweep: Untertitel werden am Bildrand abgeschnitten** | Ab Schriftgröße 26 betrifft es die Mehrheit aller Blöcke | 🔴 | ✅ **behoben** — 0 % bei allen Größen, per Render nachgewiesen |
+| 2 | **Schriftarten existieren im Docker-Container nicht** | Browser-Vorschau ≠ fertiges Video | 🔴 | ✅ **behoben** — jede Auswahl rendert jetzt eine eigene Schrift |
+| 3 | **Ton kann komplett verschwinden** | Stummer Clip ohne Warnung im UI | 🟠 | ✅ **behoben** — AAC-Fallback + sichtbare Warnung |
+| 4 | **Untertitel lassen sich nie wieder entfernen** | Kein „Zurück" nach dem Einbrennen | 🟠 | ✅ **behoben** — Entfernen-Knöpfe pro Ebene |
+| 5 | **Fehler bei „Für alle Clips" werden verschluckt** | 3 von 10 fehlgeschlagen = keine Meldung | 🟠 | ✅ **behoben** — Fortschritt, Abbrechen, Fehlerbericht |
+| 6 | **Signature-Presets rendern ~6× langsamer** | 27 s statt 4,5 s pro 45-s-Clip | 🟡 | 🟨 **verbessert** — 11,9 s statt 26,8 s; bleibt ~2,8× über dem klassischen Pfad |
 
 ---
 
 ## 3. Mögliche Bugs
 
-### 🔴 ✅ BESTÄTIGT — Neon Sweep: Zeilen werden am Bildrand abgeschnitten
+### 🔴 ✅ BESTÄTIGT — Neon Sweep: Zeilen werden am Bildrand abgeschnitten · ✅ BEHOBEN
 
 **Beteiligte Stellen:**
 
@@ -116,7 +141,7 @@ Frame b_11:   x=   0..1079   → beide Ränder abgeschnitten
 
 ---
 
-### 🔴 ✅ BESTÄTIGT — Die angebotenen Schriftarten gibt es im Container nicht
+### 🔴 ✅ BESTÄTIGT — Die angebotenen Schriftarten gibt es im Container nicht · ✅ BEHOBEN
 
 Die Oberfläche bietet 7 Schriftarten an, die Signature-Presets setzen fest auf „Arial Black", „Beast" auf „Impact". Der Docker-Container installiert aber nur:
 
@@ -152,7 +177,7 @@ Courier New    -> DejaVu Sans Mono
 
 ---
 
-### 🟠 ✅ BESTÄTIGT — Clips können stumm werden
+### 🟠 ✅ BESTÄTIGT — Clips können stumm werden · ✅ BEHOBEN
 
 ```python
 # main.py:1572
@@ -175,7 +200,7 @@ Es wird **einfach ohne Ton weitergemacht**. Der Nutzer bekommt fertige Clips ohn
 
 ---
 
-### ⚠️ RISIKO — Verzerrung bei 1:1 und Original-Format
+### ⚠️ RISIKO — Verzerrung bei 1:1 und Original-Format · ⬜ OFFEN
 
 ```python
 # subtitles.py:409-410
@@ -189,7 +214,7 @@ Feste 9:16-Zeichenfläche. Das Projekt unterstützt aber auch **1:1** und **Orig
 
 ---
 
-### 🟡 ✅ BESTÄTIGT — Farbschleier über den weißen Wörtern
+### 🟡 ✅ BESTÄTIGT — Farbschleier über den weißen Wörtern · ✅ BEHOBEN
 
 In `_generate_neon_sweep_ass` (`subtitles.py:545–571`):
 
@@ -206,7 +231,7 @@ Im gerenderten Frame sichtbar: das rote aktive Wort wirkt matt und geht im weiß
 
 ---
 
-### 🟡 ✅ BESTÄTIGT — Weiße Wörter glühen genauso stark wie das aktive
+### 🟡 ✅ BESTÄTIGT — Weiße Wörter glühen genauso stark wie das aktive · ✅ BEHOBEN
 
 Beide Masken benutzen dieselben vier Glüh-Ebenen mit Weichzeichnung 70 und 28. Im CapCut-Original glüht vor allem das *aktive* Wort. Hier bekommt der gesamte Untertitelblock einen breiten weißen Nebel — im Testrender deutlich zu sehen. Auf hellem Videohintergrund wird das zu Matsch.
 
@@ -214,7 +239,7 @@ Beide Masken benutzen dieselben vier Glüh-Ebenen mit Weichzeichnung 70 und 28. 
 
 ---
 
-### 🟡 ✅ BESTÄTIGT — Farbwechsel: Zeile 1 springt zurück auf Weiß
+### 🟡 ✅ BESTÄTIGT — Farbwechsel: Zeile 1 springt zurück auf Weiß · ⬜ OFFEN
 
 ```python
 active_mask = [line_indices[index] == active_line and index <= active_index ...]
@@ -224,7 +249,7 @@ Sobald Zeile 2 beginnt, wird Zeile 1 **komplett wieder weiß** — ein sichtbare
 
 ---
 
-### 🟡 ✅ BESTÄTIGT — Rand-Regler „Keine" erzeugt trotzdem einen Rand
+### 🟡 ✅ BESTÄTIGT — Rand-Regler „Keine" erzeugt trotzdem einen Rand · ⬜ OFFEN
 
 ```python
 # subtitles.py:750 und 930
@@ -235,7 +260,7 @@ Der Regler geht von 0 („None") bis 5. Bei 0 wird trotzdem 1 gesetzt. Ein randl
 
 ---
 
-### 🟡 ✅ BESTÄTIGT — Toter Code im Neon-Modul
+### 🟡 ✅ BESTÄTIGT — Toter Code im Neon-Modul · 🟨 TEILWEISE
 
 ```python
 # subtitles.py:366
@@ -251,7 +276,7 @@ Weiterer toter Code:
 
 ---
 
-### 🟡 ✅ BESTÄTIGT — Fehlermeldungen als rohes JSON
+### 🟡 ✅ BESTÄTIGT — Fehlermeldungen als rohes JSON · ✅ BEHOBEN
 
 ```javascript
 // ResultCard.jsx:126-129
@@ -271,7 +296,7 @@ Bei „Auto Edit" und „Dub Voice" ist es korrekt gemacht (`jsonErr.detail`). *
 
 ---
 
-### 🟡 ✅ BESTÄTIGT — Geheimnisse landen im Docker-Image
+### 🟡 ✅ BESTÄTIGT — Geheimnisse landen im Docker-Image · 🟨 TEILWEISE
 
 `.dockerignore` schließt `.env` und `*_cookies.txt` **nicht** aus, während der Dockerfile `COPY . .` macht. Damit landen `.env` und die YouTube-Cookies fest in einer Image-Ebene. Solange das Image nie geteilt wird, harmlos — aber eine Falle.
 
@@ -279,7 +304,7 @@ Ebenfalls: `allow_origins=["*"]` (`app.py:1050`) ohne Authentifizierung, und `/v
 
 ---
 
-### 🟡 ✅ BESTÄTIGT — Zeilenenden-Chaos im Repository
+### 🟡 ✅ BESTÄTIGT — Zeilenenden-Chaos im Repository · ✅ BEHOBEN
 
 `git diff --stat` meldet 10.217 geänderte Zeilen — fast alle sind **keine echten Änderungen**, sondern CRLF↔LF-Umschaltungen:
 
@@ -294,7 +319,7 @@ Es fehlt eine `.gitattributes`. **Folge:** Code-Reviews sind unbrauchbar, weil e
 
 ## 4. Verbesserungen für Bedienung und Nutzererlebnis
 
-### 🔴 Untertitel lassen sich nicht mehr entfernen
+### 🔴 Untertitel lassen sich nicht mehr entfernen · ✅ BEHOBEN
 
 Es gibt keinen Endpunkt und keinen Knopf, um eine Untertitel- oder Hook-Ebene zu **entfernen**. Der Zustand `subtitle: None` existiert im Code (`_entry_with_clean_source(..., clear_subtitle=True)`) — wird aber ausschließlich intern von der Übersetzung genutzt.
 
@@ -305,7 +330,7 @@ Es gibt keinen Endpunkt und keinen Knopf, um eine Untertitel- oder Hook-Ebene zu
 
 ---
 
-### 🔴 „Untertitel für alle" — blinder Fortschritt, verschluckte Fehler
+### 🔴 „Untertitel für alle" — blinder Fortschritt, verschluckte Fehler · ✅ BEHOBEN
 
 **(a) Kein sichtbarer Fortschritt.** Der Zähler `1/10, 2/10 …` steht auf dem Knopf *hinter* dem Modal — verdeckt vom dunklen Hintergrund. Sichtbar ist nur ein Spinner mit „Generating…", 10+ Minuten lang. Kein Abbrechen möglich.
 
@@ -321,7 +346,7 @@ setBulkSubProgress({ running: false, current: total, total, errors });
 
 ---
 
-### 🟠 Untertitel-Einstellungen werden nicht gemerkt
+### 🟠 Untertitel-Einstellungen werden nicht gemerkt · ✅ BEHOBEN
 
 Jede Clip-Karte hat ihre **eigene** `SubtitleModal`-Instanz mit eigenem Zustand. Wer für Clip 1 mühsam Farbe, Größe, Position und Preset einstellt und dann Clip 2 öffnet, fängt bei Null an. Auch beim nächsten Job.
 
@@ -329,7 +354,7 @@ Jede Clip-Karte hat ihre **eigene** `SubtitleModal`-Instanz mit eigenem Zustand.
 
 ---
 
-### 🟠 Hook und Untertitel können sich überlagern
+### 🟠 Hook und Untertitel können sich überlagern · ⬜ OFFEN
 
 - Hook „oben" landet bei **20 % der Bildhöhe** (`hooks.py:317`)
 - Untertitel „oben" landet bei **ca. 9 %** und wächst nach unten (MarginV 25 bzw. 28 bei PlayResY 288)
@@ -340,7 +365,7 @@ Bei zweizeiligen Untertiteln in großer Schrift überlappen sich beide. Keine Wa
 
 ---
 
-### 🟠 Signature-Presets: Regler, die nichts tun (und heimlich das Preset löschen)
+### 🟠 Signature-Presets: Regler, die nichts tun (und heimlich das Preset löschen) · ✅ BEHOBEN
 
 Bei aktivem Neon Sweep ignoriert der Generator **komplett**: Textfarbe, Highlight-Farbe, Rand, Hintergrundbox, Effekt, „Inaktive Wörter dimmen", GROSSBUCHSTABEN.
 
@@ -350,7 +375,7 @@ Sie werden aber **weiterhin bedienbar angezeigt**. Und schlimmer: Jeder dieser R
 
 ---
 
-### 🟡 Kleinere Bedienungspunkte
+### 🟡 Kleinere Bedienungspunkte · ⬜ OFFEN
 
 | Fund | Wirkung |
 |---|---|
@@ -367,7 +392,7 @@ Sie werden aber **weiterhin bedienbar angezeigt**. Und schlimmer: Jeder dieser R
 
 ## 5. Verbesserungen an bestehenden Funktionen
 
-### 🟠 Zwischendateien werden nie aufgeräumt
+### 🟠 Zwischendateien werden nie aufgeräumt · ✅ BEHOBEN
 
 Jeder Untertitel-Durchlauf erzeugt zwei neue Dateien im Job-Ordner:
 - `subs_<clip>_<id>.ass`
@@ -381,7 +406,7 @@ Die alten bleiben liegen. Gelöscht wird erst nach **24 Stunden**, wenn der ganz
 
 ---
 
-### 🟠 ✅ GEMESSEN — Signature-Presets sind ~6× langsamer
+### 🟠 ✅ GEMESSEN — Signature-Presets sind ~6× langsamer · 🟨 TEILWEISE
 
 **Renderzeit, 45-s-Clip, 1080×1920, echtes Arial Black:**
 
@@ -399,7 +424,7 @@ Bei einem Job mit 10 Clips à 45 s: **4,5 Minuten statt 45 Sekunden.** Ohne Fort
 
 ---
 
-### 🟡 Whisper-Wortblöcke sind nicht an die Optik gekoppelt
+### 🟡 Whisper-Wortblöcke sind nicht an die Optik gekoppelt · ✅ BEHOBEN
 
 `max_chars` (Zeichen pro Block) und `max_line_chars` (Zeichen pro Zeile) sind zwei unabhängige Konstanten, die nichts voneinander wissen — die Ursache von Problem #1.
 
@@ -415,7 +440,7 @@ Damit funktioniert das Preset bei **jeder** Schriftgröße und in **jedem** Form
 
 ---
 
-### 🟡 Vorschau ist nicht ehrlich
+### 🟡 Vorschau ist nicht ehrlich · 🟨 TEILWEISE
 
 | | Vorschau (Browser) | Render (Video) |
 |---|---|---|
@@ -610,7 +635,7 @@ Die **Idee und die Ausführung des Glüh-Effekts sind ausgezeichnet.** Der viers
 - [ ] **Echte Server-Vorschau** der ersten 3 Sekunden
 - [ ] **Untertitel-Text vor dem Einbrennen editierbar**
 - [ ] **Neue Presets** aus Abschnitt 7 (besonders „Bold Box" und „Podcast")
-- [ ] **Toten Code entfernen** (Gallery, `add_hook_to_video`, `burn_subtitles`, `_SIGNATURE_GLOW_LAYERS`)
+- [ ] **Toten Code entfernen** (Gallery, `add_hook_to_video`, `burn_subtitles`) — `_SIGNATURE_GLOW_LAYERS` ist erledigt: die Konstante ist jetzt die gemeinsame Quelle beider Renderer statt einer Leiche
 - [ ] **1:1- und Original-Format mit Signature-Presets testen**
 
 ---
@@ -619,37 +644,37 @@ Die **Idee und die Ausführung des Glüh-Effekts sind ausgezeichnet.** Der viers
 
 ### 🟢 Klein (jeweils unter einer Stunde)
 
-- `.gitattributes` anlegen
-- `_SIGNATURE_GLOW_LAYERS` löschen, Rainbow Word auf eine gemeinsame Konstante umstellen
-- `outline_width = max(1, ...)` → echtes 0 zulassen
-- `JSON.parse` in den zwei Fehlerbehandlungen ergänzen
-- Deutsche UI-Texte übersetzen (3 Stellen) oder ganz auf Deutsch umstellen
-- Klassisches „Neon"-Preset umbenennen (z. B. „Mint Glow")
-- Klassische Presets bekommen eine `fontSize`, damit ein Wechsel die Größe zurücksetzt
-- `.env` / Cookies in `.dockerignore`
-- Vorschau-Beispieltext vereinheitlichen (beide deutsch oder beide englisch)
+- [x] `.gitattributes` anlegen
+- [x] `_SIGNATURE_GLOW_LAYERS` löschen, Rainbow Word auf eine gemeinsame Konstante umstellen
+- [ ] `outline_width = max(1, ...)` → echtes 0 zulassen
+- [x] `JSON.parse` in den zwei Fehlerbehandlungen ergänzen
+- [ ] Deutsche UI-Texte übersetzen (3 Stellen) oder ganz auf Deutsch umstellen
+- [ ] Klassisches „Neon"-Preset umbenennen (z. B. „Mint Glow")
+- [ ] Klassische Presets bekommen eine `fontSize`, damit ein Wechsel die Größe zurücksetzt
+- [x] `.env` / Cookies in `.dockerignore`
+- [ ] Vorschau-Beispieltext vereinheitlichen (beide deutsch oder beide englisch)
 
 ### 🟡 Mittel (halber bis ganzer Tag)
 
-- **Zeilenbudget aus Schriftgröße berechnen** ← der wichtigste Punkt
-- Fonts im Container korrigieren
-- Ton-Umkodierung als Rückfallebene
-- Bulk-Fortschritt + Fehlerbericht + Abbrechen
-- „Ebene entfernen"-Endpunkt und Knöpfe
-- Aufräumen alter Renderings pro Clip
-- Untertitel-Stil in `localStorage` merken
-- Ebenenreihenfolge im Neon-Renderer korrigieren
-- Warnung bei Hook/Untertitel-Kollision
-- 3 neue Presets (Bold Box, Podcast, Highlight Marker)
+- [x] **Zeilenbudget aus Schriftgröße berechnen** ← der wichtigste Punkt
+- [x] Fonts im Container korrigieren
+- [x] Ton-Umkodierung als Rückfallebene
+- [x] Bulk-Fortschritt + Fehlerbericht + Abbrechen
+- [x] „Ebene entfernen"-Endpunkt und Knöpfe
+- [x] Aufräumen alter Renderings pro Clip
+- [x] Untertitel-Stil in `localStorage` merken
+- [x] Ebenenreihenfolge im Neon-Renderer korrigieren
+- [ ] Warnung bei Hook/Untertitel-Kollision
+- [ ] 3 neue Presets (Bold Box, Podcast, Highlight Marker)
 
 ### 🔵 Groß (mehrere Tage, dafür großer Effekt)
 
-- **Echte serverseitige Vorschau** — löst das Vorschau-Ehrlichkeitsproblem komplett
-- **Untertitel-Editor** mit Timeline: Text korrigieren, Zeiten verschieben, dann rendern
-- **Eigene Presets speichern und benennen**
-- **Automatische Betonung** anhand der Lautstärke aus Whisper
-- **Zugriffsschutz** (einfacher Token), falls die Instanz je öffentlich erreichbar sein soll
-- **Signierte, ablaufende Video-Links** statt eines offenen `/videos`-Verzeichnisses
+- [ ] **Echte serverseitige Vorschau** — löst das Vorschau-Ehrlichkeitsproblem komplett
+- [ ] **Untertitel-Editor** mit Timeline: Text korrigieren, Zeiten verschieben, dann rendern
+- [ ] **Eigene Presets speichern und benennen**
+- [ ] **Automatische Betonung** anhand der Lautstärke aus Whisper
+- [ ] **Zugriffsschutz** (einfacher Token), falls die Instanz je öffentlich erreichbar sein soll
+- [ ] **Signierte, ablaufende Video-Links** statt eines offenen `/videos`-Verzeichnisses
 
 ---
 
