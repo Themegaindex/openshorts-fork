@@ -82,11 +82,23 @@ def test_full_video_artifact_recovery_supports_every_canonical_format(tmp_path, 
         (app.SocialPostRequest, {
             "job_id": "j", "clip_index": -1, "api_key": "k", "user_id": "u", "platforms": ["youtube"]
         }),
+        (app.RemoveLayerRequest, {"job_id": "j", "clip_index": -1, "layer": "subtitle"}),
     ],
 )
 def test_negative_clip_indices_are_rejected(model, payload):
     with pytest.raises(ValidationError):
         model(**payload)
+
+
+@pytest.mark.parametrize("layer", ["subtitle", "hook", "all"])
+def test_remove_layer_accepts_the_documented_layers(layer):
+    assert app.RemoveLayerRequest(job_id="j", clip_index=0, layer=layer).layer == layer
+
+
+@pytest.mark.parametrize("layer", ["", "edit", "watermark", "SUBTITLE"])
+def test_remove_layer_rejects_unknown_layers(layer):
+    with pytest.raises(ValidationError):
+        app.RemoveLayerRequest(job_id="j", clip_index=0, layer=layer)
 
 
 @pytest.mark.parametrize(

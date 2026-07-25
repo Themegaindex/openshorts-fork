@@ -32,6 +32,14 @@ export default function ResultCard({ clip, index, jobId, uploadPostKey, uploadUs
     const [showHookModal, setShowHookModal] = useState(false);
     const [showTranslateModal, setShowTranslateModal] = useState(false);
     const [editError, setEditError] = useState(null);
+    // Which burned-in layers this clip currently carries. The server reports
+    // them so the remove buttons survive a page reload.
+    const [layers, setLayers] = useState(clip.layers || { subtitle: false, hook: false });
+    const [removingLayer, setRemovingLayer] = useState(null);
+
+    useEffect(() => {
+        if (clip.layers) setLayers(clip.layers);
+    }, [clip.layers]);
 
     // Initialize/Reset form when modal opens
     useEffect(() => {
@@ -126,6 +134,7 @@ export default function ResultCard({ clip, index, jobId, uploadPostKey, uploadUs
                     videoRef.current.load();
                 }
                 setShowSubtitleModal(false);
+                setLayers((prev) => ({ ...prev, subtitle: true }));
             }
 
         } catch (e) {
@@ -168,6 +177,7 @@ export default function ResultCard({ clip, index, jobId, uploadPostKey, uploadUs
                     videoRef.current.load();
                 }
                 setShowHookModal(false);
+                setLayers((prev) => ({ ...prev, hook: true }));
             }
 
         } catch (e) {
@@ -225,6 +235,7 @@ export default function ResultCard({ clip, index, jobId, uploadPostKey, uploadUs
                     videoRef.current.load();
                 }
                 setShowTranslateModal(false);
+                setLayers((prev) => ({ ...prev, subtitle: false }));
             }
 
         } catch (e) {
@@ -233,6 +244,32 @@ export default function ResultCard({ clip, index, jobId, uploadPostKey, uploadUs
             setTimeout(() => setEditError(null), 5000);
         } finally {
             setIsTranslating(false);
+        }
+    };
+
+    const handleRemoveLayer = async (layer) => {
+        setRemovingLayer(layer);
+        setEditError(null);
+        try {
+            const res = await fetch(getApiUrl('/api/clip/remove-layer'), {
+                method: 'POST',
+                headers: { 'Content-Type': 'application/json' },
+                body: JSON.stringify({ job_id: jobId, clip_index: index, layer })
+            });
+            if (!res.ok) throw new Error(await readApiError(res));
+
+            const data = await res.json();
+            if (data.layers) setLayers(data.layers);
+            if (data.new_video_url) {
+                setCurrentVideoUrl(getApiUrl(data.new_video_url));
+                onVersionChange?.(index, data.new_video_url);
+                if (videoRef.current) videoRef.current.load();
+            }
+        } catch (e) {
+            setEditError(e.message);
+            setTimeout(() => setEditError(null), 5000);
+        } finally {
+            setRemovingLayer(null);
         }
     };
 
@@ -380,8 +417,33 @@ export default function ResultCard({ clip, index, jobId, uploadPostKey, uploadUs
                     </div>
                 )}
 
+                {/* Applied layers. Burning one in used to be a one-way door:
+                    the only way out was overwriting it with another style. */}
+                {(layers.subtitle || layers.hook) && (
+                    <div className="mt-auto flex flex-wrap items-center gap-2 pt-4 text-[10px]">
+                        <span className="text-zinc-600 uppercase tracking-wider">Applied</span>
+                        {[
+                            { id: 'subtitle', label: 'Subtitles', active: layers.subtitle },
+                            { id: 'hook', label: 'Hook', active: layers.hook },
+                        ].filter((entry) => entry.active).map((entry) => (
+                            <button
+                                key={entry.id}
+                                onClick={() => handleRemoveLayer(entry.id)}
+                                disabled={removingLayer !== null}
+                                title={`Remove ${entry.label.toLowerCase()} from this clip`}
+                                className="group flex items-center gap-1 rounded-full border border-white/10 bg-white/5 px-2 py-0.5 text-zinc-300 transition-colors hover:border-red-500/40 hover:bg-red-500/10 hover:text-red-300 disabled:opacity-50"
+                            >
+                                {removingLayer === entry.id
+                                    ? <Loader2 size={10} className="animate-spin" />
+                                    : <X size={10} className="text-zinc-500 group-hover:text-red-300" />}
+                                {entry.label}
+                            </button>
+                        ))}
+                    </div>
+                )}
+
                 {/* Actions Footer */}
-                <div className="grid grid-cols-2 gap-3 mt-auto pt-4 border-t border-white/5">
+                <div className={`grid grid-cols-2 gap-3 ${layers.subtitle || layers.hook ? 'mt-3' : 'mt-auto'} pt-4 border-t border-white/5`}>
                     <button
                         onClick={handleAutoEdit}
                         disabled={isEditing}

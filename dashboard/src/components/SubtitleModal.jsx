@@ -78,6 +78,28 @@ const CAPTION_PRESETS = [
     { id: 'classic', label: 'Classic',   style: 'classic', effect: 'none', highlightColor: '#FFD700', baseOpacity: 1.0,  uppercase: false, fontName: 'Verdana', borderWidth: 2 },
 ];
 
+// Each result card owns its own modal instance, so without this every clip
+// (and every new job) started from the defaults again.
+const STYLE_STORAGE_KEY = 'openshorts_subtitle_style';
+
+const loadSavedStyle = () => {
+    try {
+        const raw = localStorage.getItem(STYLE_STORAGE_KEY);
+        return raw ? JSON.parse(raw) : null;
+    } catch {
+        return null;
+    }
+};
+
+const saveStyle = (settings) => {
+    try {
+        localStorage.setItem(STYLE_STORAGE_KEY, JSON.stringify(settings));
+    } catch {
+        // Private mode or a full quota — remembering is a convenience, not a
+        // requirement, so a failure here must never block generating.
+    }
+};
+
 // CSS approximation of the ASS effects for previews
 const effectShadow = (effect, color) => {
     if (effect === 'glow') return `0 0 6px ${color}, 0 0 14px ${color}`;
@@ -122,21 +144,22 @@ export default function SubtitleModal({
     isOpen, onClose, onGenerate, isProcessing, videoUrl, bulkCount = 0,
     bulkProgress = null, bulkResult = null, onCancelBulk = null,
 }) {
-    const [position, setPosition] = useState('bottom');
-    const [fontSize, setFontSize] = useState(24);
-    const [fontName, setFontName] = useState('Verdana');
-    const [fontColor, setFontColor] = useState('#FFFFFF');
-    const [borderColor, setBorderColor] = useState('#000000');
-    const [borderWidth, setBorderWidth] = useState(2);
-    const [bgColor, setBgColor] = useState('#000000');
-    const [bgOpacity, setBgOpacity] = useState(0.0);
-    const [style, setStyle] = useState('karaoke'); // classic | karaoke (word highlight)
-    const [highlightColor, setHighlightColor] = useState('#FFD700');
-    const [effect, setEffect] = useState('none'); // none | glow | pop | box | bounce
-    const [preset, setPreset] = useState('custom');
-    const [baseOpacity, setBaseOpacity] = useState(1.0);
-    const [uppercase, setUppercase] = useState(false);
-    const [activePreset, setActivePreset] = useState(null);
+    const saved = React.useMemo(loadSavedStyle, []);
+    const [position, setPosition] = useState(saved?.position ?? 'bottom');
+    const [fontSize, setFontSize] = useState(saved?.fontSize ?? 24);
+    const [fontName, setFontName] = useState(saved?.fontName ?? 'Verdana');
+    const [fontColor, setFontColor] = useState(saved?.fontColor ?? '#FFFFFF');
+    const [borderColor, setBorderColor] = useState(saved?.borderColor ?? '#000000');
+    const [borderWidth, setBorderWidth] = useState(saved?.borderWidth ?? 2);
+    const [bgColor, setBgColor] = useState(saved?.bgColor ?? '#000000');
+    const [bgOpacity, setBgOpacity] = useState(saved?.bgOpacity ?? 0.0);
+    const [style, setStyle] = useState(saved?.style ?? 'karaoke'); // classic | karaoke (word highlight)
+    const [highlightColor, setHighlightColor] = useState(saved?.highlightColor ?? '#FFD700');
+    const [effect, setEffect] = useState(saved?.effect ?? 'none'); // none | glow | pop | box | bounce
+    const [preset, setPreset] = useState(saved?.preset ?? 'custom');
+    const [baseOpacity, setBaseOpacity] = useState(saved?.baseOpacity ?? 1.0);
+    const [uppercase, setUppercase] = useState(saved?.uppercase ?? false);
+    const [activePreset, setActivePreset] = useState(saved?.activePreset ?? null);
     const [videoAspect, setVideoAspect] = useState(9 / 16);
 
     if (!isOpen) return null;
@@ -160,6 +183,16 @@ export default function SubtitleModal({
         setPreset('custom');
         setActivePreset(null);
     };
+
+    // The signature renderers drive colour, effect, dimming and casing
+    // themselves and ignore these inputs entirely. They used to stay fully
+    // interactive, and touching any of them silently threw the preset away via
+    // markCustom() - users dragged the dim slider and lost Neon Sweep without
+    // noticing. Position, size and font DO apply, so those stay enabled.
+    const signatureActive = preset !== 'custom';
+    const drivenByPreset = signatureActive
+        ? 'pointer-events-none select-none opacity-40'
+        : '';
 
     // Scale border width for preview (preview font is small, so amplify the effect)
     const bw = Math.max(borderWidth, 0);
@@ -284,7 +317,7 @@ export default function SubtitleModal({
                             </div>
                             {preset !== 'custom' && (
                                 <p className="mt-2 rounded-lg border border-cyan-300/10 bg-cyan-300/[0.04] px-3 py-2 text-[10px] leading-relaxed text-cyan-100/70">
-                                    Colors and word timing are driven automatically by the signature renderer. Position, size and font remain adjustable.
+                                    Colors, effect, dimming and casing are driven by this preset — those controls are greyed out below. Position, size and font still apply.
                                 </p>
                             )}
                         </div>
@@ -327,7 +360,7 @@ export default function SubtitleModal({
                         </div>
 
                         {/* Caption Style */}
-                        <div>
+                        <div className={drivenByPreset} aria-disabled={signatureActive}>
                             <label className="text-xs font-bold text-zinc-400 uppercase tracking-wider mb-2 block">Style</label>
                             <div className="grid grid-cols-2 gap-2">
                                 <button
@@ -347,7 +380,7 @@ export default function SubtitleModal({
 
                         {/* Effect (karaoke only) */}
                         {style === 'karaoke' && (
-                            <div className="animate-[fadeIn_0.2s_ease-out]">
+                            <div className={`animate-[fadeIn_0.2s_ease-out] ${drivenByPreset}`} aria-disabled={signatureActive}>
                                 <label className="text-xs font-bold text-zinc-400 uppercase tracking-wider mb-2 block">Effect</label>
                                 <div className="grid grid-cols-5 gap-2">
                                     {[
@@ -393,7 +426,7 @@ export default function SubtitleModal({
 
                         {/* Highlight Color (karaoke only) */}
                         {style === 'karaoke' && (
-                            <div className="animate-[fadeIn_0.2s_ease-out]">
+                            <div className={`animate-[fadeIn_0.2s_ease-out] ${drivenByPreset}`} aria-disabled={signatureActive}>
                                 <label className="text-xs font-bold text-zinc-400 uppercase tracking-wider mb-2 block">Highlight Color</label>
                                 <div className="flex flex-wrap gap-2">
                                     {HIGHLIGHT_PRESETS.map((c) => (
@@ -464,7 +497,7 @@ export default function SubtitleModal({
                         </div>
 
                         {/* Text Color */}
-                        <div>
+                        <div className={drivenByPreset} aria-disabled={signatureActive}>
                             <label className="text-xs font-bold text-zinc-400 uppercase tracking-wider mb-2 block">Text Color</label>
                             <div className="flex flex-wrap gap-2">
                                 {COLOR_PRESETS.map((c) => (
@@ -484,7 +517,7 @@ export default function SubtitleModal({
                         </div>
 
                         {/* Border / Outline */}
-                        <div>
+                        <div className={drivenByPreset} aria-disabled={signatureActive}>
                             <label className="text-xs font-bold text-zinc-400 uppercase tracking-wider mb-2 block">Border</label>
                             <div className="flex items-center gap-3">
                                 <label className="relative w-8 h-8 rounded-lg border border-white/10 cursor-pointer overflow-hidden shrink-0" title="Border color">
@@ -509,7 +542,7 @@ export default function SubtitleModal({
                         </div>
 
                         {/* Background Box */}
-                        <div>
+                        <div className={drivenByPreset} aria-disabled={signatureActive}>
                             <div className="flex items-center justify-between mb-2">
                                 <label className="text-xs font-bold text-zinc-400 uppercase tracking-wider">Background Box</label>
                                 <label className="relative inline-flex items-center cursor-pointer">
@@ -595,7 +628,11 @@ export default function SubtitleModal({
                     )}
 
                     <button
-                        onClick={() => onGenerate({ position, fontSize, fontName, fontColor, borderColor, borderWidth, bgColor, bgOpacity, style, preset, highlightColor, effect, baseOpacity, uppercase })}
+                        onClick={() => {
+                            const settings = { position, fontSize, fontName, fontColor, borderColor, borderWidth, bgColor, bgOpacity, style, preset, highlightColor, effect, baseOpacity, uppercase };
+                            saveStyle({ ...settings, activePreset });
+                            onGenerate(settings);
+                        }}
                         disabled={isProcessing}
                         className="w-full py-4 mt-6 bg-gradient-to-r from-yellow-500 to-orange-500 hover:from-yellow-400 hover:to-orange-400 disabled:opacity-60 disabled:cursor-not-allowed text-black font-bold rounded-xl shadow-lg shadow-orange-500/20 transition-all active:scale-[0.98] flex items-center justify-center gap-2"
                     >
