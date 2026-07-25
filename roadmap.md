@@ -17,7 +17,7 @@ verifiziert, mit 30 neuen Tests und echten FFmpeg-Renderings abgesichert.
 
 | Punkt | Wo im Bericht | Warum offen |
 |---|---|---|
-| Verzerrung bei Format 1:1 und Original ungeprüft | Abschnitt 3 | Phase 4; braucht einen Testrender pro Format |
+| Signature-Presets bei 1:1 und 16:9 zu klein (keine Verzerrung — gemessen) | Abschnitt 3 | Phase 4; braucht die Bildgeometrie im Generator |
 | Zeile 1 springt beim Zeilenwechsel zurück auf Weiß | Abschnitt 3 | Designfrage — bewusst nicht ohne deine Entscheidung geändert |
 | Rand-Regler „Keine" erzeugt weiter einen Rand von 1 | Abschnitt 3 | Kleinigkeit, war in keiner der drei Phasen |
 | Toter Code: `add_hook_to_video`, `burn_subtitles`, Gallery (~350 Zeilen) | Abschnitt 3 | Phase 4. Der tote Neon-Konstantenblock ist weg |
@@ -200,17 +200,40 @@ Es wird **einfach ohne Ton weitergemacht**. Der Nutzer bekommt fertige Clips ohn
 
 ---
 
-### ⚠️ RISIKO — Verzerrung bei 1:1 und Original-Format · ⬜ OFFEN
+### 🟡 GEMESSEN — Signature-Presets bei 1:1 und Original zu klein · ⬜ OFFEN
 
 ```python
-# subtitles.py:409-410
-"PlayResX: 162\n"
-"PlayResY: 288\n"
+# subtitles.py
+f"PlayResX: {SIGNATURE_PLAY_RES_X}\n"   # 162
+f"PlayResY: {SIGNATURE_PLAY_RES_Y}\n"   # 288
 ```
 
-Feste 9:16-Zeichenfläche. Das Projekt unterstützt aber auch **1:1** und **Original (16:9)**. Bei diesen Formaten passt das Seitenverhältnis nicht — je nach FFmpeg-Version kann die Schrift horizontal verzerrt werden. Der klassische Pfad setzt `PlayResX` gar nicht und hat das Risiko nicht.
+Feste 9:16-Zeichenfläche, obwohl das Projekt auch **1:1** und **Original (16:9)** unterstützt.
 
-**Nicht abschließend geprüft.** Ein Testrender mit „1:1" + Neon Sweep klärt es in einer Minute.
+**Korrektur meines ursprünglichen Verdachts:** Ich hatte hier eine horizontale
+Verzerrung vermutet. Der Testrender widerlegt das — dieselbe ASS-Datei auf drei
+Formaten:
+
+| Format | Textgröße | Seitenverhältnis des Textes | Anteil der Bildbreite |
+|---|---|---|---|
+| 9:16 (1080×1920) | 513 × 75 px | 6,84 | 47,5 % |
+| 1:1 (1080×1080) | 293 × 42 px | 6,98 | 27,1 % |
+| 16:9 (1920×1080) | 301 × 42 px | 7,17 | 15,7 % |
+
+Das Seitenverhältnis der Buchstaben bleibt konstant (die 5 % Streuung sind
+Messrauschen bei kleineren Pixelgrößen). **Es gibt keine Verzerrung.**
+
+Was tatsächlich passiert: libass skaliert die Schrift über die Bild*höhe*.
+Auf einem 1080 Pixel hohen Bild ist die Schrift also nur halb so groß wie auf
+einem 1920 Pixel hohen — bei 16:9 füllt der Untertitel nur noch 15,7 % der
+Breite statt 47,5 %. Zusätzlich rechnet das Zeilenbudget mit der 9:16-Fläche
+und ist dort deutlich zu vorsichtig: es dürften etwa dreimal so viele Zeichen
+pro Zeile sein.
+
+**Bewertung:** kein Korrektheitsfehler, keine Überlaufgefahr — die Ausgabe ist
+sicher, nur unnötig klein und kurzzeilig. Sauber lösbar, indem `PlayResX` aus
+dem echten Seitenverhältnis abgeleitet und die Bildgeometrie an den Generator
+durchgereicht wird.
 
 ---
 
@@ -636,7 +659,8 @@ Die **Idee und die Ausführung des Glüh-Effekts sind ausgezeichnet.** Der viers
 - [ ] **Untertitel-Text vor dem Einbrennen editierbar**
 - [ ] **Neue Presets** aus Abschnitt 7 (besonders „Bold Box" und „Podcast")
 - [ ] **Toten Code entfernen** (Gallery, `add_hook_to_video`, `burn_subtitles`) — `_SIGNATURE_GLOW_LAYERS` ist erledigt: die Konstante ist jetzt die gemeinsame Quelle beider Renderer statt einer Leiche
-- [ ] **1:1- und Original-Format mit Signature-Presets testen**
+- [x] **1:1- und Original-Format mit Signature-Presets testen** — gemessen: keine Verzerrung, aber Schrift zu klein
+- [ ] **`PlayResX` aus dem echten Seitenverhältnis ableiten**, damit 1:1/16:9 die Bildbreite nutzen
 
 ---
 

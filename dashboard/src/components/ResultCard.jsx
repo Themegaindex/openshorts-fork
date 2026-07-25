@@ -81,7 +81,9 @@ export default function ResultCard({ clip, index, jobId, uploadPostKey, uploadUs
             const data = await res.json();
             if (data.new_video_url) {
                 setCurrentVideoUrl(getApiUrl(data.new_video_url));
-                onVersionChange?.(index, data.new_video_url);
+                // Auto Edit keeps the layers; pass them so the remount does
+                // not fall back to a stale copy from the parent.
+                onVersionChange?.(index, data.new_video_url, layers);
                 // Reload video
                 if (videoRef.current) {
                     videoRef.current.load();
@@ -128,13 +130,14 @@ export default function ResultCard({ clip, index, jobId, uploadPostKey, uploadUs
 
             const data = await res.json();
             if (data.new_video_url) {
+                const nextLayers = { ...layers, subtitle: true };
+                setLayers(nextLayers);
                 setCurrentVideoUrl(getApiUrl(data.new_video_url));
-                onVersionChange?.(index, data.new_video_url);
+                onVersionChange?.(index, data.new_video_url, nextLayers);
                 if (videoRef.current) {
                     videoRef.current.load();
                 }
                 setShowSubtitleModal(false);
-                setLayers((prev) => ({ ...prev, subtitle: true }));
             }
 
         } catch (e) {
@@ -171,13 +174,14 @@ export default function ResultCard({ clip, index, jobId, uploadPostKey, uploadUs
 
             const data = await res.json();
             if (data.new_video_url) {
+                const nextLayers = { ...layers, hook: true };
+                setLayers(nextLayers);
                 setCurrentVideoUrl(getApiUrl(data.new_video_url));
-                onVersionChange?.(index, data.new_video_url);
+                onVersionChange?.(index, data.new_video_url, nextLayers);
                 if (videoRef.current) {
                     videoRef.current.load();
                 }
                 setShowHookModal(false);
-                setLayers((prev) => ({ ...prev, hook: true }));
             }
 
         } catch (e) {
@@ -229,13 +233,15 @@ export default function ResultCard({ clip, index, jobId, uploadPostKey, uploadUs
             const data = await res.json();
             console.log('[Translate] Success response:', data);
             if (data.new_video_url) {
+                // Dubbing drops the now-stale subtitles server-side.
+                const nextLayers = { ...layers, subtitle: false };
+                setLayers(nextLayers);
                 setCurrentVideoUrl(getApiUrl(data.new_video_url));
-                onVersionChange?.(index, data.new_video_url);
+                onVersionChange?.(index, data.new_video_url, nextLayers);
                 if (videoRef.current) {
                     videoRef.current.load();
                 }
                 setShowTranslateModal(false);
-                setLayers((prev) => ({ ...prev, subtitle: false }));
             }
 
         } catch (e) {
@@ -259,10 +265,11 @@ export default function ResultCard({ clip, index, jobId, uploadPostKey, uploadUs
             if (!res.ok) throw new Error(await readApiError(res));
 
             const data = await res.json();
-            if (data.layers) setLayers(data.layers);
+            const nextLayers = data.layers || layers;
+            setLayers(nextLayers);
             if (data.new_video_url) {
                 setCurrentVideoUrl(getApiUrl(data.new_video_url));
-                onVersionChange?.(index, data.new_video_url);
+                onVersionChange?.(index, data.new_video_url, nextLayers);
                 if (videoRef.current) videoRef.current.load();
             }
         } catch (e) {

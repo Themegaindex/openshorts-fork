@@ -329,11 +329,17 @@ function App() {
     setIsSyncedPlaying(false);
   };
 
-  const handleClipVersionChange = (clipIndex, newVideoUrl) => {
+  // The card is keyed by clip.video_url, so changing the URL remounts it and
+  // any state the card set locally is thrown away. Layer state therefore has
+  // to travel up with the new URL, otherwise the remove buttons only appear
+  // (or disappear) after the next full server refresh.
+  const handleClipVersionChange = (clipIndex, newVideoUrl, layers) => {
     setResults((current) => {
       if (!current?.clips?.[clipIndex]) return current;
       const clips = current.clips.map((clip, index) => (
-        index === clipIndex ? { ...clip, video_url: newVideoUrl } : clip
+        index === clipIndex
+          ? { ...clip, video_url: newVideoUrl, ...(layers ? { layers } : {}) }
+          : clip
       ));
       return { ...current, clips };
     });
