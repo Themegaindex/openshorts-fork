@@ -184,6 +184,14 @@ export default function SubtitleModal({
         setActivePreset(null);
     };
 
+    // Clicking an active signature preset turns it off again. Without this the
+    // only way back to the manual controls was picking an unrelated classic
+    // preset, which is not a discoverable escape hatch.
+    const toggleSignaturePreset = (p) => {
+        if (activePreset === p.id) markCustom();
+        else applyPreset(p);
+    };
+
     // The signature renderers drive colour, effect, dimming and casing
     // themselves and ignore these inputs entirely. They used to stay fully
     // interactive, and touching any of them silently threw the preset away via
@@ -301,9 +309,9 @@ export default function SubtitleModal({
                                 {SIGNATURE_PRESETS.map((p) => (
                                     <button
                                         key={p.id}
-                                        onClick={() => applyPreset(p)}
+                                        onClick={() => toggleSignaturePreset(p)}
                                         className={`caption-signature-card group relative overflow-hidden rounded-xl border p-3 text-left transition-all ${activePreset === p.id ? 'is-active border-cyan-300/80' : 'border-white/10 hover:border-cyan-300/40'}`}
-                                        title={p.description}
+                                        title={activePreset === p.id ? 'Click again to go back to manual controls' : p.description}
                                     >
                                         <span className="caption-signature-grid" />
                                         <span className="relative flex h-14 items-center justify-center overflow-hidden rounded-lg bg-black/90">
@@ -317,7 +325,7 @@ export default function SubtitleModal({
                             </div>
                             {preset !== 'custom' && (
                                 <p className="mt-2 rounded-lg border border-cyan-300/10 bg-cyan-300/[0.04] px-3 py-2 text-[10px] leading-relaxed text-cyan-100/70">
-                                    Colors, effect, dimming and casing are driven by this preset — those controls are greyed out below. Position, size and font still apply.
+                                    Colors, effect, dimming and casing are driven by this preset — those controls are greyed out below. Position, size and font still apply. Click the preset again for manual control.
                                 </p>
                             )}
                         </div>
