@@ -42,6 +42,7 @@ from clip_selection import (
     selection_limits,
     snap_clip_to_words,
 )
+from media_audio import extract_audio_track
 from render_planning import (
     SceneLayoutDecision,
     decide_scene_layout_detailed,
@@ -1791,16 +1792,7 @@ def process_video_to_vertical(input_video, final_output_video, progress_callback
     print("\n   🔊 Step 5: Extracting audio...")
     if progress_callback:
         progress_callback(92.0, "Extracting audio...")
-    audio_extract_command = [
-        'ffmpeg', '-y', '-i', input_video, '-vn', '-acodec', 'copy', temp_audio_output
-    ]
-    try:
-        subprocess.run(audio_extract_command, check=True, stdout=subprocess.DEVNULL, stderr=subprocess.PIPE, timeout=1800)
-    except subprocess.TimeoutExpired:
-        print("\n   ❌ Audio extraction timed out after 1800s. Proceeding without audio.")
-    except subprocess.CalledProcessError:
-        print("\n   ❌ Audio extraction failed (maybe no audio?). Proceeding without audio.")
-        pass
+    extract_audio_track(input_video, temp_audio_output, warn=JOB_REPORTER.warning)
 
     print("\n   ✨ Step 6: Merging...")
     if progress_callback:

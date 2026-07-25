@@ -7,6 +7,7 @@ import SubtitleModal from './components/SubtitleModal';
 import ProcessingAnimation from './components/ProcessingAnimation';
 // import Gallery from './components/Gallery';
 import { getApiUrl } from './config';
+import { readApiError } from './apiError';
 
 // Heavy tab components load on first open instead of bloating the main bundle.
 const ThumbnailStudio = lazy(() => import('./components/ThumbnailStudio'));
@@ -305,6 +306,10 @@ function App() {
   // Bulk subtitles: apply one style to every clip of the job
   const [showBulkSubtitles, setShowBulkSubtitles] = useState(false);
   const [bulkSubProgress, setBulkSubProgress] = useState({ running: false, current: 0, total: 0, errors: 0 });
+  // Outcome of the last bulk run, so partial failures are actually reported.
+  const [bulkSubResult, setBulkSubResult] = useState(null); // {total, failed: [{index, message}], cancelled}
+  // Set while a bulk run should stop; the sequential loop checks it per clip.
+  const bulkCancelRef = React.useRef(false);
 
   // Quality gate: server refused to start because YouTube only offers low-res
   const [lowQualityPrompt, setLowQualityPrompt] = useState(null); // {data, maxHeight, cookiesInvalid}
@@ -324,11 +329,17 @@ function App() {
     setIsSyncedPlaying(false);
   };
 
-  const handleClipVersionChange = (clipIndex, newVideoUrl) => {
+  // The card is keyed by clip.video_url, so changing the URL remounts it and
+  // any state the card set locally is thrown away. Layer state therefore has
+  // to travel up with the new URL, otherwise the remove buttons only appear
+  // (or disappear) after the next full server refresh.
+  const handleClipVersionChange = (clipIndex, newVideoUrl, layers) => {
     setResults((current) => {
       if (!current?.clips?.[clipIndex]) return current;
       const clips = current.clips.map((clip, index) => (
-        index === clipIndex ? { ...clip, video_url: newVideoUrl } : clip
+        index === clipIndex
+          ? { ...clip, video_url: newVideoUrl, ...(layers ? { layers } : {}) }
+          : clip
       ));
       return { ...current, clips };
     });
@@ -671,13 +682,17 @@ function App() {
     const clips = results?.clips || [];
     if (!jobId || clips.length === 0) return;
     const total = clips.length;
-    let errors = 0;
+    const failed = [];
+    bulkCancelRef.current = false;
+    setBulkSubResult(null);
     setBulkSubProgress({ running: true, current: 0, total, errors: 0 });
 
     // Sequential on purpose: each burn is an FFmpeg run; parallel requests
     // would hammer the box without finishing sooner.
+    let processed = 0;
     for (let i = 0; i < total; i++) {
-      setBulkSubProgress({ running: true, current: i + 1, total, errors });
+      if (bulkCancelRef.current) break;
+      setBulkSubProgress({ running: true, current: i + 1, total, errors: failed.length });
       try {
         const res = await fetch(getApiUrl('/api/subtitle'), {
           method: 'POST',
@@ -694,6 +709,7 @@ function App() {
             bg_color: options.bgColor,
             bg_opacity: options.bgOpacity,
             style: options.style,
+            preset: options.preset,
             highlight_color: options.highlightColor,
             effect: options.effect,
             base_opacity: options.baseOpacity,
@@ -702,14 +718,22 @@ function App() {
             // replaces existing subtitles instead of stacking them
           }),
         });
-        if (!res.ok) errors += 1;
-      } catch {
-        errors += 1;
+        if (!res.ok) {
+          // Failures used to be counted and then silently dropped, so a run
+          // where half the clips failed still looked like a clean success.
+          failed.push({ index: i, message: await readApiError(res) });
+        }
+      } catch (e) {
+        failed.push({ index: i, message: e.message || 'Network error' });
       }
+      processed += 1;
     }
 
-    setBulkSubProgress({ running: false, current: total, total, errors });
-    setShowBulkSubtitles(false);
+    const cancelled = bulkCancelRef.current;
+    bulkCancelRef.current = false;
+    setBulkSubProgress({ running: false, current: processed, total, errors: failed.length });
+    setBulkSubResult({ total, processed, failed, cancelled });
+    if (failed.length === 0 && !cancelled) setShowBulkSubtitles(false);
     // One targeted refresh so the cards pick up the new video_urls
     // (replaces the old permanent 2s poll loop in 'complete').
     try {
@@ -1389,11 +1413,14 @@ function App() {
       {/* Bulk Subtitles Modal: one style, applied to every clip */}
       <SubtitleModal
         isOpen={showBulkSubtitles}
-        onClose={() => setShowBulkSubtitles(false)}
+        onClose={() => { setShowBulkSubtitles(false); setBulkSubResult(null); }}
         onGenerate={handleBulkSubtitles}
         isProcessing={bulkSubProgress.running}
         videoUrl={results?.clips?.[0]?.video_url ? getApiUrl(results.clips[0].video_url) : undefined}
         bulkCount={results?.clips?.length || 0}
+        bulkProgress={bulkSubProgress}
+        bulkResult={bulkSubResult}
+        onCancelBulk={() => { bulkCancelRef.current = true; }}
       />
 
       {/* Low Quality Confirmation Modal (quality gate) */}

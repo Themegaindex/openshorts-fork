@@ -82,6 +82,7 @@ def test_full_video_artifact_recovery_supports_every_canonical_format(tmp_path, 
         (app.SocialPostRequest, {
             "job_id": "j", "clip_index": -1, "api_key": "k", "user_id": "u", "platforms": ["youtube"]
         }),
+        (app.RemoveLayerRequest, {"job_id": "j", "clip_index": -1, "layer": "subtitle"}),
     ],
 )
 def test_negative_clip_indices_are_rejected(model, payload):
@@ -89,11 +90,23 @@ def test_negative_clip_indices_are_rejected(model, payload):
         model(**payload)
 
 
+@pytest.mark.parametrize("layer", ["subtitle", "hook", "all"])
+def test_remove_layer_accepts_the_documented_layers(layer):
+    assert app.RemoveLayerRequest(job_id="j", clip_index=0, layer=layer).layer == layer
+
+
+@pytest.mark.parametrize("layer", ["", "edit", "watermark", "SUBTITLE"])
+def test_remove_layer_rejects_unknown_layers(layer):
+    with pytest.raises(ValidationError):
+        app.RemoveLayerRequest(job_id="j", clip_index=0, layer=layer)
+
+
 @pytest.mark.parametrize(
     "field,value",
     [
         ("position", "center-ish"),
         ("style", "animated"),
+        ("preset", "disco_fire"),
         ("effect", "shake"),
         ("font_color", "red"),
         ("font_size", 500),
@@ -109,6 +122,13 @@ def test_invalid_subtitle_options_are_rejected(field, value):
 def test_safe_bounce_is_a_valid_subtitle_effect():
     request = app.SubtitleRequest(job_id="j", clip_index=0, effect="bounce", style="karaoke")
     assert request.effect == "bounce"
+
+
+def test_signature_subtitle_presets_are_valid():
+    neon = app.SubtitleRequest(job_id="j", clip_index=0, preset="neon_sweep")
+    rainbow = app.SubtitleRequest(job_id="j", clip_index=0, preset="rainbow_word")
+    assert neon.preset == "neon_sweep"
+    assert rainbow.preset == "rainbow_word"
 
 
 def test_worker_summary_does_not_publish_completed_before_validation(monkeypatch, tmp_path):

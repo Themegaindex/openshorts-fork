@@ -1,6 +1,7 @@
 import React, { useState, useEffect } from 'react';
 import { Download, Share2, Instagram, Youtube, Video, CheckCircle, AlertCircle, X, Loader2, Copy, Wand2, Type, Calendar, Clock, Languages } from 'lucide-react';
 import { getApiUrl } from '../config';
+import { readApiError } from '../apiError';
 import SubtitleModal from './SubtitleModal';
 import HookModal from './HookModal';
 import TranslateModal from './TranslateModal';
@@ -31,6 +32,14 @@ export default function ResultCard({ clip, index, jobId, uploadPostKey, uploadUs
     const [showHookModal, setShowHookModal] = useState(false);
     const [showTranslateModal, setShowTranslateModal] = useState(false);
     const [editError, setEditError] = useState(null);
+    // Which burned-in layers this clip currently carries. The server reports
+    // them so the remove buttons survive a page reload.
+    const [layers, setLayers] = useState(clip.layers || { subtitle: false, hook: false });
+    const [removingLayer, setRemovingLayer] = useState(null);
+
+    useEffect(() => {
+        if (clip.layers) setLayers(clip.layers);
+    }, [clip.layers]);
 
     // Initialize/Reset form when modal opens
     useEffect(() => {
@@ -67,20 +76,14 @@ export default function ResultCard({ clip, index, jobId, uploadPostKey, uploadUs
                 })
             });
 
-            if (!res.ok) {
-                const errText = await res.text();
-                try {
-                    const jsonErr = JSON.parse(errText);
-                    throw new Error(jsonErr.detail || errText);
-                } catch {
-                    throw new Error(errText);
-                }
-            }
+            if (!res.ok) throw new Error(await readApiError(res));
 
             const data = await res.json();
             if (data.new_video_url) {
                 setCurrentVideoUrl(getApiUrl(data.new_video_url));
-                onVersionChange?.(index, data.new_video_url);
+                // Auto Edit keeps the layers; pass them so the remount does
+                // not fall back to a stale copy from the parent.
+                onVersionChange?.(index, data.new_video_url, layers);
                 // Reload video
                 if (videoRef.current) {
                     videoRef.current.load();
@@ -114,6 +117,7 @@ export default function ResultCard({ clip, index, jobId, uploadPostKey, uploadUs
                     bg_color: options.bgColor,
                     bg_opacity: options.bgOpacity,
                     style: options.style,
+                    preset: options.preset,
                     highlight_color: options.highlightColor,
                     effect: options.effect,
                     base_opacity: options.baseOpacity,
@@ -122,15 +126,14 @@ export default function ResultCard({ clip, index, jobId, uploadPostKey, uploadUs
                 })
             });
 
-            if (!res.ok) {
-                const errText = await res.text();
-                throw new Error(errText);
-            }
+            if (!res.ok) throw new Error(await readApiError(res));
 
             const data = await res.json();
             if (data.new_video_url) {
+                const nextLayers = { ...layers, subtitle: true };
+                setLayers(nextLayers);
                 setCurrentVideoUrl(getApiUrl(data.new_video_url));
-                onVersionChange?.(index, data.new_video_url);
+                onVersionChange?.(index, data.new_video_url, nextLayers);
                 if (videoRef.current) {
                     videoRef.current.load();
                 }
@@ -167,15 +170,14 @@ export default function ResultCard({ clip, index, jobId, uploadPostKey, uploadUs
                 })
             });
 
-            if (!res.ok) {
-                const errText = await res.text();
-                throw new Error(errText);
-            }
+            if (!res.ok) throw new Error(await readApiError(res));
 
             const data = await res.json();
             if (data.new_video_url) {
+                const nextLayers = { ...layers, hook: true };
+                setLayers(nextLayers);
                 setCurrentVideoUrl(getApiUrl(data.new_video_url));
-                onVersionChange?.(index, data.new_video_url);
+                onVersionChange?.(index, data.new_video_url, nextLayers);
                 if (videoRef.current) {
                     videoRef.current.load();
                 }
@@ -223,22 +225,19 @@ export default function ResultCard({ clip, index, jobId, uploadPostKey, uploadUs
             console.log('[Translate] Response status:', res.status);
 
             if (!res.ok) {
-                const errText = await res.text();
-                console.error('[Translate] Error response:', errText);
-                try {
-                    const jsonErr = JSON.parse(errText);
-                    throw new Error(jsonErr.detail || errText);
-                } catch (e) {
-                    if (e.message !== errText) throw e;
-                    throw new Error(errText);
-                }
+                const message = await readApiError(res);
+                console.error('[Translate] Error response:', message);
+                throw new Error(message);
             }
 
             const data = await res.json();
             console.log('[Translate] Success response:', data);
             if (data.new_video_url) {
+                // Dubbing drops the now-stale subtitles server-side.
+                const nextLayers = { ...layers, subtitle: false };
+                setLayers(nextLayers);
                 setCurrentVideoUrl(getApiUrl(data.new_video_url));
-                onVersionChange?.(index, data.new_video_url);
+                onVersionChange?.(index, data.new_video_url, nextLayers);
                 if (videoRef.current) {
                     videoRef.current.load();
                 }
@@ -251,6 +250,33 @@ export default function ResultCard({ clip, index, jobId, uploadPostKey, uploadUs
             setTimeout(() => setEditError(null), 5000);
         } finally {
             setIsTranslating(false);
+        }
+    };
+
+    const handleRemoveLayer = async (layer) => {
+        setRemovingLayer(layer);
+        setEditError(null);
+        try {
+            const res = await fetch(getApiUrl('/api/clip/remove-layer'), {
+                method: 'POST',
+                headers: { 'Content-Type': 'application/json' },
+                body: JSON.stringify({ job_id: jobId, clip_index: index, layer })
+            });
+            if (!res.ok) throw new Error(await readApiError(res));
+
+            const data = await res.json();
+            const nextLayers = data.layers || layers;
+            setLayers(nextLayers);
+            if (data.new_video_url) {
+                setCurrentVideoUrl(getApiUrl(data.new_video_url));
+                onVersionChange?.(index, data.new_video_url, nextLayers);
+                if (videoRef.current) videoRef.current.load();
+            }
+        } catch (e) {
+            setEditError(e.message);
+            setTimeout(() => setEditError(null), 5000);
+        } finally {
+            setRemovingLayer(null);
         }
     };
 
@@ -298,15 +324,7 @@ export default function ResultCard({ clip, index, jobId, uploadPostKey, uploadUs
                 body: JSON.stringify(payload)
             });
 
-            if (!res.ok) {
-                const errText = await res.text();
-                try {
-                    const jsonErr = JSON.parse(errText);
-                    throw new Error(jsonErr.detail || errText);
-                } catch {
-                    throw new Error(errText);
-                }
-            }
+            if (!res.ok) throw new Error(await readApiError(res));
 
             setPostResult({ success: true, msg: isScheduling ? "Scheduled successfully!" : "Posted successfully!" });
             setTimeout(() => {
@@ -406,8 +424,33 @@ export default function ResultCard({ clip, index, jobId, uploadPostKey, uploadUs
                     </div>
                 )}
 
+                {/* Applied layers. Burning one in used to be a one-way door:
+                    the only way out was overwriting it with another style. */}
+                {(layers.subtitle || layers.hook) && (
+                    <div className="mt-auto flex flex-wrap items-center gap-2 pt-4 text-[10px]">
+                        <span className="text-zinc-600 uppercase tracking-wider">Applied</span>
+                        {[
+                            { id: 'subtitle', label: 'Subtitles', active: layers.subtitle },
+                            { id: 'hook', label: 'Hook', active: layers.hook },
+                        ].filter((entry) => entry.active).map((entry) => (
+                            <button
+                                key={entry.id}
+                                onClick={() => handleRemoveLayer(entry.id)}
+                                disabled={removingLayer !== null}
+                                title={`Remove ${entry.label.toLowerCase()} from this clip`}
+                                className="group flex items-center gap-1 rounded-full border border-white/10 bg-white/5 px-2 py-0.5 text-zinc-300 transition-colors hover:border-red-500/40 hover:bg-red-500/10 hover:text-red-300 disabled:opacity-50"
+                            >
+                                {removingLayer === entry.id
+                                    ? <Loader2 size={10} className="animate-spin" />
+                                    : <X size={10} className="text-zinc-500 group-hover:text-red-300" />}
+                                {entry.label}
+                            </button>
+                        ))}
+                    </div>
+                )}
+
                 {/* Actions Footer */}
-                <div className="grid grid-cols-2 gap-3 mt-auto pt-4 border-t border-white/5">
+                <div className={`grid grid-cols-2 gap-3 ${layers.subtitle || layers.hook ? 'mt-3' : 'mt-auto'} pt-4 border-t border-white/5`}>
                     <button
                         onClick={handleAutoEdit}
                         disabled={isEditing}

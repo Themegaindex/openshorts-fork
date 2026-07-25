@@ -275,6 +275,154 @@ class TestGenerateAss:
         content = out.read_text(encoding="utf-8-sig")
         assert "&H00FFFFFF" in content  # pure white, no dimming
 
+    def test_neon_sweep_uses_cumulative_line_mask_and_layered_glow(self, tmp_path):
+        from subtitles import _NEON_SWEEP_GLOW_LAYERS, _NEON_SWEEP_PALETTE, generate_ass
+        out = tmp_path / "neon_sweep.ass"
+        words = [
+            _w(" und", 0.0, 0.30), _w(" meint", 0.30, 0.60),
+            _w(" der", 0.60, 0.90), _w(" andere", 0.90, 1.20),
+        ]
+
+        assert generate_ass(
+            self._transcript(words), 0, 10, str(out),
+            preset="neon_sweep", font_name="Arial Black", fontsize=27,
+        ) is True
+        content = out.read_text(encoding="utf-8-sig")
+        events = [line for line in content.splitlines() if line.startswith("Dialogue:")]
+
+        assert "PlayResX: 162" in content and "PlayResY: 288" in content
+        assert "Style: Signature,Arial Black," in content
+        assert r"\blur70.0" in content and r"\blur28.0" in content
+        assert r"\N" in content  # stable renderer-independent line break
+        assert len([line for line in events if line.startswith("Dialogue: 7")]) == 4
+        # First active event shows one colored word; the second keeps a
+        # cumulative two-word prefix instead of flashing only one word.
+        sharp_events = [line for line in events if line.startswith("Dialogue: 7")]
+        assert sharp_events[0].count(r"\alpha&H00&") == 1
+        assert sharp_events[1].count(r"\alpha&H00&") == 2
+        # Two white layers + four pure-colour layers per spoken interval: the
+        # unspoken words only get the two tight glow stages.
+        assert len(events) == 24
+        assert _NEON_SWEEP_PALETTE == ("18F8F4", "19FF43", "FF2038")
+        assert [layer[2] for layer in _NEON_SWEEP_GLOW_LAYERS] == ["0D", "0D", "0D", "00"]
+        assert r"\1a&H0D&" in events[0]
+
+    def test_neon_sweep_keeps_sharp_cores_above_every_blurred_bloom(self, tmp_path):
+        """A coloured wide bloom must never cover a neighbour's white core.
+
+        White and colour masks are interleaved per glow stage, so the two sharp
+        cores end up on the highest layers instead of the colour mask sitting
+        on top of every white layer.
+        """
+        from subtitles import generate_ass
+        out = tmp_path / "layers.ass"
+        words = [_w(" und", 0.0, 0.30), _w(" meint", 0.30, 0.60)]
+        assert generate_ass(
+            self._transcript(words), 0, 10, str(out),
+            preset="neon_sweep", font_name="Arial Black", fontsize=20,
+        ) is True
+
+        blur_layers, sharp_layers = [], []
+        for line in out.read_text(encoding="utf-8-sig").splitlines():
+            if not line.startswith("Dialogue:"):
+                continue
+            layer = int(line.split(",", 1)[0].split(":")[1])
+            if r"\blur70.0" in line or r"\blur28.0" in line:
+                blur_layers.append(layer)
+            elif r"\blur0.08" in line:
+                sharp_layers.append(layer)
+
+        assert blur_layers and sharp_layers
+        assert max(blur_layers) < min(sharp_layers)
+
+    def test_signature_line_budget_shrinks_as_the_font_grows(self):
+        """The old renderer used a fixed 16 characters at every font size."""
+        from subtitles import (
+            SIGNATURE_MIN_LINE_CHARS, _NEON_SWEEP_SCALE_X,
+            _signature_final_fontsize, _signature_line_budget,
+        )
+        budgets = [
+            _signature_line_budget(_signature_final_fontsize(ui), _NEON_SWEEP_SCALE_X)
+            for ui in (14, 20, 29, 40)
+        ]
+        assert budgets == sorted(budgets, reverse=True)
+        assert budgets[0] > budgets[-1]
+        assert min(budgets) >= SIGNATURE_MIN_LINE_CHARS
+
+    def test_signature_blocks_never_exceed_two_budgeted_lines(self, tmp_path):
+        """Every emitted line has to stay inside the per-size character budget.
+
+        This is the regression that let 20-character lines run off both edges
+        of a 1080px frame at the preset's own default font size.
+        """
+        import re
+        from subtitles import (
+            _NEON_SWEEP_SCALE_X, _signature_final_fontsize,
+            _signature_line_budget, generate_ass,
+        )
+        vocab = ["kompliziert", "zusammenarbeit", "wirklich", "und", "so", "andere"]
+        words, clock = [], 0.0
+        for index in range(60):
+            words.append(_w(" " + vocab[index % len(vocab)], clock, clock + 0.3))
+            clock += 0.3
+
+        for ui_size in (14, 20, 29, 40):
+            out = tmp_path / f"budget_{ui_size}.ass"
+            assert generate_ass(
+                self._transcript(words), 0, clock + 1, str(out),
+                preset="neon_sweep", font_name="Arial Black", fontsize=ui_size,
+            ) is True
+            budget = _signature_line_budget(
+                _signature_final_fontsize(ui_size), _NEON_SWEEP_SCALE_X,
+            )
+            for line in out.read_text(encoding="utf-8-sig").splitlines():
+                if not line.startswith("Dialogue:"):
+                    continue
+                text = re.sub(r"\{[^}]*\}", "", line.split(",", 9)[-1])
+                for rendered in text.split(r"\N"):
+                    assert len(rendered.strip()) <= budget, (
+                        f"size {ui_size}: {rendered!r} exceeds budget {budget}"
+                    )
+
+    def test_signature_header_keeps_libass_wrapping_as_a_safety_net(self, tmp_path):
+        """WrapStyle 2 disabled wrapping entirely, so overflow got clipped."""
+        from subtitles import generate_ass
+        out = tmp_path / "wrap.ass"
+        assert generate_ass(
+            self._transcript([_w(" hallo", 0.0, 0.4)]), 0, 10, str(out),
+            preset="neon_sweep", font_name="Arial Black", fontsize=20,
+        ) is True
+        content = out.read_text(encoding="utf-8-sig")
+        assert "WrapStyle: 0" in content
+        assert "WrapStyle: 2" not in content
+
+    def test_rainbow_word_shows_only_current_word_with_animated_gradient(self, tmp_path):
+        import re
+        from subtitles import generate_ass
+        out = tmp_path / "rainbow_word.ass"
+        words = [_w(" brown", 0.0, 0.60), _w(" fox", 0.60, 1.20)]
+
+        assert generate_ass(
+            self._transcript(words), 0, 10, str(out),
+            preset="rainbow_word", font_name="Arial Black", fontsize=30,
+        ) is True
+        content = out.read_text(encoding="utf-8-sig")
+        events = [line for line in content.splitlines() if line.startswith("Dialogue:")]
+
+        assert len(events) == 8  # four measured glow/core layers per current word
+        assert r"\blur70.0" in content and r"\blur0.08" in content
+        assert r"\fad(40,40)" in content
+        first_word_events = events[:4]
+        second_word_events = events[4:]
+        visible_text = lambda line: re.sub(r"\{[^}]*\}", "", line.split(",", 9)[-1])
+        assert all(visible_text(line) == "BROWN" for line in first_word_events)
+        assert all(visible_text(line) == "FOX" for line in second_word_events)
+        # Every character gets the smooth spectrum and travelling white shine.
+        assert first_word_events[3].count(r"\t(") >= 35
+        assert first_word_events[3].count(r"\1a&H00&") == 1
+        initial_colors = re.findall(r"\\c(&H[0-9A-F]{6}&)", first_word_events[3])
+        assert len(set(initial_colors[:5])) > 1
+
 
 class TestBuildSubtitleFilterAlignment:
     """ASS v4.00+ numpad alignment: 2=bottom, 5=middle, 8=top center.

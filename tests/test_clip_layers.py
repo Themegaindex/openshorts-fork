@@ -274,3 +274,152 @@ def test_resolve_entry_persists_migration_and_returns_a_copy(monkeypatch, tmp_pa
     entry["subtitle"]["path"] = "mutated.ass"
     unchanged = json.loads((output_dir / app.CLIP_LAYERS_FILE).read_text(encoding="utf-8"))
     assert unchanged["clips"]["0"]["subtitle"] == {"path": "legacy_a.ass"}
+
+
+def _store(clips, legacy=None):
+    return {"version": 2, "clips": clips, "legacy_entries": legacy or {}}
+
+
+class TestPruneReplacedClipFiles:
+    """Every restyle wrote a new full-length MP4 and kept the old one.
+
+    Trying five preset looks on a ten-clip job left 50 orphaned videos behind
+    until the whole job was purged 24 hours later.
+    """
+
+    def _populate(self, tmp_path, names):
+        for name in names:
+            (tmp_path / name).write_bytes(b"x")
+
+    def test_removes_the_render_and_subtitle_this_clip_replaced(self, tmp_path):
+        self._populate(tmp_path, [
+            "clip.mp4",
+            "subtitled_new111_clip.mp4", "subs_0_new111.ass",   # current
+            "subtitled_old999_clip.mp4", "subs_0_old999.ass",   # replaced
+        ])
+        previous = {
+            "clean_source": "clip.mp4",
+            "current_render": "subtitled_old999_clip.mp4",
+            "subtitle": {"path": "subs_0_old999.ass"}, "hook": None,
+        }
+        store = _store({"0": {
+            "clean_source": "clip.mp4",
+            "current_render": "subtitled_new111_clip.mp4",
+            "subtitle": {"path": "subs_0_new111.ass"}, "hook": None,
+        }})
+
+        app._prune_replaced_clip_files(str(tmp_path), previous, store)
+
+        assert sorted(p.name for p in tmp_path.iterdir()) == [
+            "clip.mp4", "subs_0_new111.ass", "subtitled_new111_clip.mp4",
+        ]
+
+    def test_never_deletes_a_clean_source_or_unrelated_file(self, tmp_path):
+        """Only the two generated name patterns may ever be removed."""
+        self._populate(tmp_path, ["clip.mp4", "edited_x_clip.mp4", "translated_y_clip.mp4"])
+        previous = {"clean_source": "clip.mp4", "current_render": "edited_x_clip.mp4",
+                    "subtitle": None, "hook": None}
+        store = _store({"0": {"clean_source": "translated_y_clip.mp4",
+                              "current_render": "translated_y_clip.mp4",
+                              "subtitle": None, "hook": None}})
+
+        app._prune_replaced_clip_files(str(tmp_path), previous, store)
+
+        assert len(list(tmp_path.iterdir())) == 3
+
+    def test_keeps_a_render_another_clip_still_points_at(self, tmp_path):
+        self._populate(tmp_path, ["clip.mp4", "subtitled_shared_clip.mp4"])
+        previous = {"clean_source": "clip.mp4",
+                    "current_render": "subtitled_shared_clip.mp4",
+                    "subtitle": None, "hook": None}
+        store = _store({
+            "0": {"clean_source": "clip.mp4", "current_render": "clip.mp4",
+                  "subtitle": None, "hook": None},
+            "1": {"clean_source": "subtitled_shared_clip.mp4",
+                  "current_render": "subtitled_shared_clip.mp4",
+                  "subtitle": None, "hook": None},
+        })
+
+        app._prune_replaced_clip_files(str(tmp_path), previous, store)
+
+        assert (tmp_path / "subtitled_shared_clip.mp4").exists()
+
+    def test_does_not_touch_files_of_a_clip_still_encoding(self, tmp_path):
+        """The reason this is not a directory sweep.
+
+        Another clip of the same job can be minutes into an FFmpeg encode
+        whose output is not in the store yet; a sweep would delete it while
+        it is being written.
+        """
+        self._populate(tmp_path, [
+            "clip.mp4",
+            "subtitled_old_clip1.mp4",           # what clip 0 replaced
+            "subtitled_inflight_clip2.mp4",      # clip 1 is still writing this
+        ])
+        previous = {"clean_source": "clip.mp4",
+                    "current_render": "subtitled_old_clip1.mp4",
+                    "subtitle": None, "hook": None}
+        store = _store({"0": {"clean_source": "clip.mp4",
+                              "current_render": "subtitled_new_clip1.mp4",
+                              "subtitle": None, "hook": None}})
+
+        app._prune_replaced_clip_files(str(tmp_path), previous, store)
+
+        assert (tmp_path / "subtitled_inflight_clip2.mp4").exists()
+        assert not (tmp_path / "subtitled_old_clip1.mp4").exists()
+
+    def test_keeps_subtitle_files_referenced_by_unmigrated_v1_entries(self, tmp_path):
+        self._populate(tmp_path, ["clip.mp4", "subs_3_legacy.ass"])
+        previous = {"clean_source": "clip.mp4", "current_render": "clip.mp4",
+                    "subtitle": {"path": "subs_3_legacy.ass"}, "hook": None}
+        store = _store(
+            {"0": {"clean_source": "clip.mp4", "current_render": "clip.mp4",
+                   "subtitle": None, "hook": None}},
+            legacy={"other.mp4": {"subtitle": {"path": "subs_3_legacy.ass"}}},
+        )
+
+        app._prune_replaced_clip_files(str(tmp_path), previous, store)
+
+        assert (tmp_path / "subs_3_legacy.ass").exists()
+
+    def test_first_operation_on_a_clip_has_nothing_to_prune(self, tmp_path):
+        app._prune_replaced_clip_files(str(tmp_path), None, _store({}))
+
+
+class TestRemoveLayerState:
+    """Removing a layer re-renders from the clean source without it."""
+
+    def test_dropping_the_last_layer_needs_no_encode(self, tmp_path):
+        entry = {"clean_source": "clip.mp4", "current_render": "subtitled_a_clip.mp4",
+                 "subtitle": {"path": "subs_0_a.ass"}, "hook": None}
+        candidate = dict(entry)
+        candidate["subtitle"] = None
+        assert not (candidate.get("subtitle") or candidate.get("hook"))
+        # The clean source becomes the result as-is.
+        (tmp_path / "clip.mp4").write_bytes(b"video")
+        assert os.path.basename(
+            app._clean_source_path(str(tmp_path), candidate)
+        ) == "clip.mp4"
+
+    def test_layer_summary_reports_what_the_client_can_remove(self):
+        assert app._clip_layer_summary({"subtitle": {"path": "s.ass"}, "hook": None}) == {
+            "subtitle": True, "hook": False,
+        }
+        assert app._clip_layer_summary({"subtitle": None, "hook": {"text": "Hi"}}) == {
+            "subtitle": False, "hook": True,
+        }
+
+    def test_remove_all_falls_back_to_the_original_clip(self, tmp_path):
+        """'all' also undoes auto-edit and dubbing, not just the overlays."""
+        (tmp_path / "clip.mp4").write_bytes(b"original")
+        entry = {"clean_source": "translated_x_clip.mp4",
+                 "current_render": "subtitled_a_translated_x_clip.mp4",
+                 "subtitle": {"path": "s.ass"}, "hook": {"text": "Hi"},
+                 "transcript_source": "media"}
+        candidate = dict(entry)
+        candidate["subtitle"] = None
+        candidate["hook"] = None
+        candidate["clean_source"] = "clip.mp4"
+        candidate.pop("transcript_source", None)
+        assert candidate["clean_source"] == "clip.mp4"
+        assert "transcript_source" not in candidate

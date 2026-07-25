@@ -316,6 +316,7 @@ def _update_clip_version(
     video_url: str,
     *,
     metadata_path: Optional[str] = None,
+    layers: Optional[dict] = None,
 ) -> None:
     """Atomically persist the selected derivative in memory and metadata.
 
@@ -345,8 +346,14 @@ def _update_clip_version(
         raise HTTPException(status_code=404, detail="Clip metadata not found")
 
     metadata_clips[clip_index]["video_url"] = video_url
+    if layers is not None:
+        # Surfaced to the dashboard so it can offer to remove exactly the
+        # layers a clip actually carries, and keep doing so after a reload.
+        metadata_clips[clip_index]["layers"] = layers
     _safe_write_json(metadata_path, metadata)
     result_clips[clip_index]["video_url"] = video_url
+    if layers is not None:
+        result_clips[clip_index]["layers"] = layers
     job["updated_at"] = _now_ts()
     _persist_job_state(job_id)
 
@@ -2040,9 +2047,79 @@ async def _commit_clip_layer_state(
     """
     async with _get_job_state_lock(job_id):
         store = _coerce_layer_store(_load_clip_layers(output_dir))
+        previous_entry = store["clips"].get(str(clip_index))
         store["clips"][str(clip_index)] = entry
         _save_clip_layers(output_dir, store)
-        _update_clip_version(job_id, clip_index, video_url, metadata_path=metadata_path)
+        _update_clip_version(
+            job_id, clip_index, video_url,
+            metadata_path=metadata_path, layers=_clip_layer_summary(entry),
+        )
+        _prune_replaced_clip_files(output_dir, previous_entry, store)
+
+
+# Presentation renders are named "<prefix>_<generation id>_<clean source>", so
+# every restyle of a clip left a full-length MP4 behind. Trying five preset
+# looks on a ten-clip job kept 50 orphaned videos until the whole job was
+# purged 24 hours later.
+_LAYERED_RENDER_RE = re.compile(r'^(?:subtitled|hook)_[A-Za-z0-9-]+_')
+_SUBTITLE_FILE_RE = re.compile(r'^subs_\d+_[A-Za-z0-9-]+\.(?:ass|srt)$')
+
+
+def _referenced_files(store: dict) -> set:
+    """Every file the layer store still points at, across all clips."""
+    referenced = set()
+
+    def remember(value):
+        name = os.path.basename(str(value or ""))
+        if name:
+            referenced.add(name)
+
+    for entry in list(store.get("clips", {}).values()) + list(store.get("legacy_entries", {}).values()):
+        if not isinstance(entry, dict):
+            continue
+        remember(entry.get("current_render"))
+        remember(entry.get("clean_source"))
+        remember((entry.get("subtitle") or {}).get("path"))
+    return referenced
+
+
+def _prune_replaced_clip_files(output_dir: str, previous_entry, store: dict) -> None:
+    """Delete only the files THIS clip just replaced.
+
+    Deliberately not a directory sweep: another clip of the same job may be
+    minutes into an FFmpeg encode whose output file is not in the store yet,
+    and a sweep would delete it out from under the running job. We only ever
+    consider the previous entry's own render and subtitle, only when they
+    match the generated-name patterns, and only when no other clip still
+    references them. Failures are ignored — a leftover file is harmless,
+    deleting a live one is not.
+    """
+    if not isinstance(previous_entry, dict):
+        return
+
+    still_referenced = _referenced_files(store)
+    candidates = [
+        os.path.basename(str(previous_entry.get("current_render") or "")),
+        os.path.basename(str((previous_entry.get("subtitle") or {}).get("path") or "")),
+    ]
+
+    for filename in candidates:
+        if not filename or filename in still_referenced:
+            continue
+        if not (_LAYERED_RENDER_RE.match(filename) or _SUBTITLE_FILE_RE.match(filename)):
+            continue
+        try:
+            os.remove(os.path.join(output_dir, filename))
+        except OSError:
+            pass
+
+
+def _clip_layer_summary(entry: dict) -> dict:
+    """What the client needs to offer 'remove this layer' buttons."""
+    return {
+        "subtitle": bool(entry.get("subtitle")),
+        "hook": bool(entry.get("hook")),
+    }
 
 
 def _clean_source_path(output_dir: str, entry: dict) -> str:
@@ -2136,6 +2213,7 @@ class SubtitleRequest(BaseModel):
     bg_color: str = Field(default="#000000", pattern=r"^#[0-9A-Fa-f]{6}$")
     bg_opacity: float = Field(default=0.0, ge=0.0, le=1.0)
     style: Literal["classic", "karaoke"] = "classic"
+    preset: Literal["custom", "neon_sweep", "rainbow_word"] = "custom"
     highlight_color: str = Field(default="#FFD700", pattern=r"^#[0-9A-Fa-f]{6}$")
     effect: Literal["none", "glow", "pop", "box", "bounce"] = "none"
     base_opacity: float = Field(default=1.0, ge=0.05, le=1.0)
@@ -2188,7 +2266,9 @@ async def _add_subtitles_locked(req: SubtitleRequest):
         
     # Define outputs
     generation_id = uuid.uuid4().hex[:12]
-    is_karaoke = req.style == "karaoke"
+    # Signature presets are ASS renderers by definition. Keeping this defensive
+    # guard makes direct API clients safe even if they leave style at "classic".
+    is_karaoke = req.style == "karaoke" or req.preset != "custom"
     srt_filename = f"subs_{req.clip_index}_{generation_id}.{'ass' if is_karaoke else 'srt'}"
     srt_path = os.path.join(output_dir, srt_filename)
 
@@ -2199,6 +2279,7 @@ async def _add_subtitles_locked(req: SubtitleRequest):
         border_width=req.border_width, highlight_color=req.highlight_color,
         bg_color=req.bg_color, bg_opacity=req.bg_opacity,
         effect=req.effect, base_opacity=req.base_opacity, uppercase=req.uppercase,
+        preset=req.preset,
     )
 
     try:
@@ -2239,6 +2320,7 @@ async def _add_subtitles_locked(req: SubtitleRequest):
             "burn_opts": burn_opts,
             "style": req.style,
             "effect": req.effect,
+            "preset": req.preset,
         }
         output_filename = _layered_filename(candidate_entry, generation_id)
         output_path = os.path.join(output_dir, output_filename)
@@ -2271,6 +2353,103 @@ async def _add_subtitles_locked(req: SubtitleRequest):
     return {
         "success": True,
         "new_video_url": new_video_url
+    }
+
+
+class RemoveLayerRequest(BaseModel):
+    job_id: str
+    clip_index: int = Field(ge=0)
+    # "all" also drops auto-edit and dubbing by going back to the originally
+    # rendered clip; the two named layers keep the current clean source.
+    layer: Literal["subtitle", "hook", "all"]
+
+
+@app.post("/api/clip/remove-layer")
+async def remove_clip_layer(req: RemoveLayerRequest):
+    """Take a burned-in subtitle or hook back off a clip.
+
+    Applying a layer was a one-way door: the only way out was to overwrite it
+    with another one. The clean source and the layer descriptions were already
+    tracked per clip, so removal is just re-rendering from that source without
+    the dropped layer — or handing back the clean source untouched when no
+    layer is left, which needs no encode at all.
+    """
+    async with _get_clip_operation_lock(req.job_id, req.clip_index):
+        return await _remove_clip_layer_locked(req)
+
+
+async def _remove_clip_layer_locked(req: RemoveLayerRequest):
+    if req.job_id not in jobs:
+        raise HTTPException(status_code=404, detail="Job not found")
+
+    output_dir = os.path.join(OUTPUT_DIR, req.job_id)
+    json_files = glob.glob(os.path.join(output_dir, "*_metadata.json"))
+    if not json_files:
+        raise HTTPException(status_code=404, detail="Metadata not found")
+
+    with open(json_files[0], 'r', encoding='utf-8') as f:
+        data = json.load(f)
+
+    clips = data.get('shorts', [])
+    if req.clip_index >= len(clips):
+        raise HTTPException(status_code=404, detail="Clip not found")
+    clip_data = clips[req.clip_index]
+
+    layer_entry = await _resolve_clip_layer_entry(
+        req.job_id, output_dir, req.clip_index, clip_data,
+    )
+
+    candidate_entry = dict(layer_entry)
+    if req.layer in ("subtitle", "all"):
+        candidate_entry["subtitle"] = None
+    if req.layer in ("hook", "all"):
+        candidate_entry["hook"] = None
+    if req.layer == "all":
+        original = os.path.basename(str(clip_data.get("output_filename") or ""))
+        if original and os.path.exists(os.path.join(output_dir, original)):
+            candidate_entry["clean_source"] = original
+            # The original clip carries the source audio again, so a later
+            # subtitle run must use the job transcript, not re-transcribe.
+            candidate_entry.pop("transcript_source", None)
+
+    if candidate_entry == layer_entry:
+        raise HTTPException(status_code=400, detail="This clip has no such layer to remove.")
+
+    try:
+        if candidate_entry.get("subtitle") or candidate_entry.get("hook"):
+            generation_id = uuid.uuid4().hex[:12]
+            output_filename = _layered_filename(candidate_entry, generation_id)
+            output_path = os.path.join(output_dir, output_filename)
+            loop = asyncio.get_event_loop()
+            await loop.run_in_executor(
+                None, _render_stored_layers, output_dir, candidate_entry, output_path,
+            )
+        else:
+            # Nothing left to compose — the clean source *is* the result.
+            output_filename = os.path.basename(
+                _clean_source_path(output_dir, candidate_entry)
+            )
+        candidate_entry["current_render"] = output_filename
+    except HTTPException:
+        raise
+    except Exception as e:
+        print(f"❌ Remove layer error: {e}")
+        raise HTTPException(status_code=500, detail="Removing the layer failed. Check the server logs for details.")
+
+    new_video_url = f"/videos/{req.job_id}/{output_filename}"
+    await _commit_clip_layer_state(
+        req.job_id,
+        output_dir,
+        req.clip_index,
+        candidate_entry,
+        new_video_url,
+        metadata_path=json_files[0],
+    )
+
+    return {
+        "success": True,
+        "new_video_url": new_video_url,
+        "layers": _clip_layer_summary(candidate_entry),
     }
 
 

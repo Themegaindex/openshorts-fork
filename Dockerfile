@@ -29,8 +29,19 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
     libsm6 \
     libxext6 \
     libxrender1 \
+    fontconfig \
+    fonts-dejavu-core \
+    fonts-dejavu-extra \
+    fonts-liberation2 \
     nodejs \
     && rm -rf /var/lib/apt/lists/*
+
+# The subtitle UI offers Arial Black, Impact, Verdana and Helvetica, none of
+# which can ship here. Without explicit rules fontconfig collapsed all of them
+# onto one default sans, so the burned-in captions never matched the browser
+# preview and most font choices had no visible effect at all.
+COPY docker/fonts.conf /etc/fonts/conf.d/99-openshorts-aliases.conf
+RUN fc-cache -f
 
 # Copy virtual env from builder
 COPY --from=builder /opt/venv /opt/venv
