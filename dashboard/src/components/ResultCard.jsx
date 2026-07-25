@@ -1,6 +1,7 @@
 import React, { useState, useEffect } from 'react';
 import { Download, Share2, Instagram, Youtube, Video, CheckCircle, AlertCircle, X, Loader2, Copy, Wand2, Type, Calendar, Clock, Languages } from 'lucide-react';
 import { getApiUrl } from '../config';
+import { readApiError } from '../apiError';
 import SubtitleModal from './SubtitleModal';
 import HookModal from './HookModal';
 import TranslateModal from './TranslateModal';
@@ -67,15 +68,7 @@ export default function ResultCard({ clip, index, jobId, uploadPostKey, uploadUs
                 })
             });
 
-            if (!res.ok) {
-                const errText = await res.text();
-                try {
-                    const jsonErr = JSON.parse(errText);
-                    throw new Error(jsonErr.detail || errText);
-                } catch {
-                    throw new Error(errText);
-                }
-            }
+            if (!res.ok) throw new Error(await readApiError(res));
 
             const data = await res.json();
             if (data.new_video_url) {
@@ -114,6 +107,7 @@ export default function ResultCard({ clip, index, jobId, uploadPostKey, uploadUs
                     bg_color: options.bgColor,
                     bg_opacity: options.bgOpacity,
                     style: options.style,
+                    preset: options.preset,
                     highlight_color: options.highlightColor,
                     effect: options.effect,
                     base_opacity: options.baseOpacity,
@@ -122,10 +116,7 @@ export default function ResultCard({ clip, index, jobId, uploadPostKey, uploadUs
                 })
             });
 
-            if (!res.ok) {
-                const errText = await res.text();
-                throw new Error(errText);
-            }
+            if (!res.ok) throw new Error(await readApiError(res));
 
             const data = await res.json();
             if (data.new_video_url) {
@@ -167,10 +158,7 @@ export default function ResultCard({ clip, index, jobId, uploadPostKey, uploadUs
                 })
             });
 
-            if (!res.ok) {
-                const errText = await res.text();
-                throw new Error(errText);
-            }
+            if (!res.ok) throw new Error(await readApiError(res));
 
             const data = await res.json();
             if (data.new_video_url) {
@@ -223,15 +211,9 @@ export default function ResultCard({ clip, index, jobId, uploadPostKey, uploadUs
             console.log('[Translate] Response status:', res.status);
 
             if (!res.ok) {
-                const errText = await res.text();
-                console.error('[Translate] Error response:', errText);
-                try {
-                    const jsonErr = JSON.parse(errText);
-                    throw new Error(jsonErr.detail || errText);
-                } catch (e) {
-                    if (e.message !== errText) throw e;
-                    throw new Error(errText);
-                }
+                const message = await readApiError(res);
+                console.error('[Translate] Error response:', message);
+                throw new Error(message);
             }
 
             const data = await res.json();
@@ -298,15 +280,7 @@ export default function ResultCard({ clip, index, jobId, uploadPostKey, uploadUs
                 body: JSON.stringify(payload)
             });
 
-            if (!res.ok) {
-                const errText = await res.text();
-                try {
-                    const jsonErr = JSON.parse(errText);
-                    throw new Error(jsonErr.detail || errText);
-                } catch {
-                    throw new Error(errText);
-                }
-            }
+            if (!res.ok) throw new Error(await readApiError(res));
 
             setPostResult({ success: true, msg: isScheduling ? "Scheduled successfully!" : "Posted successfully!" });
             setTimeout(() => {

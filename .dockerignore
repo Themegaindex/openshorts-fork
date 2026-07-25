@@ -1,3 +1,16 @@
+# Secrets. The Dockerfile does "COPY . ." — without these the .env and the
+# exported YouTube cookies get baked into an image layer and travel with it.
+.env
+.env.*
+!.env.example
+cookies.txt
+*_cookies.txt
+
+# Runtime data. Recreated by the Dockerfile; copying it in would bloat the
+# build context with every clip ever rendered.
+output/
+uploads/
+
 # Git
 .git
 .gitignore

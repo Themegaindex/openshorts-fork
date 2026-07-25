@@ -2136,6 +2136,7 @@ class SubtitleRequest(BaseModel):
     bg_color: str = Field(default="#000000", pattern=r"^#[0-9A-Fa-f]{6}$")
     bg_opacity: float = Field(default=0.0, ge=0.0, le=1.0)
     style: Literal["classic", "karaoke"] = "classic"
+    preset: Literal["custom", "neon_sweep", "rainbow_word"] = "custom"
     highlight_color: str = Field(default="#FFD700", pattern=r"^#[0-9A-Fa-f]{6}$")
     effect: Literal["none", "glow", "pop", "box", "bounce"] = "none"
     base_opacity: float = Field(default=1.0, ge=0.05, le=1.0)
@@ -2188,7 +2189,9 @@ async def _add_subtitles_locked(req: SubtitleRequest):
         
     # Define outputs
     generation_id = uuid.uuid4().hex[:12]
-    is_karaoke = req.style == "karaoke"
+    # Signature presets are ASS renderers by definition. Keeping this defensive
+    # guard makes direct API clients safe even if they leave style at "classic".
+    is_karaoke = req.style == "karaoke" or req.preset != "custom"
     srt_filename = f"subs_{req.clip_index}_{generation_id}.{'ass' if is_karaoke else 'srt'}"
     srt_path = os.path.join(output_dir, srt_filename)
 
@@ -2199,6 +2202,7 @@ async def _add_subtitles_locked(req: SubtitleRequest):
         border_width=req.border_width, highlight_color=req.highlight_color,
         bg_color=req.bg_color, bg_opacity=req.bg_opacity,
         effect=req.effect, base_opacity=req.base_opacity, uppercase=req.uppercase,
+        preset=req.preset,
     )
 
     try:
@@ -2239,6 +2243,7 @@ async def _add_subtitles_locked(req: SubtitleRequest):
             "burn_opts": burn_opts,
             "style": req.style,
             "effect": req.effect,
+            "preset": req.preset,
         }
         output_filename = _layered_filename(candidate_entry, generation_id)
         output_path = os.path.join(output_dir, output_filename)
