@@ -221,6 +221,31 @@ def test_job_event_persists_phase_timing_fields(monkeypatch, tmp_path):
     assert job["phase_durations_seconds"]["transcribe"] == 3900.5
 
 
+def test_recent_keepalive_does_not_mask_expired_blocking_operation():
+    reason = app._job_stall_reason({
+        "last_heartbeat_at": 999.0,
+        "operation_name": "yt-dlp:FFmpegMerger",
+        "operation_deadline_at": 990.0,
+    }, now=1000.0)
+
+    assert reason == "Operation 'yt-dlp:FFmpegMerger' exceeded its activity deadline."
+    assert app._job_stall_reason({"last_heartbeat_at": 999.0}, now=1000.0) is None
+
+
+def test_status_payload_exposes_explicit_auto_resume_pending(monkeypatch):
+    monkeypatch.setattr(app, "_now_ts", lambda: 1000.0)
+    payload = app._build_status_payload({
+        "job_id": "pending-resume",
+        "status": "stalled",
+        "auto_resume_count": 2,
+        "max_auto_resumes": 2,
+        "auto_resume_pending": False,
+        "raw_logs": [],
+    })
+
+    assert payload["auto_resume_pending"] is False
+
+
 def test_run_job_validates_result_before_completed(monkeypatch, tmp_path):
     job_id = "job-order"
     execution_id = "execution-1"
@@ -318,6 +343,8 @@ def test_resume_stops_old_process_and_uses_automatic_phase(monkeypatch, tmp_path
 
     async def run_resume():
         monkeypatch.setattr(app, "job_queue", asyncio.Queue())
+        monkeypatch.setattr(app, "job_resume_locks", {})
+        monkeypatch.setattr(app, "_wait_for_job_processes_stopped", lambda *_args, **_kwargs: asyncio.sleep(0, result=True))
         request = SimpleNamespace(headers={"X-Gemini-Key": "test-key"})
         return await app.resume_job(job_id, request, None)
 
@@ -330,6 +357,105 @@ def test_resume_stops_old_process_and_uses_automatic_phase(monkeypatch, tmp_path
     assert job["actual_duration_seconds"] is None
     assert job["eta_state"] == "calculating"
     assert job["phase_durations_seconds"] == {}
+
+
+def test_manual_and_auto_resume_can_enqueue_only_once(monkeypatch, tmp_path):
+    job_id = "resume-race"
+    token = "stall-generation-1"
+    job = {
+        "job_id": job_id,
+        "status": "stalled",
+        "is_resumable": True,
+        "output_dir": str(tmp_path),
+        "progress_percent": 50,
+        "auto_resume_count": 1,
+        "auto_resume_pending": True,
+        "auto_resume_token": token,
+        "raw_logs": [],
+        "important_logs": [],
+    }
+    monkeypatch.setattr(app, "jobs", {job_id: job})
+    monkeypatch.setattr(app, "job_resume_locks", {})
+    monkeypatch.setattr(app, "_terminate_job_processes", lambda _job_id: None)
+
+    async def processes_stopped(*_args, **_kwargs):
+        await asyncio.sleep(0)
+        return True
+
+    monkeypatch.setattr(app, "_wait_for_job_processes_stopped", processes_stopped)
+
+    async def race():
+        monkeypatch.setattr(app, "job_queue", asyncio.Queue())
+        results = await asyncio.gather(
+            app._resume_job_internal(job_id, auto_token=token, reason="auto"),
+            app._resume_job_internal(job_id, api_key="key", manual=True, reason="manual"),
+            return_exceptions=True,
+        )
+        return results, app.job_queue.qsize()
+
+    results, queue_size = asyncio.run(race())
+
+    assert queue_size == 1
+    assert sum(isinstance(result, dict) and result.get("status") == "queued" for result in results) == 1
+    assert job["status"] == "queued"
+    assert job["auto_resume_pending"] is False
+
+
+def test_resume_aborts_when_previous_worker_is_not_reaped(monkeypatch, tmp_path):
+    job_id = "unsafe-resume"
+    job = {
+        "job_id": job_id,
+        "status": "stalled",
+        "is_resumable": True,
+        "output_dir": str(tmp_path),
+        "raw_logs": [],
+        "important_logs": [],
+    }
+    monkeypatch.setattr(app, "jobs", {job_id: job})
+    monkeypatch.setattr(app, "job_resume_locks", {})
+    monkeypatch.setattr(app, "_terminate_job_processes", lambda _job_id: None)
+
+    async def still_running(*_args, **_kwargs):
+        return False
+
+    monkeypatch.setattr(app, "_wait_for_job_processes_stopped", still_running)
+
+    async def attempt_resume():
+        monkeypatch.setattr(app, "job_queue", asyncio.Queue())
+        with pytest.raises(app.HTTPException) as exc:
+            await app._resume_job_internal(job_id, api_key="key", manual=True)
+        return exc.value.status_code, app.job_queue.qsize()
+
+    status_code, queue_size = asyncio.run(attempt_resume())
+    assert status_code == 503
+    assert queue_size == 0
+    assert job["status"] == "stalled"
+
+
+def test_stale_auto_resume_token_cannot_resume_later_stall(monkeypatch, tmp_path):
+    job_id = "stale-auto-token"
+    job = {
+        "job_id": job_id,
+        "status": "stalled",
+        "is_resumable": True,
+        "output_dir": str(tmp_path),
+        "auto_resume_pending": True,
+        "auto_resume_token": "new-generation",
+        "raw_logs": [],
+        "important_logs": [],
+    }
+    monkeypatch.setattr(app, "jobs", {job_id: job})
+    monkeypatch.setattr(app, "job_resume_locks", {})
+
+    async def stale_attempt():
+        monkeypatch.setattr(app, "job_queue", asyncio.Queue())
+        result = await app._resume_job_internal(job_id, auto_token="old-generation")
+        return result, app.job_queue.qsize()
+
+    result, queue_size = asyncio.run(stale_attempt())
+    assert result["status"] == "skipped"
+    assert queue_size == 0
+    assert job["status"] == "stalled"
 
 
 def test_auxiliary_jobs_recover_after_restart(monkeypatch, tmp_path):

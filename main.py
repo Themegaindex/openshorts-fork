@@ -7,6 +7,8 @@ import glob
 import re
 import sys
 import math
+import threading
+from contextlib import contextmanager
 from scenedetect import SceneManager
 from scenedetect.detectors import ContentDetector
 # PySceneDetect 0.7 removed VideoManager; 0.6+ provides open_video. Support
@@ -116,15 +118,123 @@ PHASE_RANGES = {
     "completed": (100.0, 100.0),
 }
 
-# ETA is measured from the running job only. Cross-job history mixed full
-# renders with short-clip jobs and produced misleading multi-hour totals.
 PHASE_ETA_ORDER = ["download", "transcribe", "analyze", "render", "finalize"]
-LIVE_ETA_THRESHOLDS = {
-    "transcribe": (120.0, 10.0),
-    "analyze": (5.0, 5.0),
-    "render": (10.0, 10.0),
-    "finalize": (2.0, 5.0),
+
+# Cross-job history was dropped once because it stored transcribe as a ratio and
+# analyze as absolute seconds in the same list, so a full render and a short-clip
+# job produced incomparable numbers. Pinning one normalising unit per phase makes
+# that history meaningful again: every phase is measured in the quantity it
+# actually scales with.
+PHASE_COST_UNITS = {
+    "download": "per_source_second",
+    "transcribe": "per_source_second",
+    "analyze": "per_source_second_after_overhead",
+    "render": "per_output_second",
+    "finalize": "absolute",
 }
+# Seeds until the job has measured its own numbers (see .job_stats.json).
+PHASE_COST_PRIORS = {
+    "download": 0.03,
+    "transcribe": 0.50,
+    "analyze": 0.02,
+    "render": 1.20,
+    "finalize": 5.0,
+}
+# Fixed overhead every phase pays regardless of length (model load, API round
+# trips, container mux), so a 30s video does not get a 1-second estimate.
+PHASE_COST_FLOOR = {
+    "download": 5.0,
+    "transcribe": 15.0,
+    "analyze": 30.0,
+    "render": 10.0,
+    "finalize": 2.0,
+}
+PHASE_FIXED_OVERHEAD = {
+    "analyze": 30.0,
+}
+# The clip count is unknown until the analysis finishes; assume a typical result
+# so the total ETA does not start out far too low.
+ASSUMED_OUTPUT_SECONDS = 8 * 40.0
+JOB_STATS_SAMPLE_LIMIT = 20
+JOB_STATS_LOCK_TIMEOUT_SECONDS = 10.0
+BLOCKING_OPERATION_STALL_SECONDS = int(os.environ.get("JOB_BLOCKING_STALL_SECONDS", "1800"))
+YTDLP_PROBE_STALL_SECONDS = int(os.environ.get("JOB_YTDLP_PROBE_STALL_SECONDS", "600"))
+MERGE_SECONDS_PER_SOURCE_SECOND = float(os.environ.get("JOB_MERGE_SECONDS_PER_SOURCE_SECOND", "0.015"))
+MERGE_MIN_SECONDS = float(os.environ.get("JOB_MERGE_MIN_SECONDS", "30"))
+MERGE_MAX_SECONDS = float(os.environ.get("JOB_MERGE_MAX_SECONDS", "900"))
+MERGE_MIN_STALL_SECONDS = int(os.environ.get("JOB_MERGE_MIN_STALL_SECONDS", "240"))
+MERGE_STALL_MULTIPLIER = float(os.environ.get("JOB_MERGE_STALL_MULTIPLIER", "4"))
+JOB_STATS_PATH = os.environ.get("JOB_STATS_PATH") or os.path.join(
+    os.path.dirname(os.path.abspath(__file__)), "output", ".job_stats.json"
+)
+
+
+def _median(values):
+    ordered = sorted(values)
+    count = len(ordered)
+    if not count:
+        return None
+    mid = count // 2
+    return ordered[mid] if count % 2 else (ordered[mid - 1] + ordered[mid]) / 2.0
+
+
+def _load_job_stats() -> dict:
+    """Measured phase costs of previous jobs, normalised per PHASE_COST_UNITS."""
+    try:
+        with open(JOB_STATS_PATH, "r", encoding="utf-8") as f:
+            data = json.load(f)
+        return data if isinstance(data, dict) else {}
+    except Exception:
+        return {}
+
+
+@contextmanager
+def _job_stats_file_lock(timeout_seconds=JOB_STATS_LOCK_TIMEOUT_SECONDS):
+    """Cross-process lock for the shared learned-ETA history.
+
+    Workers are separate Python processes, so a threading lock cannot protect
+    their common JSON file. Exclusive lock-file creation works on Windows and
+    POSIX; an abandoned lock is reclaimed after a generous stale interval.
+    """
+    lock_path = f"{JOB_STATS_PATH}.lock"
+    os.makedirs(os.path.dirname(JOB_STATS_PATH) or ".", exist_ok=True)
+    deadline = time.monotonic() + max(0.1, float(timeout_seconds))
+    stale_after = max(30.0, float(timeout_seconds) * 3.0)
+    descriptor = None
+    while descriptor is None:
+        try:
+            descriptor = os.open(lock_path, os.O_CREAT | os.O_EXCL | os.O_WRONLY)
+            os.write(descriptor, f"{os.getpid()} {time.time()}".encode("ascii"))
+        except FileExistsError:
+            try:
+                if time.time() - os.path.getmtime(lock_path) > stale_after:
+                    os.remove(lock_path)
+                    continue
+            except FileNotFoundError:
+                continue
+            if time.monotonic() >= deadline:
+                raise TimeoutError("Timed out waiting for the job-stats lock")
+            time.sleep(0.05)
+    try:
+        yield
+    finally:
+        try:
+            os.close(descriptor)
+        finally:
+            try:
+                os.remove(lock_path)
+            except FileNotFoundError:
+                pass
+
+
+def _estimated_merge_seconds(video_duration) -> float:
+    """Conservative stream-copy estimate used while yt-dlp is muxing."""
+    try:
+        duration = max(0.0, float(video_duration or 0.0))
+    except (TypeError, ValueError):
+        duration = 0.0
+    estimate = MERGE_MIN_SECONDS + duration * MERGE_SECONDS_PER_SOURCE_SECOND
+    return max(MERGE_MIN_SECONDS, min(MERGE_MAX_SECONDS, estimate))
 
 
 class JobReporter:
@@ -138,7 +248,15 @@ class JobReporter:
         self.progress_percent = 0.0
         self.last_heartbeat_at = 0.0
         self.video_duration = None
+        self.output_seconds = None
         self.phase_durations = {}
+        self.job_stats = _load_job_stats()
+        self.last_work_activity_at = self.started_at
+        self.operation_name = None
+        self.operation_deadline_at = None
+        self.operation_expected_end_at = None
+        self.operation_timeout_seconds = None
+        self._state_lock = threading.RLock()
 
     def _overall_progress(self, phase: Optional[str] = None, phase_progress_percent: Optional[float] = None) -> float:
         current_phase = phase or self.phase
@@ -149,26 +267,201 @@ class JobReporter:
             return max(0.0, min(100.0, end))
         return round(start + ((end - start) * (phase_percent / 100.0)), 2)
 
-    def _estimate_live_phase_seconds(self) -> Optional[int]:
-        """Estimate only the running phase from this job's measured progress.
+    def set_output_seconds(self, seconds):
+        """Total seconds of rendered output — the unit the render phase scales with."""
+        try:
+            value = float(seconds)
+        except (TypeError, ValueError):
+            return
+        if value > 0:
+            self.output_seconds = value
 
-        Cross-job totals mixed full-video renders with short-clip renders and
-        could be wrong by hours.  A live phase ETA is intentionally withheld
-        until enough of the current job has been measured.
+    def _phase_cost_prior(self, phase: str) -> Optional[float]:
+        """Expected total seconds for a phase, from learned medians when available."""
+        unit = PHASE_COST_UNITS.get(phase)
+        if unit is None:
+            return None
+        samples = [
+            value for value in (self.job_stats.get(phase) or {}).get(unit) or []
+            if isinstance(value, (int, float)) and value >= 0
+        ]
+        rate = _median(samples)
+        if rate is None:
+            rate = PHASE_COST_PRIORS[phase]
+        floor = PHASE_COST_FLOOR.get(phase, 0.0)
+        if unit == "absolute":
+            return max(floor, float(rate))
+        if unit in {"per_source_second", "per_source_second_after_overhead"}:
+            if not self.video_duration:
+                return None
+            if unit == "per_source_second_after_overhead":
+                fixed = PHASE_FIXED_OVERHEAD.get(phase, floor)
+                return max(floor, float(fixed) + float(rate) * self.video_duration)
+            return max(floor, float(rate) * self.video_duration)
+        return max(floor, float(rate) * (self.output_seconds or ASSUMED_OUTPUT_SECONDS))
+
+    def _estimate_phase_remaining(self) -> Optional[float]:
+        """Remaining seconds of the running phase.
+
+        Blends the prior with this job's measured pace, weighted by how far the
+        phase has come. Early on the prior carries the estimate, later the
+        measurement does. A number is therefore available immediately instead of
+        showing "calculating" for the first two minutes of every phase, and it
+        does not jump when the measurement takes over.
         """
         if self.phase not in PHASE_ETA_ORDER:
             return None
+        percent = max(0.0, min(100.0, self.phase_progress_percent))
         now = time.time()
         in_phase = max(0.0, now - self.phase_started_at)
-        phase_percent = max(0.0, min(100.0, self.phase_progress_percent))
-        min_elapsed, min_percent = LIVE_ETA_THRESHOLDS.get(self.phase, (5.0, 10.0))
-        if in_phase < min_elapsed or phase_percent < min_percent:
+
+        with self._state_lock:
+            operation_expected_end_at = self.operation_expected_end_at
+        if operation_expected_end_at is not None:
+            return max(0.0, operation_expected_end_at - now)
+
+        measured = None
+        if percent >= 1.0 and in_phase >= 3.0:
+            measured = max(0.0, (in_phase * 100.0 / percent) - in_phase)
+
+        prior_total = self._phase_cost_prior(self.phase)
+        prior_remaining = None
+        if prior_total is not None:
+            prior_remaining = max(0.0, prior_total * (1.0 - percent / 100.0))
+
+        if measured is None:
+            return prior_remaining
+        if prior_remaining is None:
+            return measured
+        weight = percent / 100.0
+        return (weight * measured) + ((1.0 - weight) * prior_remaining)
+
+    def _estimate_total_remaining(self, phase_remaining: Optional[float]) -> Optional[float]:
+        """Remaining seconds of the whole job: current phase plus every phase left."""
+        if phase_remaining is None or self.phase not in PHASE_ETA_ORDER:
             return None
-        return max(0, int((in_phase * 100.0 / phase_percent) - in_phase))
+        total = float(phase_remaining)
+        for phase in PHASE_ETA_ORDER[PHASE_ETA_ORDER.index(self.phase) + 1:]:
+            prior = self._phase_cost_prior(phase)
+            if prior is None:
+                return None
+            total += prior
+        return total
+
+    def _record_job_stats(self):
+        """Persist this job's measured phase costs for future estimates."""
+        if not self.phase_durations:
+            return
+        try:
+            with _job_stats_file_lock():
+                # Re-read while holding the inter-process lock so concurrent
+                # completions cannot lose one another's samples.
+                stats = _load_job_stats()
+                for phase, seconds in self.phase_durations.items():
+                    unit = PHASE_COST_UNITS.get(phase)
+                    if unit is None or not seconds or seconds < 1.0:
+                        continue
+                    if unit in {"per_source_second", "per_source_second_after_overhead"}:
+                        if not self.video_duration:
+                            continue
+                        measured_seconds = float(seconds)
+                        if unit == "per_source_second_after_overhead":
+                            measured_seconds = max(
+                                0.0,
+                                measured_seconds - PHASE_FIXED_OVERHEAD.get(phase, 0.0),
+                            )
+                        value = measured_seconds / self.video_duration
+                    elif unit == "per_output_second":
+                        if not self.output_seconds:
+                            continue
+                        value = seconds / self.output_seconds
+                    else:
+                        value = seconds
+                    bucket = stats.setdefault(phase, {}).setdefault(unit, [])
+                    bucket.append(round(value, 4))
+                    del bucket[:-JOB_STATS_SAMPLE_LIMIT]
+                tmp_path = (
+                    f"{JOB_STATS_PATH}.{os.getpid()}.{threading.get_ident()}."
+                    f"{time.time_ns()}.tmp"
+                )
+                try:
+                    with open(tmp_path, "w", encoding="utf-8") as f:
+                        json.dump(stats, f)
+                    os.replace(tmp_path, JOB_STATS_PATH)
+                finally:
+                    try:
+                        os.remove(tmp_path)
+                    except FileNotFoundError:
+                        pass
+                self.job_stats = stats
+        except Exception as e:
+            print(f"⚠️ Could not persist phase stats: {e!r}", file=sys.stderr)
+
+    def _mark_work_activity(self, now=None):
+        now = float(now or time.time())
+        with self._state_lock:
+            self.last_work_activity_at = now
+            if self.operation_timeout_seconds:
+                self.operation_deadline_at = now + self.operation_timeout_seconds
+
+    def begin_operation(self, name: str, *, timeout_seconds: float,
+                        expected_seconds: Optional[float] = None,
+                        message: Optional[str] = None, **extra):
+        """Declare a blocking operation so keepalives cannot hide its freeze."""
+        now = time.time()
+        timeout_seconds = max(1.0, float(timeout_seconds))
+        with self._state_lock:
+            self.operation_name = str(name)
+            self.operation_timeout_seconds = timeout_seconds
+            self.operation_deadline_at = now + timeout_seconds
+            self.operation_expected_end_at = (
+                now + max(0.0, float(expected_seconds))
+                if expected_seconds is not None else None
+            )
+            self.last_work_activity_at = now
+        self.heartbeat(message or f"Starting {name}.", force=True, **extra)
+
+    def finish_operation(self, *, message: Optional[str] = None, **extra):
+        with self._state_lock:
+            previous_name = self.operation_name
+            self.operation_name = None
+            self.operation_timeout_seconds = None
+            self.operation_deadline_at = None
+            self.operation_expected_end_at = None
+            self.last_work_activity_at = time.time()
+        self.heartbeat(
+            message or (f"Finished {previous_name}." if previous_name else "Blocking operation finished."),
+            force=True,
+            **extra,
+        )
+
+    @contextmanager
+    def operation(self, name: str, *, timeout_seconds: float,
+                  expected_seconds: Optional[float] = None,
+                  message: Optional[str] = None, **extra):
+        self.begin_operation(
+            name,
+            timeout_seconds=timeout_seconds,
+            expected_seconds=expected_seconds,
+            message=message,
+            **extra,
+        )
+        try:
+            yield
+        finally:
+            self.finish_operation(**extra)
 
     def emit(self, event_type: str, message: Optional[str] = None, **extra):
+        if event_type in {"phase", "progress", "resume", "artifact"}:
+            self._mark_work_activity()
         if extra.get("video_duration_seconds"):
             self.video_duration = float(extra["video_duration_seconds"])
+        with self._state_lock:
+            operation_payload = {
+                "work_activity_at": self.last_work_activity_at,
+                "operation_name": self.operation_name,
+                "operation_deadline_at": self.operation_deadline_at,
+            }
         payload = {
             "type": event_type,
             "timestamp": time.time(),
@@ -177,20 +470,38 @@ class JobReporter:
             "phase_label": extra.pop("phase_label", self.phase_label),
             "phase_progress_percent": extra.pop("phase_progress_percent", self.phase_progress_percent),
             "progress_percent": extra.pop("progress_percent", self.progress_percent),
+            **operation_payload,
         }
         phase_eta_seconds = extra.pop("phase_eta_seconds", None)
         # Backward-compatible input for callers that supplied yt-dlp's live
         # ETA before phase_eta_seconds existed.
         if phase_eta_seconds is None:
             phase_eta_seconds = extra.pop("eta_seconds", None)
+        else:
+            extra.pop("eta_seconds", None)
+        caller_eta_is_estimated = bool(extra.pop("eta_is_estimated", False))
+        # A caller-supplied ETA is normally measured (for example yt-dlp's
+        # byte-rate ETA), unless it explicitly includes a prior such as muxing.
+        measured = phase_eta_seconds is not None and not caller_eta_is_estimated
         if event_type == "summary" and extra.get("status") == "completed":
             phase_eta_seconds = 0
+            total_eta_seconds = 0
             eta_state = "done"
         else:
             if phase_eta_seconds is None:
-                phase_eta_seconds = self._estimate_live_phase_seconds()
-            eta_state = "live" if phase_eta_seconds is not None else "calculating"
+                estimate = self._estimate_phase_remaining()
+                phase_eta_seconds = None if estimate is None else max(0, int(round(estimate)))
+                # Past the halfway mark the blend is dominated by this job's own
+                # measurement, so the value stops being a guess.
+                measured = self.phase_progress_percent >= 50.0
+            total_estimate = self._estimate_total_remaining(phase_eta_seconds)
+            total_eta_seconds = None if total_estimate is None else max(0, int(round(total_estimate)))
+            if phase_eta_seconds is None:
+                eta_state = "calculating"
+            else:
+                eta_state = "live" if measured else "estimated"
         payload["phase_eta_seconds"] = phase_eta_seconds
+        payload["total_eta_seconds"] = total_eta_seconds
         payload["eta_state"] = eta_state
         # Keep the legacy field populated for older clients.  New clients use
         # phase_eta_seconds and its explicit phase-only label.
@@ -212,6 +523,11 @@ class JobReporter:
         self.phase = phase
         self.phase_label = label
         self.phase_started_at = time.time()
+        with self._state_lock:
+            self.operation_name = None
+            self.operation_timeout_seconds = None
+            self.operation_deadline_at = None
+            self.operation_expected_end_at = None
         self.phase_progress_percent = phase_progress_percent
         self.progress_percent = self._overall_progress(phase=phase, phase_progress_percent=phase_progress_percent)
         self.emit(
@@ -239,11 +555,15 @@ class JobReporter:
             **extra,
         )
 
-    def heartbeat(self, *, message: Optional[str] = None, force: bool = False, **extra):
+    def heartbeat(self, message: Optional[str] = None, *, force: bool = False, **extra):
+        # message stays positional-friendly on purpose: a keyword-only signature
+        # here silently broke the keepalive thread for months (TypeError eaten by
+        # a bare except), and every long blocking step was then flagged as stalled.
         now = time.time()
-        if not force and now - self.last_heartbeat_at < HEARTBEAT_INTERVAL_SECONDS:
-            return
-        self.last_heartbeat_at = now
+        with self._state_lock:
+            if not force and now - self.last_heartbeat_at < HEARTBEAT_INTERVAL_SECONDS:
+                return
+            self.last_heartbeat_at = now
         self.emit("heartbeat", message, **extra)
 
     def warning(self, message: str, **extra):
@@ -267,6 +587,7 @@ class JobReporter:
             # breakdown alongside its independently validated wall-clock end.
             if self.phase in PHASE_ETA_ORDER:
                 self.phase_durations[self.phase] = time.time() - self.phase_started_at
+            self._record_job_stats()
         phase = "completed" if status == "completed" else self.phase
         progress_percent = 100.0 if status == "completed" else self.progress_percent
         self.emit(
@@ -294,21 +615,27 @@ def set_job_reporter(reporter: JobReporter):
     JOB_REPORTER = reporter
 
 
-def _start_keepalive(interval_seconds=25):
+def _start_keepalive(interval_seconds=15):
     """Emit a heartbeat every few seconds regardless of pipeline progress.
 
-    Whisper/FFmpeg can crunch for minutes without emitting an event; without
-    this, the server's 90s stall detector flags perfectly healthy jobs as
-    stalled. With it, "stalled" means the process is truly frozen or asleep."""
+    Whisper/FFmpeg/yt-dlp's merge can crunch for minutes without emitting an
+    event; without this, the server's stall detector flags perfectly healthy
+    jobs as stalled. With it, "stalled" means the process is truly frozen or
+    asleep."""
     import threading
 
     def _beat():
+        reported_failure = False
         while True:
             time.sleep(interval_seconds)
             try:
                 JOB_REPORTER.heartbeat("Worker alive.")
-            except Exception:
-                pass
+            except Exception as e:
+                # Never swallow this silently again: a broken keepalive looks
+                # exactly like a frozen worker and gets the job killed.
+                if not reported_failure:
+                    reported_failure = True
+                    print(f"⚠️ Keepalive heartbeat failed: {e!r}", file=sys.stderr, flush=True)
 
     threading.Thread(target=_beat, daemon=True, name="keepalive").start()
 
@@ -1226,14 +1553,8 @@ def sanitize_filename(filename):
     return filename[:100]
 
 
-def download_youtube_video(url, output_dir="."):
-    """
-    Downloads a YouTube video using yt-dlp.
-    Returns the path to the downloaded video and the video title.
-    """
-    print(f"🔍 Debug: yt-dlp version: {yt_dlp.version.__version__}")
-    print("📥 Downloading video from YouTube...")
-    step_start_time = time.time()
+def _make_ytdlp_progress_hooks():
+    """Create per-download yt-dlp hooks with isolated throttling state."""
     progress_state = {"last_emit": 0.0, "last_bucket": -1}
 
     def download_progress_hook(data):
@@ -1251,13 +1572,72 @@ def download_youtube_video(url, output_dir="."):
             return
         progress_state["last_emit"] = now
         progress_state["last_bucket"] = bucket
+        yt_dlp_eta = data.get("eta")
+        phase_eta = None
+        if yt_dlp_eta is not None:
+            phase_eta = float(yt_dlp_eta) + _estimated_merge_seconds(JOB_REPORTER.video_duration)
         JOB_REPORTER.progress(
-            percent,
+            percent * 0.98,
             message=f"Downloading video... {percent:.1f}%",
             important=bucket % 2 == 0,
-            eta_seconds=data.get("eta"),
+            eta_seconds=phase_eta,
+            eta_is_estimated=phase_eta is not None,
             category="download",
         )
+
+    def download_postprocessor_hook(data):
+        # yt-dlp muxes the separate video/audio streams with FFmpeg after the
+        # download. This operation has its own ETA and freeze deadline because
+        # yt-dlp does not publish byte progress while FFmpegMerger is running.
+        name = data.get("postprocessor") or "post-processing"
+        status = data.get("status")
+        if status == "started":
+            label = "Merging video and audio..." if "Merger" in name else f"Post-processing ({name})..."
+            expected_seconds = _estimated_merge_seconds(JOB_REPORTER.video_duration)
+            timeout_seconds = max(
+                MERGE_MIN_STALL_SECONDS,
+                int(math.ceil(expected_seconds * MERGE_STALL_MULTIPLIER)),
+            )
+            JOB_REPORTER.begin_operation(
+                f"yt-dlp:{name}",
+                timeout_seconds=timeout_seconds,
+                expected_seconds=expected_seconds,
+                message=label,
+                category="download",
+            )
+            # 100% means the entire download phase is done. Keep one final
+            # percent for muxing and publish its own non-zero ETA.
+            JOB_REPORTER.progress(
+                99.0,
+                message=label,
+                important=True,
+                phase_eta_seconds=int(round(expected_seconds)),
+                eta_is_estimated=True,
+                category="download",
+            )
+        elif status == "finished":
+            JOB_REPORTER.finish_operation(
+                message=f"Post-processing ({name}) finished.",
+                category="download",
+            )
+        else:
+            JOB_REPORTER.heartbeat(f"Post-processing ({name}): {status}", category="download")
+
+    return download_progress_hook, download_postprocessor_hook
+
+
+def download_youtube_video(url, output_dir=".", resume=False):
+    """
+    Downloads a YouTube video using yt-dlp.
+    Returns the path to the downloaded video and the video title.
+
+    With resume=True already finished format files and .part fragments are kept
+    so a re-download after an interrupted job continues instead of starting over.
+    """
+    print(f"🔍 Debug: yt-dlp version: {yt_dlp.version.__version__}")
+    print("📥 Downloading video from YouTube...")
+    step_start_time = time.time()
+    download_progress_hook, download_postprocessor_hook = _make_ytdlp_progress_hooks()
 
     # Look for cookies in the project directory (multiple common filenames)
     _script_dir = os.path.dirname(os.path.abspath(__file__))
@@ -1337,6 +1717,7 @@ def download_youtube_video(url, output_dir="."):
             ),
         },
         'progress_hooks': [download_progress_hook],
+        'postprocessor_hooks': [download_postprocessor_hook],
     }
     if js_runtimes:
         _COMMON_YDL_OPTS['js_runtimes'] = js_runtimes
@@ -1357,8 +1738,14 @@ def download_youtube_video(url, output_dir="."):
     ]:
         try:
             print(f"🔄 Trying download mode: {attempt_name}...")
-            with yt_dlp.YoutubeDL(attempt_opts) as ydl:
-                probe = ydl.extract_info(url, download=False)
+            with JOB_REPORTER.operation(
+                f"yt-dlp metadata probe ({attempt_name})",
+                timeout_seconds=YTDLP_PROBE_STALL_SECONDS,
+                message=f"Reading YouTube metadata ({attempt_name}).",
+                category="download",
+            ):
+                with yt_dlp.YoutubeDL(attempt_opts) as ydl:
+                    probe = ydl.extract_info(url, download=False)
             # Check if we actually got video formats (not just images/storyboards)
             formats = probe.get('formats') or []
             video_formats = [
@@ -1422,25 +1809,51 @@ Technical Details: {str(last_error)}
             category="download",
         )
 
+    # Publish the duration from the probe: every ETA below the download scales
+    # with it, and waiting for the post-download probe would leave the whole
+    # download phase without a total estimate.
+    probed_duration = info.get('duration')
+    if probed_duration:
+        JOB_REPORTER.heartbeat(
+            "Video metadata loaded.",
+            force=True,
+            video_duration_seconds=round(float(probed_duration), 3),
+            category="download",
+        )
+
     video_title = info.get('title', 'youtube_video')
     sanitized_title = sanitize_filename(video_title)
     
     output_template = os.path.join(output_dir, f'{sanitized_title}.%(ext)s')
     expected_file = os.path.join(output_dir, f'{sanitized_title}.mp4')
     if os.path.exists(expected_file):
+        existing_streams = _probe_stream_types(expected_file) if resume else set()
+        if resume and existing_streams and {"video", "audio"}.issubset(existing_streams):
+            print("✅ Reusing the already complete merged source video.")
+            JOB_REPORTER.progress(100.0, message="Download already complete.", important=True, category="download")
+            return expected_file, sanitized_title
         os.remove(expected_file)
-        print("🗑️  Removed existing file to re-download video")
+        print("🗑️  Removed existing file before downloading video")
     
     ydl_opts = {
         **_COMMON_YDL_OPTS,
         'format': 'bestvideo[ext=mp4]+bestaudio[ext=m4a]/bestvideo[ext=mp4]+bestaudio/bestvideo+bestaudio/best[ext=mp4]/best',
         'outtmpl': output_template,
         'merge_output_format': 'mp4',
-        'overwrites': True,
+        # A resume must reuse the format files a killed run already finished.
+        # Overwriting them would re-download gigabytes just to redo the merge.
+        'overwrites': not resume,
+        'continuedl': True,
     }
     
-    with yt_dlp.YoutubeDL(ydl_opts) as ydl:
-        ydl.download([url])
+    with JOB_REPORTER.operation(
+        "yt-dlp download",
+        timeout_seconds=BLOCKING_OPERATION_STALL_SECONDS,
+        message="YouTube download worker started.",
+        category="download",
+    ):
+        with yt_dlp.YoutubeDL(ydl_opts) as ydl:
+            ydl.download([url])
     
     downloaded_file = os.path.join(output_dir, f'{sanitized_title}.mp4')
     
@@ -2352,7 +2765,7 @@ def _get_video_duration(video_path):
     return frame_count / fps
 
 
-def _find_source_video(resume_dir: str):
+def _find_source_video(resume_dir: str, *, require_audio: bool = False):
     """Locate the downloaded/uploaded source video in a job directory."""
     skip_prefixes = ("temp_", "subtitled_", "hook_", "hooked_", "edited_", "translated_")
     candidates = []
@@ -2364,9 +2777,85 @@ def _find_source_video(resume_dir: str):
             "_vertical.mp4", "_square.mp4", "_original.mp4",
         )):
             continue
+        # yt-dlp leaves per-format files (Title.f625.mp4) behind when it is
+        # killed before the merge. The video-only one is the largest file in the
+        # directory, so picking by size would resume on a silent video.
+        if re.search(r"\.f\d+\.mp4$", name):
+            continue
+        # FFmpegMergerPP writes to <title>.temp.mp4 and only renames it after a
+        # successful mux. Its presence therefore proves the merge was interrupted.
+        if name.lower().endswith(".temp.mp4"):
+            continue
+        streams = _probe_stream_types(path)
+        if streams is not None and "video" not in streams:
+            continue
+        if require_audio and (streams is None or "audio" not in streams):
+            continue
         candidates.append(path)
     # If several remain, the source is by far the largest one.
     return max(candidates, key=os.path.getsize) if candidates else None
+
+
+def _probe_stream_types(path: str):
+    """Stream types ffprobe finds in a file.
+
+    Returns None when ffprobe itself could not run — the caller must not treat
+    that as "file is broken", or a missing ffprobe would delete healthy videos.
+    An empty set means ffprobe ran and rejected the file.
+    """
+    try:
+        result = subprocess.run(
+            ["ffprobe", "-v", "error", "-show_entries", "stream=codec_type",
+             "-of", "csv=p=0", path],
+            capture_output=True, timeout=60,
+        )
+    except Exception:
+        return None
+    if result.returncode != 0:
+        return set()
+    return {
+        line.strip()
+        for line in (result.stdout or b"").decode("utf-8", "ignore").splitlines()
+        if line.strip()
+    }
+
+
+def _clean_partial_download(resume_dir: str):
+    """Drop half-merged mp4 files before a resume re-runs the download.
+
+    yt-dlp's merge writes the final Title.mp4 in place; a job killed mid-merge
+    leaves a truncated file that would either fail later or silently lose its
+    audio track. The per-format files and .part fragments are kept on purpose so
+    the resumed download only redoes the merge.
+    """
+    removed = []
+    for path in sorted(glob.glob(os.path.join(resume_dir, "*.mp4"))):
+        name = os.path.basename(path)
+        if re.search(r"\.f\d+\.mp4$", name) or re.search(r"_clip_\d+\.mp4$", name):
+            continue
+        if name.endswith(("_vertical.mp4", "_square.mp4", "_original.mp4")):
+            continue
+        if name.lower().endswith(".temp.mp4"):
+            try:
+                os.remove(path)
+                removed.append(name)
+            except OSError:
+                pass
+            continue
+        streams = _probe_stream_types(path)
+        if streams is None:
+            print(f"⚠️ Could not probe {name} — keeping it to be safe.")
+            continue
+        if "video" in streams and "audio" in streams:
+            continue
+        try:
+            os.remove(path)
+            removed.append(name)
+        except OSError:
+            pass
+    if removed:
+        print(f"🧹 Removed incomplete download artifacts: {', '.join(removed)}")
+    return removed
 
 
 def _load_render_config(output_dir: str) -> dict:
@@ -2391,7 +2880,6 @@ def _load_resume_context(resume_dir: str):
         # (e.g. frozen mid-transcription). If the source video survived,
         # resume from the transcription phase instead of failing — the
         # pipeline handles transcript=None by transcribing again.
-        source_video = _find_source_video(resume_dir)
         source_url = None
         state_file = os.path.join(resume_dir, "job_state.json")
         if os.path.exists(state_file):
@@ -2400,6 +2888,7 @@ def _load_resume_context(resume_dir: str):
                     source_url = json.load(f).get("source_url")
             except Exception:
                 pass
+        source_video = _find_source_video(resume_dir, require_audio=bool(source_url))
 
         if not source_video:
             # Job died mid-download (only a .part file left, or nothing at
@@ -2463,6 +2952,13 @@ def _load_resume_context(resume_dir: str):
         with open(metadata_file, "r", encoding="utf-8") as f:
             metadata = json.load(f)
 
+    input_video = analysis_input_payload.get("input_video")
+    source_url = analysis_input_payload.get("source_url")
+    if source_url and input_video and os.path.exists(input_video):
+        streams = _probe_stream_types(input_video)
+        if streams is None or not {"video", "audio"}.issubset(streams):
+            input_video = None
+
     return {
         "output_dir": resume_dir,
         "video_title": video_title,
@@ -2471,8 +2967,8 @@ def _load_resume_context(resume_dir: str):
         "metadata_file": metadata_file,
         "transcript_file": transcript_file,
         "words_file": words_file,
-        "input_video": analysis_input_payload.get("input_video"),
-        "source_url": analysis_input_payload.get("source_url"),
+        "input_video": input_video,
+        "source_url": source_url,
         "duration": float(analysis_input_payload.get("video_duration") or 0.0),
         "transcript": transcript,
         "analysis_result": analysis_result,
@@ -2547,7 +3043,8 @@ if __name__ == '__main__':
                 # instead of failing the resume. yt-dlp resumes .part files.
                 reporter.set_phase("download", "Downloading source video",
                                    message="Source video missing — re-downloading for resume...")
-                input_video, video_title = download_youtube_video(source_url, output_dir)
+                _clean_partial_download(output_dir)
+                input_video, video_title = download_youtube_video(source_url, output_dir, resume=True)
             reporter.emit("resume", "Resuming previous job from saved checkpoints.", important=True, resumable=True)
         else:
             output_format = normalize_output_format(args.output_format)
@@ -2600,22 +3097,35 @@ if __name__ == '__main__':
 
         if args.skip_analysis and not args.resume_dir:
             reporter.set_phase("render", "Rendering full video", message="Skipping AI analysis and rendering the full video.")
+            reporter.set_output_seconds(duration)
             output_file = args.output if args.output else _full_render_filename(
                 output_dir, video_title, output_format,
             )
-            success = _render_clip(
-                input_video,
-                output_file,
-                output_format=output_format,
-                layout_style=layout_style,
-                progress_callback=lambda percent, message: reporter.progress(percent, message=message, category="render"),
-            )
+            with reporter.operation(
+                "full-video render",
+                timeout_seconds=BLOCKING_OPERATION_STALL_SECONDS,
+                message="Full-video renderer started.",
+                category="render",
+            ):
+                success = _render_clip(
+                    input_video,
+                    output_file,
+                    output_format=output_format,
+                    layout_style=layout_style,
+                    progress_callback=lambda percent, message: reporter.progress(percent, message=message, category="render"),
+                )
             if not success:
                 raise RuntimeError("Full-video render failed.")
         else:
             if not transcript or args.resume_phase == "transcribe":
                 reporter.set_phase("transcribe", "Transcribing audio", message="Starting transcription...")
-                transcript = transcribe_video(input_video, duration)
+                with reporter.operation(
+                    "transcription",
+                    timeout_seconds=max(BLOCKING_OPERATION_STALL_SECONDS, int(duration * 2.0)),
+                    message="Transcription worker started.",
+                    category="transcribe",
+                ):
+                    transcript = transcribe_video(input_video, duration)
                 _save_json_file(transcript_file, transcript)
                 reporter.artifact("transcript", transcript_file)
                 words_payload = {"words": _extract_words_for_analysis(transcript)}
@@ -2634,12 +3144,18 @@ if __name__ == '__main__':
 
             if not analysis_result or args.resume_phase == "analyze":
                 reporter.set_phase("analyze", "Analyzing with Gemini", message="Starting Gemini analysis...")
-                analysis_result = get_viral_clips(
-                    transcript,
-                    duration,
-                    output_dir=output_dir,
-                    video_title=video_title,
-                )
+                with reporter.operation(
+                    "Gemini analysis",
+                    timeout_seconds=BLOCKING_OPERATION_STALL_SECONDS,
+                    message="Gemini analysis worker started.",
+                    category="analyze",
+                ):
+                    analysis_result = get_viral_clips(
+                        transcript,
+                        duration,
+                        output_dir=output_dir,
+                        video_title=video_title,
+                    )
                 _save_json_file(analysis_result_file, analysis_result)
                 reporter.artifact("analysis_result", analysis_result_file)
 
@@ -2648,14 +3164,21 @@ if __name__ == '__main__':
             reporter.set_phase("render", "Rendering clips", message="Starting vertical render...")
             if not clips_data or 'shorts' not in clips_data:
                 print("❌ Failed to identify clips. Converting whole video as fallback.")
+                reporter.set_output_seconds(duration)
                 output_file = _full_render_filename(output_dir, video_title, output_format)
-                success = _render_clip(
-                    input_video,
-                    output_file,
-                    output_format=output_format,
-                    layout_style=layout_style,
-                    progress_callback=lambda percent, message: reporter.progress(percent, message=message, category="render"),
-                )
+                with reporter.operation(
+                    "fallback render",
+                    timeout_seconds=BLOCKING_OPERATION_STALL_SECONDS,
+                    message="Fallback renderer started.",
+                    category="render",
+                ):
+                    success = _render_clip(
+                        input_video,
+                        output_file,
+                        output_format=output_format,
+                        layout_style=layout_style,
+                        progress_callback=lambda percent, message: reporter.progress(percent, message=message, category="render"),
+                    )
                 if not success:
                     raise RuntimeError("Full-video fallback rendering failed.")
 
@@ -2690,6 +3213,8 @@ if __name__ == '__main__':
                 ]
                 total_render_weight = sum(clip_render_weights)
                 completed_render_weight = 0.0
+                # The render phase scales with output length, not source length.
+                reporter.set_output_seconds(total_render_weight)
                 for i, clip in enumerate(clips_data['shorts']):
                     start = clip['start']
                     end = clip['end']
@@ -2716,9 +3241,24 @@ if __name__ == '__main__':
                         clip_temp_path
                     ]
                     try:
-                        subprocess.run(cut_command, stdout=subprocess.DEVNULL, stderr=subprocess.PIPE, check=True, timeout=1800)
+                        with reporter.operation(
+                            f"FFmpeg clip cut {i + 1}/{total_clips}",
+                            timeout_seconds=BLOCKING_OPERATION_STALL_SECONDS,
+                            message=f"Cutting clip {i + 1}/{total_clips}.",
+                            category="render",
+                        ):
+                            subprocess.run(
+                                cut_command,
+                                stdout=subprocess.DEVNULL,
+                                stderr=subprocess.PIPE,
+                                check=True,
+                                timeout=BLOCKING_OPERATION_STALL_SECONDS,
+                            )
                     except subprocess.TimeoutExpired:
-                        raise RuntimeError(f"FFmpeg clip cut timed out after 1800s for {clip_filename}")
+                        raise RuntimeError(
+                            f"FFmpeg clip cut timed out after "
+                            f"{BLOCKING_OPERATION_STALL_SECONDS}s for {clip_filename}"
+                        )
 
                     current_render_weight = clip_render_weights[i]
                     weight_before_clip = completed_render_weight
@@ -2735,8 +3275,19 @@ if __name__ == '__main__':
                             category="render",
                         )
 
-                    success = _render_clip(clip_temp_path, clip_final_path, output_format=output_format,
-                                           layout_style=layout_style, progress_callback=_clip_progress)
+                    with reporter.operation(
+                        f"clip render {i + 1}/{total_clips}",
+                        timeout_seconds=BLOCKING_OPERATION_STALL_SECONDS,
+                        message=f"Rendering clip {i + 1}/{total_clips}.",
+                        category="render",
+                    ):
+                        success = _render_clip(
+                            clip_temp_path,
+                            clip_final_path,
+                            output_format=output_format,
+                            layout_style=layout_style,
+                            progress_callback=_clip_progress,
+                        )
                     if not success:
                         raise RuntimeError(f"Clip render failed for {clip_filename}")
                     completed_render_weight += current_render_weight

@@ -140,23 +140,149 @@ def test_watermarked_passthrough_pads_odd_dimensions(monkeypatch, tmp_path):
     assert EVEN_PAD_FILTER in filter_complex
 
 
-def test_live_transcription_eta_waits_for_real_job_progress(monkeypatch):
+def test_transcription_eta_blends_prior_with_live_progress(monkeypatch, tmp_path):
     clock = [1000.0]
     monkeypatch.setattr(main.time, "time", lambda: clock[0])
+    monkeypatch.setattr(main, "JOB_STATS_PATH", str(tmp_path / ".job_stats.json"))
     reporter = main.JobReporter(job_id="eta-live")
     reporter.phase = "transcribe"
     reporter.phase_started_at = 1000.0
+    reporter.video_duration = 600.0
 
-    clock[0] = 1119.0
-    reporter.phase_progress_percent = 20.0
-    assert reporter._estimate_live_phase_seconds() is None
+    assert reporter._estimate_phase_remaining() == 300.0
 
-    clock[0] = 1120.0
-    reporter.phase_progress_percent = 9.9
-    assert reporter._estimate_live_phase_seconds() is None
-
+    clock[0] = 1010.0
     reporter.phase_progress_percent = 10.0
-    assert reporter._estimate_live_phase_seconds() == 1080
+    assert reporter._estimate_phase_remaining() == pytest.approx(252.0)
+
+
+def test_operation_deadline_moves_only_with_real_work(monkeypatch, tmp_path):
+    clock = [1000.0]
+    monkeypatch.setattr(main.time, "time", lambda: clock[0])
+    monkeypatch.setattr(main, "JOB_STATS_PATH", str(tmp_path / ".job_stats.json"))
+    reporter = main.JobReporter(job_id="operation-watchdog")
+
+    reporter.begin_operation("ffmpeg", timeout_seconds=120, expected_seconds=60)
+    assert reporter.operation_deadline_at == 1120.0
+    assert reporter._estimate_phase_remaining() is None  # queued is not an ETA phase
+
+    clock[0] = 1040.0
+    reporter.phase = "download"
+    reporter.phase_started_at = 1000.0
+    reporter.progress(50.0, message="made progress")
+    assert reporter.operation_deadline_at == 1160.0
+    assert reporter._estimate_phase_remaining() == pytest.approx(20.0)
+
+    clock[0] = 1050.0
+    reporter.heartbeat("keepalive", force=True)
+    assert reporter.operation_deadline_at == 1160.0
+
+
+def test_ytdlp_hooks_reserve_progress_and_eta_for_merge(monkeypatch):
+    calls = []
+
+    class Reporter:
+        video_duration = 3600.0
+
+        def progress(self, percent, **kwargs):
+            calls.append(("progress", percent, kwargs))
+
+        def begin_operation(self, name, **kwargs):
+            calls.append(("begin", name, kwargs))
+
+        def finish_operation(self, **kwargs):
+            calls.append(("finish", None, kwargs))
+
+        def heartbeat(self, *args, **kwargs):
+            calls.append(("heartbeat", args, kwargs))
+
+    monkeypatch.setattr(main, "JOB_REPORTER", Reporter())
+    monkeypatch.setattr(main.time, "time", lambda: 1000.0)
+    progress_hook, postprocessor_hook = main._make_ytdlp_progress_hooks()
+
+    progress_hook({
+        "status": "downloading",
+        "total_bytes": 100,
+        "downloaded_bytes": 100,
+        "eta": 10,
+    })
+    network_progress = calls[-1]
+    assert network_progress[0:2] == ("progress", 98.0)
+    assert network_progress[2]["eta_seconds"] > 10
+    assert network_progress[2]["eta_is_estimated"] is True
+
+    postprocessor_hook({"status": "started", "postprocessor": "FFmpegMerger"})
+    begin = next(call for call in calls if call[0] == "begin")
+    merge_progress = calls[-1]
+    assert begin[1] == "yt-dlp:FFmpegMerger"
+    assert begin[2]["timeout_seconds"] >= 240
+    assert merge_progress[0:2] == ("progress", 99.0)
+    assert merge_progress[2]["phase_eta_seconds"] > 0
+    assert merge_progress[2]["eta_is_estimated"] is True
+
+    postprocessor_hook({"status": "finished", "postprocessor": "FFmpegMerger"})
+    assert calls[-1][0] == "finish"
+
+
+def test_resume_source_rejects_yt_dlp_fragments_and_partial_merge(monkeypatch, tmp_path):
+    fragment = tmp_path / "Title.f625.mp4"
+    partial_merge = tmp_path / "Title.temp.mp4"
+    silent_final = tmp_path / "Silent.mp4"
+    complete_final = tmp_path / "Complete.mp4"
+    for path, size in ((fragment, 500), (partial_merge, 400), (silent_final, 300), (complete_final, 200)):
+        path.write_bytes(b"x" * size)
+
+    stream_map = {
+        str(fragment): {"video"},
+        str(partial_merge): {"video", "audio"},
+        str(silent_final): {"video"},
+        str(complete_final): {"video", "audio"},
+    }
+    monkeypatch.setattr(main, "_probe_stream_types", lambda path: stream_map[str(path)])
+
+    assert main._find_source_video(str(tmp_path), require_audio=True) == str(complete_final)
+    complete_final.unlink()
+    assert main._find_source_video(str(tmp_path), require_audio=True) is None
+
+    (tmp_path / "job_state.json").write_text(
+        '{"source_url": "https://www.youtube.com/watch?v=test"}',
+        encoding="utf-8",
+    )
+    context = main._load_resume_context(str(tmp_path))
+    assert context["input_video"] is None
+    assert context["source_url"].startswith("https://www.youtube.com/")
+
+    removed = main._clean_partial_download(str(tmp_path))
+    assert "Title.temp.mp4" in removed
+    assert partial_merge.exists() is False
+    assert fragment.exists() is True
+
+
+def test_analysis_learning_subtracts_fixed_overhead_and_serializes_writers(monkeypatch, tmp_path):
+    from concurrent.futures import ThreadPoolExecutor
+
+    stats_path = tmp_path / ".job_stats.json"
+    monkeypatch.setattr(main, "JOB_STATS_PATH", str(stats_path))
+    reporters = []
+    for index in range(6):
+        reporter = main.JobReporter(job_id=f"stats-{index}")
+        reporter.video_duration = 60.0
+        reporter.phase_durations = {"analyze": 35.0 + index}
+        reporters.append(reporter)
+
+    with ThreadPoolExecutor(max_workers=6) as pool:
+        list(pool.map(lambda reporter: reporter._record_job_stats(), reporters))
+
+    stats = main._load_job_stats()
+    unit = main.PHASE_COST_UNITS["analyze"]
+    assert unit == "per_source_second_after_overhead"
+    assert len(stats["analyze"][unit]) == 6
+    # Fixed 30s overhead is removed before normalising by source duration.
+    assert min(stats["analyze"][unit]) == pytest.approx(5.0 / 60.0, abs=0.0001)
+
+    long_job = main.JobReporter(job_id="long-analysis")
+    long_job.video_duration = 7200.0
+    assert long_job._phase_cost_prior("analyze") < 1000.0
 
 
 def test_blocked_gemini_batch_rescues_each_window_once(monkeypatch):

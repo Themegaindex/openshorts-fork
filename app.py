@@ -11,6 +11,7 @@ import glob
 import time
 import asyncio
 import re
+import signal
 import zipfile
 import hashlib
 from datetime import datetime, timezone
@@ -40,8 +41,14 @@ os.makedirs(OUTPUT_DIR, exist_ok=True)
 MAX_CONCURRENT_JOBS = int(os.environ.get("MAX_CONCURRENT_JOBS", "5"))
 MAX_FILE_SIZE_MB = 2048  # 2GB limit
 JOB_RETENTION_SECONDS = int(os.environ.get("JOB_RETENTION_SECONDS", str(24 * 3600)))
-HEARTBEAT_STALL_WARNING_SECONDS = int(os.environ.get("JOB_STALL_WARNING_SECONDS", "30"))
-HEARTBEAT_STALLED_SECONDS = int(os.environ.get("JOB_STALLED_SECONDS", "90"))
+# The worker emits a keepalive heartbeat every 15s, so silence this long really
+# means the process is frozen — not just busy inside a long FFmpeg/Whisper call.
+HEARTBEAT_STALL_WARNING_SECONDS = int(os.environ.get("JOB_STALL_WARNING_SECONDS", "90"))
+HEARTBEAT_STALLED_SECONDS = int(os.environ.get("JOB_STALLED_SECONDS", "240"))
+HEARTBEAT_MONITOR_INTERVAL_SECONDS = int(os.environ.get("JOB_STALL_CHECK_INTERVAL_SECONDS", "5"))
+# How often a stalled job restarts itself before it waits for the user.
+MAX_AUTO_RESUMES = int(os.environ.get("JOB_MAX_AUTO_RESUMES", "2"))
+AUTO_RESUME_BACKOFF_SECONDS = [10, 30]
 JOB_LOG_LIMIT = int(os.environ.get("JOB_LOG_LIMIT", "4000"))
 IMPORTANT_LOG_LIMIT = int(os.environ.get("JOB_IMPORTANT_LOG_LIMIT", "1000"))
 EVENT_PREFIX = "__JOB_EVENT__"
@@ -72,6 +79,7 @@ _state_write_lock = threading.Lock()
 # job_id -> set[subprocess.Popen]; guarded by job_processes_lock.
 job_processes: Dict[str, set] = {}
 job_processes_lock = threading.Lock()
+job_resume_locks: Dict[str, asyncio.Lock] = {}
 
 # Editing the same clip twice at once used to reuse temporary/output names and
 # could corrupt both results. Locks live only for the process lifetime; every
@@ -84,7 +92,25 @@ THUMBNAIL_SESSION_TTL_SECONDS = int(os.environ.get("THUMBNAIL_SESSION_TTL_SECOND
 PUBLISH_JOB_TTL_SECONDS = int(os.environ.get("PUBLISH_JOB_TTL_SECONDS", str(3600)))
 
 
+def _process_group_id(proc: "subprocess.Popen") -> Optional[int]:
+    """The worker's own process group, or None if it shares the server's.
+
+    Killing the server's own group would take the API down together with the
+    job, so anything but a dedicated group is treated as "no group to kill".
+    """
+    if os.name == "nt":
+        return None
+    try:
+        pgid = os.getpgid(proc.pid)
+    except Exception:
+        return None
+    return None if pgid == os.getpgid(0) else pgid
+
+
 def _register_job_process(job_id: str, proc: "subprocess.Popen") -> None:
+    # Resolve the group while the process is still alive. Once it is reaped its
+    # pid is gone and any surviving FFmpeg children can no longer be located.
+    proc._job_pgid = _process_group_id(proc)
     with job_processes_lock:
         job_processes.setdefault(job_id, set()).add(proc)
 
@@ -98,15 +124,47 @@ def _unregister_job_process(job_id: str, proc: "subprocess.Popen") -> None:
                 job_processes.pop(job_id, None)
 
 
+def _kill_process_tree(proc: "subprocess.Popen") -> bool:
+    """Kill a worker together with its FFmpeg/Gemini children.
+
+    Terminating only the main.py pid leaves those grandchildren running, and
+    they keep writing into the very output directory a resumed worker is about
+    to use. Returns True if the tree kill was issued.
+    """
+    try:
+        if os.name == "nt":
+            # /T walks the tree, so this has to run while the parent still exists.
+            subprocess.run(
+                ["taskkill", "/F", "/T", "/PID", str(proc.pid)],
+                stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL, timeout=15,
+            )
+            return True
+        pgid = getattr(proc, "_job_pgid", None) or _process_group_id(proc)
+        if pgid is None:
+            return False
+        os.killpg(pgid, signal.SIGKILL)
+        return True
+    except Exception:
+        return False
+
+
 def _stop_process(proc: "subprocess.Popen") -> None:
-    """Terminate a process, waiting up to 5s, then kill. No-op if already exited."""
+    """Stop a worker and its children, then reap it. No-op if already gone."""
     try:
         if proc.poll() is None:
+            # Children first: while the parent is alive its tree is still
+            # discoverable, and reaping it beforehand would strand FFmpeg.
+            _kill_process_tree(proc)
             proc.terminate()
             try:
                 proc.wait(timeout=5)
             except subprocess.TimeoutExpired:
                 proc.kill()
+                proc.wait(timeout=5)
+        else:
+            # Parent already exited — sweep whatever it left behind. Works even
+            # after reaping because the group was recorded at registration.
+            _kill_process_tree(proc)
     except Exception as e:
         print(f"⚠️ Failed to stop process: {e}")
 
@@ -117,6 +175,18 @@ def _terminate_job_processes(job_id: str) -> None:
         procs = list(job_processes.get(job_id, set()))
     for proc in procs:
         _stop_process(proc)
+
+
+async def _wait_for_job_processes_stopped(job_id: str, timeout_seconds: float = 20.0) -> bool:
+    """Wait until run_job has reaped and unregistered every old worker."""
+    deadline = time.monotonic() + max(0.0, float(timeout_seconds))
+    while True:
+        with job_processes_lock:
+            if not job_processes.get(job_id):
+                return True
+        if time.monotonic() >= deadline:
+            return False
+        await asyncio.sleep(0.1)
 
 
 def _now_ts() -> float:
@@ -310,6 +380,15 @@ def _get_job_state_lock(job_id: str) -> asyncio.Lock:
     return lock
 
 
+def _get_job_resume_lock(job_id: str) -> asyncio.Lock:
+    """Serialize cancel, manual resume and watchdog resume for one job."""
+    lock = job_resume_locks.get(job_id)
+    if lock is None:
+        lock = asyncio.Lock()
+        job_resume_locks[job_id] = lock
+    return lock
+
+
 def _update_clip_version(
     job_id: str,
     clip_index: int,
@@ -430,11 +509,16 @@ def _serialize_job(job: dict) -> dict:
         "actual_duration_seconds",
         "eta_seconds",
         "phase_eta_seconds",
+        "total_eta_seconds",
+        "eta_reference_at",
         "eta_state",
         "phase_durations_seconds",
         "worker_duration_seconds",
         "attempt",
         "resume_count",
+        "auto_resume_count",
+        "max_auto_resumes",
+        "auto_resume_pending",
         "stall_state",
         "error_summary",
         "warnings",
@@ -445,7 +529,9 @@ def _serialize_job(job: dict) -> dict:
         "input_filename",
         "output_dir",
         "video_duration_seconds",
-        "total_estimate_seconds",
+        "last_work_activity_at",
+        "operation_name",
+        "operation_deadline_at",
         "is_resumable",
         "raw_logs",
         "important_logs",
@@ -497,10 +583,15 @@ def _build_job_state(job_id: str, *, output_dir: str, source_type: Optional[str]
         "actual_duration_seconds": None,
         "eta_seconds": None,
         "phase_eta_seconds": None,
+        "total_eta_seconds": None,
+        "eta_reference_at": None,
         "eta_state": "calculating",
         "phase_durations_seconds": {},
         "attempt": 0,
         "resume_count": 0,
+        "auto_resume_count": 0,
+        "max_auto_resumes": MAX_AUTO_RESUMES,
+        "auto_resume_pending": False,
         "stall_state": "healthy",
         "error_summary": None,
         "warnings": [],
@@ -511,6 +602,9 @@ def _build_job_state(job_id: str, *, output_dir: str, source_type: Optional[str]
         "input_filename": input_filename,
         "output_dir": output_dir,
         "video_duration_seconds": None,
+        "last_work_activity_at": now,
+        "operation_name": None,
+        "operation_deadline_at": None,
         "is_resumable": False,
         "raw_logs": [],
         "important_logs": [],
@@ -560,6 +654,7 @@ def _mark_job_status(job_id: str, status: str, *, error_summary: Optional[str] =
         job["finished_at"] = None
         job["actual_duration_seconds"] = None
         job["eta_state"] = "calculating"
+        job["auto_resume_pending"] = False
     elif status in TERMINAL_JOB_STATUSES:
         finished_at = float(job.get("finished_at") or now)
         job["finished_at"] = finished_at
@@ -569,7 +664,11 @@ def _mark_job_status(job_id: str, status: str, *, error_summary: Optional[str] =
         )
         job["phase_eta_seconds"] = 0
         job["eta_seconds"] = 0
+        job["total_eta_seconds"] = 0
         job["eta_state"] = "done"
+        job["auto_resume_pending"] = False
+        job["operation_name"] = None
+        job["operation_deadline_at"] = None
     if error_summary is not None:
         job["error_summary"] = error_summary
     if resumable is not None:
@@ -609,7 +708,11 @@ def _apply_job_event(job_id: str, event: dict) -> None:
     elif event_type == "slow":
         job["stall_state"] = "slow"
     elif event_type in {"heartbeat", "progress", "phase", "resume"}:
-        job["stall_state"] = "healthy"
+        # The log thread keeps draining for up to 5s after a stalled worker was
+        # killed. A buffered event from that window must not report the job as
+        # healthy again while its status still says stalled.
+        if job.get("status") != "stalled" and not job.get("stall_termination_requested"):
+            job["stall_state"] = "healthy"
 
     event_status = event.get("status")
     # A worker's final summary is advisory. The supervising process validates
@@ -627,10 +730,16 @@ def _apply_job_event(job_id: str, event: dict) -> None:
     if "phase_eta_seconds" in event:
         value = event.get("phase_eta_seconds")
         job["phase_eta_seconds"] = None if value is None else max(0, int(value))
+        # Anchor the countdown so the status endpoint can age the estimate
+        # between events instead of reporting a frozen number.
+        job["eta_reference_at"] = now
+    if "total_eta_seconds" in event:
+        value = event.get("total_eta_seconds")
+        job["total_eta_seconds"] = None if value is None else max(0, int(value))
     if "eta_seconds" in event:
         value = event.get("eta_seconds")
         job["eta_seconds"] = None if value is None else max(0, int(value))
-    if event.get("eta_state") in {"calculating", "live", "done"}:
+    if event.get("eta_state") in {"calculating", "estimated", "live", "done"}:
         job["eta_state"] = event["eta_state"]
     if isinstance(event.get("phase_durations_seconds"), dict):
         job["phase_durations_seconds"] = {
@@ -646,8 +755,13 @@ def _apply_job_event(job_id: str, event: dict) -> None:
         job["resume_count"] = int(event["resume_count"])
     if event.get("video_duration_seconds") is not None:
         job["video_duration_seconds"] = float(event["video_duration_seconds"])
-    if event.get("total_estimate_seconds") is not None:
-        job["total_estimate_seconds"] = max(0, int(event["total_estimate_seconds"]))
+    if event.get("work_activity_at") is not None:
+        job["last_work_activity_at"] = float(event["work_activity_at"])
+    if "operation_name" in event:
+        job["operation_name"] = event.get("operation_name")
+    if "operation_deadline_at" in event:
+        value = event.get("operation_deadline_at")
+        job["operation_deadline_at"] = None if value is None else float(value)
     if event.get("resumable") is not None:
         job["is_resumable"] = bool(event["resumable"])
     if event.get("processing_mode") is not None:
@@ -795,6 +909,10 @@ def _recover_jobs_from_disk() -> None:
         state.setdefault("raw_logs", [])
         state.setdefault("important_logs", [])
         state["logs"] = [log_entry.get("message", "") for log_entry in state.get("raw_logs", [])]
+        # Scheduled asyncio tasks do not survive an API restart. Never restore a
+        # persisted "pending" badge without a live task/token behind it.
+        state["auto_resume_pending"] = False
+        state.pop("auto_resume_token", None)
         if state.get("status") in ACTIVE_JOB_STATUSES:
             state["status"] = "stalled"
             state["stall_state"] = "stalled"
@@ -932,6 +1050,123 @@ def _build_result_from_video_artifacts(job_id: str, output_dir: str) -> Optional
         'processing_mode': 'full_video_fallback',
     }
 
+async def _auto_resume_after_stall(job_id: str, attempt: int, token: str):
+    """Restart the exact stalled generation represented by ``token``."""
+    try:
+        backoff = AUTO_RESUME_BACKOFF_SECONDS[min(attempt - 1, len(AUTO_RESUME_BACKOFF_SECONDS) - 1)]
+        await asyncio.sleep(backoff)
+        await _resume_job_internal(
+            job_id,
+            auto_token=token,
+            reason=f"Automatic restart {attempt} after a detected freeze.",
+        )
+    except asyncio.CancelledError:
+        raise
+    except Exception as e:
+        print(f"⚠️ Auto-resume for {job_id} failed: {e}")
+        async with _get_job_resume_lock(job_id):
+            job = jobs.get(job_id)
+            if job and job.get("auto_resume_token") == token:
+                job["auto_resume_pending"] = False
+                job.pop("auto_resume_token", None)
+                _persist_job_state(job_id)
+        _append_log(job_id, f"Automatic restart failed: {e}", level="error", category="stall", important=True)
+
+
+def _job_stall_reason(job: dict, now: float) -> Optional[str]:
+    """Return why a processing job must be stopped, even if it still heartbeats."""
+    operation_deadline = job.get("operation_deadline_at")
+    if operation_deadline is not None and now >= float(operation_deadline):
+        operation_name = job.get("operation_name") or "blocking operation"
+        return f"Operation '{operation_name}' exceeded its activity deadline."
+
+    last_heartbeat_at = (
+        job.get("last_heartbeat_at")
+        or job.get("updated_at")
+        or job.get("created_at")
+        or now
+    )
+    heartbeat_age = now - float(last_heartbeat_at)
+    if heartbeat_age >= HEARTBEAT_STALLED_SECONDS:
+        return f"No heartbeat received for {int(heartbeat_age)}s."
+    return None
+
+
+async def heartbeat_monitor():
+    """Flag jobs whose worker went silent, kill them and restart them.
+
+    This used to live inside cleanup_jobs' 5-minute loop, which meant the
+    threshold was checked far too late to be meaningful.
+    """
+    print("💓 Heartbeat monitor started.")
+    while True:
+        try:
+            await asyncio.sleep(HEARTBEAT_MONITOR_INTERVAL_SECONDS)
+            now = time.time()
+            stalled_job_ids = []
+
+            for job_id, job in list(jobs.items()):
+                if job.get("status") != "processing":
+                    continue
+                last_heartbeat_at = job.get("last_heartbeat_at") or job.get("updated_at") or job.get("created_at") or now
+                heartbeat_age = now - float(last_heartbeat_at)
+                stall_reason = _job_stall_reason(job, now)
+                if stall_reason:
+                    job["status"] = "stalled"
+                    job["stall_state"] = "stalled"
+                    job["stall_termination_requested"] = True
+                    job["is_resumable"] = True
+                    job["auto_resume_pending"] = False
+                    job["error_summary"] = stall_reason
+                    _append_log(
+                        job_id,
+                        f"{stall_reason} Stopping the old process before resume.",
+                        level="warning", category="stall", important=True,
+                    )
+                    stalled_job_ids.append(job_id)
+                elif heartbeat_age >= HEARTBEAT_STALL_WARNING_SECONDS and job.get("stall_state") != "slow":
+                    job["stall_state"] = "slow"
+                    _append_log(job_id, "Job is slower than expected but still waiting for activity.",
+                                level="warning", category="stall", important=True)
+
+            # Never let a stalled worker keep its semaphore slot or write into
+            # the same output directory as a resumed worker.
+            for stalled_job_id in stalled_job_ids:
+                await asyncio.get_running_loop().run_in_executor(
+                    None, _terminate_job_processes, stalled_job_id
+                )
+                job = jobs.get(stalled_job_id) or {}
+                # A manual resume/cancel may have won while taskkill was running.
+                if job.get("status") != "stalled":
+                    continue
+                budget = int(job.get("max_auto_resumes", MAX_AUTO_RESUMES))
+                used = int(job.get("auto_resume_count") or 0)
+                if used >= budget:
+                    job["auto_resume_pending"] = False
+                    job.pop("auto_resume_token", None)
+                    _append_log(
+                        stalled_job_id,
+                        f"Automatic restarts exhausted ({used}/{budget}). Please resume manually.",
+                        level="warning", category="stall", important=True,
+                    )
+                    continue
+                token = uuid.uuid4().hex
+                job["auto_resume_count"] = used + 1
+                job["auto_resume_pending"] = True
+                job["auto_resume_token"] = token
+                _append_log(
+                    stalled_job_id,
+                    f"Automatic restart {used + 1}/{budget} scheduled after the detected freeze.",
+                    level="warning", category="stall", important=True,
+                )
+                asyncio.create_task(_auto_resume_after_stall(stalled_job_id, used + 1, token))
+
+        except asyncio.CancelledError:
+            raise
+        except Exception as e:
+            print(f"⚠️ Heartbeat monitor error: {e}")
+
+
 async def cleanup_jobs():
     """Background task to remove old jobs and files."""
     print("🧹 Cleanup task started.")
@@ -941,34 +1176,11 @@ async def cleanup_jobs():
             now = time.time()
 
             protected_uploads = set()
-            stalled_job_ids = []
             for job_id, job in list(jobs.items()):
                 status = job.get("status")
                 input_path = job.get("input_path")
                 if input_path and (status in ACTIVE_JOB_STATUSES or job.get("is_resumable")):
                     protected_uploads.add(os.path.abspath(input_path))
-
-                if status == "processing":
-                    last_heartbeat_at = job.get("last_heartbeat_at") or job.get("updated_at") or job.get("created_at") or now
-                    heartbeat_age = now - float(last_heartbeat_at)
-                    if heartbeat_age >= HEARTBEAT_STALLED_SECONDS:
-                        job["status"] = "stalled"
-                        job["stall_state"] = "stalled"
-                        job["stall_termination_requested"] = True
-                        job["is_resumable"] = True
-                        job["error_summary"] = job.get("error_summary") or "No heartbeat received for too long."
-                        _append_log(job_id, "Job heartbeat timed out. Stopping the old process before resume.", level="warning", category="stall", important=True)
-                        stalled_job_ids.append(job_id)
-                    elif heartbeat_age >= HEARTBEAT_STALL_WARNING_SECONDS and job.get("stall_state") != "slow":
-                        job["stall_state"] = "slow"
-                        _append_log(job_id, "Job is slower than expected but still waiting for activity.", level="warning", category="stall", important=True)
-
-            # Never let a stalled worker keep its semaphore slot or write into
-            # the same output directory as a resumed worker.
-            for stalled_job_id in stalled_job_ids:
-                await asyncio.get_running_loop().run_in_executor(
-                    None, _terminate_job_processes, stalled_job_id
-                )
 
             for job_id in os.listdir(OUTPUT_DIR):
                 if job_id.startswith(".") or job_id == "thumbnails":
@@ -1007,6 +1219,7 @@ async def cleanup_jobs():
                 for lock_key in [key for key in clip_operation_locks if key[0] == job_id]:
                     clip_operation_locks.pop(lock_key, None)
                 job_state_locks.pop(job_id, None)
+                job_resume_locks.pop(job_id, None)
 
             # Cleanup SaaSShorts jobs from memory
             try:
@@ -1089,6 +1302,7 @@ async def lifespan(app: FastAPI):
     _recover_auxiliary_state()
     worker_task = asyncio.create_task(process_queue())
     cleanup_task = asyncio.create_task(cleanup_jobs())
+    heartbeat_task = asyncio.create_task(heartbeat_monitor())
     yield
     # Cleanup (optional: cancel worker)
 
@@ -1207,6 +1421,21 @@ def _build_status_payload(job: dict) -> dict:
     if finished_at:
         seconds_since_finish = max(0, int(now - float(finished_at)))
 
+    # Age the ETAs by the time since the worker last reported one. Without this
+    # the countdown freezes for as long as a phase stays silent and then jumps.
+    eta_state = job.get("eta_state") or "calculating"
+    eta_age = 0.0
+    if job.get("eta_reference_at") and eta_state != "done":
+        eta_age = max(0.0, now - float(job["eta_reference_at"]))
+
+    def _aged(value):
+        if value is None:
+            return None
+        return max(0, int(round(float(value) - eta_age)))
+
+    phase_eta_seconds = _aged(job.get("phase_eta_seconds"))
+    total_eta_seconds = _aged(job.get("total_eta_seconds"))
+
     display_raw_logs = [_display_log_entry(entry) for entry in job.get("raw_logs", [])][-JOB_LOG_LIMIT:]
     display_important_logs = [entry for entry in display_raw_logs if entry.get("important")][-IMPORTANT_LOG_LIMIT:]
 
@@ -1217,9 +1446,10 @@ def _build_status_payload(job: dict) -> dict:
         "phase_label": job.get("phase_label"),
         "progress_percent": job.get("progress_percent"),
         "phase_progress_percent": job.get("phase_progress_percent"),
-        "eta_seconds": job.get("eta_seconds"),
-        "phase_eta_seconds": job.get("phase_eta_seconds"),
-        "eta_state": job.get("eta_state") or "calculating",
+        "eta_seconds": phase_eta_seconds,
+        "phase_eta_seconds": phase_eta_seconds,
+        "total_eta_seconds": total_eta_seconds,
+        "eta_state": eta_state,
         "elapsed_seconds": elapsed_seconds,
         "actual_duration_seconds": actual_duration_seconds,
         "created_at": job.get("created_at"),
@@ -1230,6 +1460,9 @@ def _build_status_payload(job: dict) -> dict:
         "seconds_since_finish": seconds_since_finish,
         "attempt": job.get("attempt"),
         "resume_count": job.get("resume_count"),
+        "auto_resume_count": job.get("auto_resume_count", 0),
+        "max_auto_resumes": job.get("max_auto_resumes", MAX_AUTO_RESUMES),
+        "auto_resume_pending": bool(job.get("auto_resume_pending", False)),
         "stall_state": job.get("stall_state"),
         "error_summary": job.get("error_summary"),
         "warnings": job.get("warnings", []),
@@ -1237,7 +1470,9 @@ def _build_status_payload(job: dict) -> dict:
         "source_type": job.get("source_type"),
         "source_url": job.get("source_url"),
         "video_duration_seconds": job.get("video_duration_seconds"),
-        "total_estimate_seconds": job.get("total_estimate_seconds"),
+        "last_work_activity_at": job.get("last_work_activity_at"),
+        "operation_name": job.get("operation_name"),
+        "operation_deadline_at": job.get("operation_deadline_at"),
         "phase_durations_seconds": job.get("phase_durations_seconds", {}),
         "worker_duration_seconds": job.get("worker_duration_seconds"),
         "important_logs": display_important_logs,
@@ -1277,12 +1512,19 @@ async def run_job(job_id, job_data):
     process = None
     t_log = None
     try:
+        # Own process group/session so _stop_process can take the worker's
+        # FFmpeg and Gemini children down with it instead of orphaning them.
+        if os.name == "nt":
+            spawn_kwargs = {"creationflags": subprocess.CREATE_NEW_PROCESS_GROUP}
+        else:
+            spawn_kwargs = {"start_new_session": True}
         process = subprocess.Popen(
             cmd,
             stdout=subprocess.PIPE,
             stderr=subprocess.STDOUT, # Merge stderr to stdout
             env=env,
-            cwd=os.getcwd()
+            cwd=os.getcwd(),
+            **spawn_kwargs,
         )
         _register_job_process(job_id, process)
 
@@ -1619,23 +1861,131 @@ async def get_support_log(job_id: str):
 @app.post("/api/jobs/{job_id}/cancel")
 async def cancel_job(job_id: str):
     """Cancel a queued/running job: flag it, kill its worker subprocess, free the slot."""
-    job = jobs.get(job_id)
-    if not job:
-        # Not live in memory: exists on disk => already finished; otherwise unknown.
-        if _get_job(job_id):
+    async with _get_job_resume_lock(job_id):
+        job = jobs.get(job_id)
+        if not job:
+            # Not live in memory: exists on disk => already finished; otherwise unknown.
+            if _get_job(job_id):
+                return {"success": False, "detail": "already finished"}
+            raise HTTPException(status_code=404, detail="Job not found")
+
+        if job.get("status") in TERMINAL_JOB_STATUSES:
             return {"success": False, "detail": "already finished"}
-        raise HTTPException(status_code=404, detail="Job not found")
 
-    if job.get("status") in TERMINAL_JOB_STATUSES:
-        return {"success": False, "detail": "already finished"}
+        job["cancel_requested"] = True
+        job["auto_resume_pending"] = False
+        job.pop("auto_resume_token", None)
+        # Killing the registered subprocess unblocks run_job's wait loop; its
+        # wrapper finally releases the concurrency semaphore slot.
+        await asyncio.get_running_loop().run_in_executor(None, _terminate_job_processes, job_id)
+        _mark_job_status(job_id, "failed", error_summary="Cancelled by user", resumable=False)
+        _append_log(job_id, "Job cancelled by user.", level="warning", category="cancel", important=True)
+        return {"success": True}
 
-    job["cancel_requested"] = True
-    # Killing the registered subprocess unblocks run_job's wait loop; its wrapper's
-    # finally then releases the concurrency semaphore slot, so no slot is leaked.
-    await asyncio.get_running_loop().run_in_executor(None, _terminate_job_processes, job_id)
-    _mark_job_status(job_id, "failed", error_summary="Cancelled by user", resumable=False)
-    _append_log(job_id, "Job cancelled by user.", level="warning", category="cancel", important=True)
-    return {"success": True}
+
+async def _resume_job_internal(job_id: str, *, phase: Optional[str] = None,
+                               api_key: Optional[str] = None,
+                               auto_token: Optional[str] = None,
+                               manual: bool = False,
+                               reason: str = "Job re-queued for resume."):
+    """Re-queue a stalled/failed job. Shared by the endpoint and the watchdog."""
+    async with _get_job_resume_lock(job_id):
+        job = _get_job(job_id)
+        if not job:
+            if auto_token:
+                return {"job_id": job_id, "status": "skipped"}
+            raise HTTPException(status_code=404, detail="Job not found")
+
+        if auto_token:
+            # A stale task must not resume a later stall generation.
+            if (
+                job.get("auto_resume_token") != auto_token
+                or not job.get("auto_resume_pending")
+                or job.get("status") != "stalled"
+            ):
+                return {"job_id": job_id, "status": "skipped"}
+        else:
+            if job.get("status") in ACTIVE_JOB_STATUSES:
+                raise HTTPException(status_code=409, detail="Job is already active")
+            if not job.get("is_resumable") and job.get("status") != "stalled":
+                raise HTTPException(status_code=409, detail="Job is not resumable")
+
+        output_dir = job.get("output_dir") or os.path.join(OUTPUT_DIR, job_id)
+        if not os.path.isdir(output_dir):
+            job["auto_resume_pending"] = False
+            job.pop("auto_resume_token", None)
+            _persist_job_state(job_id)
+            if auto_token:
+                _append_log(
+                    job_id,
+                    "Automatic restart skipped: job artifacts are gone.",
+                    level="error", category="stall", important=True,
+                )
+                return {"job_id": job_id, "status": "skipped"}
+            raise HTTPException(status_code=410, detail="Job artifacts are no longer available")
+
+        # Stop the old tree and prove run_job has unregistered it before a new
+        # worker is allowed to touch the same directory.
+        await asyncio.get_running_loop().run_in_executor(None, _terminate_job_processes, job_id)
+        if not await _wait_for_job_processes_stopped(job_id):
+            job["status"] = "stalled"
+            job["stall_state"] = "stalled"
+            job["auto_resume_pending"] = False
+            job.pop("auto_resume_token", None)
+            _append_log(
+                job_id,
+                "Restart aborted because the previous worker could not be stopped safely.",
+                level="error", category="stall", important=True,
+            )
+            if auto_token:
+                return {"job_id": job_id, "status": "blocked"}
+            raise HTTPException(status_code=503, detail="Previous worker is still running")
+
+        cmd = _build_resume_command(job_id, output_dir, phase)
+        env = dict(job.get("env") or os.environ)
+        if api_key:
+            env["GEMINI_API_KEY"] = api_key
+        if manual:
+            # Explicit user action grants a fresh automatic-restart budget.
+            job["auto_resume_count"] = 0
+        job["cmd"] = cmd
+        job["env"] = env
+        job["execution_id"] = uuid.uuid4().hex
+        job.pop("cancel_requested", None)
+        job.pop("stall_termination_requested", None)
+        job.pop("auto_resume_token", None)
+        job["auto_resume_pending"] = False
+        job["status"] = "queued"
+        job["phase"] = "queued"
+        job["phase_label"] = "Queued"
+        job["progress_percent"] = min(float(job.get("progress_percent") or 0.0), 99.0)
+        job["phase_progress_percent"] = 0.0
+        job["attempt"] = 0
+        job["stall_state"] = "healthy"
+        job["error_summary"] = None
+        job["warnings"] = []
+        job["resume_count"] = int(job.get("resume_count") or 0) + 1
+        job["updated_at"] = _now_ts()
+        job["last_heartbeat_at"] = job["updated_at"]
+        job["last_work_activity_at"] = job["updated_at"]
+        job["operation_name"] = None
+        job["operation_deadline_at"] = None
+        # Restart the elapsed clock: counting from the original start (incl. a
+        # possible multi-hour freeze) makes runtime and ETA meaningless.
+        job["started_at"] = job["updated_at"]
+        job["finished_at"] = None
+        job["actual_duration_seconds"] = None
+        job["phase_eta_seconds"] = None
+        job["eta_seconds"] = None
+        job["total_eta_seconds"] = None
+        job["eta_reference_at"] = None
+        job["eta_state"] = "calculating"
+        job["phase_durations_seconds"] = {}
+        job.pop("worker_duration_seconds", None)
+        job["is_resumable"] = True
+        _append_log(job_id, reason, category="resume", important=True)
+        await job_queue.put(job_id)
+        return {"job_id": job_id, "status": "queued", "resume_count": job["resume_count"]}
 
 
 @app.post("/api/jobs/{job_id}/resume")
@@ -1644,58 +1994,13 @@ async def resume_job(job_id: str, request: Request, body: Optional[ResumeRequest
     if not api_key:
         raise HTTPException(status_code=400, detail="Missing X-Gemini-Key header")
 
-    job = _get_job(job_id)
-    if not job:
-        raise HTTPException(status_code=404, detail="Job not found")
-    if job.get("status") in ACTIVE_JOB_STATUSES:
-        raise HTTPException(status_code=409, detail="Job is already active")
-    if not job.get("is_resumable") and job.get("status") != "stalled":
-        raise HTTPException(status_code=409, detail="Job is not resumable")
-
-    output_dir = job.get("output_dir") or os.path.join(OUTPUT_DIR, job_id)
-    if not os.path.isdir(output_dir):
-        raise HTTPException(status_code=410, detail="Job artifacts are no longer available")
-
-    # A heartbeat-stalled process may still be registered for a few seconds.
-    # Stop and wait for it before another worker can touch the same artifacts.
-    await asyncio.get_running_loop().run_in_executor(None, _terminate_job_processes, job_id)
-
-    cmd = _build_resume_command(job_id, output_dir, body.phase if body else None)
-
-    env = os.environ.copy()
-    env["GEMINI_API_KEY"] = api_key
-    job["cmd"] = cmd
-    job["env"] = env
-    job["execution_id"] = uuid.uuid4().hex
-    job.pop("cancel_requested", None)
-    job.pop("stall_termination_requested", None)
-    job["status"] = "queued"
-    job["phase"] = "queued"
-    job["phase_label"] = "Queued"
-    job["progress_percent"] = min(float(job.get("progress_percent") or 0.0), 99.0)
-    job["phase_progress_percent"] = 0.0
-    job["attempt"] = 0
-    job["stall_state"] = "healthy"
-    job["error_summary"] = None
-    job["warnings"] = []
-    job["resume_count"] = int(job.get("resume_count") or 0) + 1
-    job["updated_at"] = _now_ts()
-    job["last_heartbeat_at"] = job["updated_at"]
-    # Restart the elapsed clock: counting from the original start (incl. a
-    # possible multi-hour freeze) makes runtime and ETA meaningless.
-    job["started_at"] = job["updated_at"]
-    job["finished_at"] = None
-    job["actual_duration_seconds"] = None
-    job["phase_eta_seconds"] = None
-    job["eta_seconds"] = None
-    job["eta_state"] = "calculating"
-    job["phase_durations_seconds"] = {}
-    job.pop("worker_duration_seconds", None)
-    job.pop("total_estimate_seconds", None)
-    job["is_resumable"] = True
-    _append_log(job_id, "Job re-queued for resume.", category="resume", important=True)
-    await job_queue.put(job_id)
-    return {"job_id": job_id, "status": "queued", "resume_count": job["resume_count"]}
+    return await _resume_job_internal(
+        job_id,
+        phase=body.phase if body else None,
+        api_key=api_key,
+        manual=True,
+        reason="Job re-queued for resume.",
+    )
 
 from editor import VideoEditor
 from subtitles import generate_srt, generate_ass, burn_layers, generate_srt_from_video
