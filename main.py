@@ -37,6 +37,13 @@ from dotenv import load_dotenv
 import json
 import shutil
 from typing import List, Optional
+
+# OS advisory file locks for the shared ETA history (_job_stats_file_lock):
+# msvcrt on Windows, flock everywhere else.
+if os.name == "nt":
+    import msvcrt
+else:
+    import fcntl
 from pydantic import BaseModel
 from clip_selection import (
     build_transcript_windows,
@@ -197,38 +204,73 @@ def _job_stats_file_lock(timeout_seconds=JOB_STATS_LOCK_TIMEOUT_SECONDS):
     """Cross-process lock for the shared learned-ETA history.
 
     Workers are separate Python processes, so a threading lock cannot protect
-    their common JSON file. Exclusive lock-file creation works on Windows and
-    POSIX; an abandoned lock is reclaimed after a generous stale interval.
+    their common JSON file. The kernel's advisory lock (msvcrt.locking/flock)
+    is held on a persistent sidecar file: only one holder can ever exist, and
+    the OS releases the lock the moment its holder dies, so no stale-lock
+    heuristics are needed. The sidecar is deliberately never deleted —
+    unlinking a locked path would let the next process lock a fresh file
+    while the previous holder still owns the old one.
     """
     lock_path = f"{JOB_STATS_PATH}.lock"
     os.makedirs(os.path.dirname(JOB_STATS_PATH) or ".", exist_ok=True)
     deadline = time.monotonic() + max(0.1, float(timeout_seconds))
-    stale_after = max(30.0, float(timeout_seconds) * 3.0)
-    descriptor = None
-    while descriptor is None:
-        try:
-            descriptor = os.open(lock_path, os.O_CREAT | os.O_EXCL | os.O_WRONLY)
-            os.write(descriptor, f"{os.getpid()} {time.time()}".encode("ascii"))
-        except FileExistsError:
-            try:
-                if time.time() - os.path.getmtime(lock_path) > stale_after:
-                    os.remove(lock_path)
-                    continue
-            except FileNotFoundError:
-                continue
-            if time.monotonic() >= deadline:
-                raise TimeoutError("Timed out waiting for the job-stats lock")
-            time.sleep(0.05)
+    descriptor = os.open(lock_path, os.O_CREAT | os.O_RDWR)
+    acquired = False
     try:
+        while not acquired:
+            try:
+                if os.name == "nt":
+                    os.lseek(descriptor, 0, os.SEEK_SET)
+                    msvcrt.locking(descriptor, msvcrt.LK_NBLCK, 1)
+                else:
+                    fcntl.flock(descriptor, fcntl.LOCK_EX | fcntl.LOCK_NB)
+                acquired = True
+            except OSError:
+                if time.monotonic() >= deadline:
+                    raise TimeoutError("Timed out waiting for the job-stats lock")
+                time.sleep(0.05)
         yield
     finally:
+        if acquired:
+            try:
+                if os.name == "nt":
+                    os.lseek(descriptor, 0, os.SEEK_SET)
+                    msvcrt.locking(descriptor, msvcrt.LK_UNLCK, 1)
+                else:
+                    fcntl.flock(descriptor, fcntl.LOCK_UN)
+            except OSError:
+                pass
+        os.close(descriptor)
+
+
+def _append_job_stat_samples(samples: dict) -> dict:
+    """Merge measured cost samples into the shared history and persist it.
+
+    ``samples`` maps phase -> {unit: [values]}. The re-read happens while the
+    inter-process lock is held so concurrent completions (or a calibration
+    run) cannot lose one another's samples. Returns the stored stats.
+    """
+    with _job_stats_file_lock():
+        stats = _load_job_stats()
+        for phase, units in samples.items():
+            for unit, values in units.items():
+                bucket = stats.setdefault(phase, {}).setdefault(unit, [])
+                bucket.extend(round(float(value), 4) for value in values)
+                del bucket[:-JOB_STATS_SAMPLE_LIMIT]
+        tmp_path = (
+            f"{JOB_STATS_PATH}.{os.getpid()}.{threading.get_ident()}."
+            f"{time.time_ns()}.tmp"
+        )
         try:
-            os.close(descriptor)
+            with open(tmp_path, "w", encoding="utf-8") as f:
+                json.dump(stats, f)
+            os.replace(tmp_path, JOB_STATS_PATH)
         finally:
             try:
-                os.remove(lock_path)
+                os.remove(tmp_path)
             except FileNotFoundError:
                 pass
+    return stats
 
 
 def _estimated_merge_seconds(video_duration) -> float:
@@ -356,48 +398,32 @@ class JobReporter:
         """Persist this job's measured phase costs for future estimates."""
         if not self.phase_durations:
             return
+        samples = {}
+        for phase, seconds in self.phase_durations.items():
+            unit = PHASE_COST_UNITS.get(phase)
+            if unit is None or not seconds or seconds < 1.0:
+                continue
+            if unit in {"per_source_second", "per_source_second_after_overhead"}:
+                if not self.video_duration:
+                    continue
+                measured_seconds = float(seconds)
+                if unit == "per_source_second_after_overhead":
+                    measured_seconds = max(
+                        0.0,
+                        measured_seconds - PHASE_FIXED_OVERHEAD.get(phase, 0.0),
+                    )
+                value = measured_seconds / self.video_duration
+            elif unit == "per_output_second":
+                if not self.output_seconds:
+                    continue
+                value = seconds / self.output_seconds
+            else:
+                value = seconds
+            samples.setdefault(phase, {}).setdefault(unit, []).append(value)
+        if not samples:
+            return
         try:
-            with _job_stats_file_lock():
-                # Re-read while holding the inter-process lock so concurrent
-                # completions cannot lose one another's samples.
-                stats = _load_job_stats()
-                for phase, seconds in self.phase_durations.items():
-                    unit = PHASE_COST_UNITS.get(phase)
-                    if unit is None or not seconds or seconds < 1.0:
-                        continue
-                    if unit in {"per_source_second", "per_source_second_after_overhead"}:
-                        if not self.video_duration:
-                            continue
-                        measured_seconds = float(seconds)
-                        if unit == "per_source_second_after_overhead":
-                            measured_seconds = max(
-                                0.0,
-                                measured_seconds - PHASE_FIXED_OVERHEAD.get(phase, 0.0),
-                            )
-                        value = measured_seconds / self.video_duration
-                    elif unit == "per_output_second":
-                        if not self.output_seconds:
-                            continue
-                        value = seconds / self.output_seconds
-                    else:
-                        value = seconds
-                    bucket = stats.setdefault(phase, {}).setdefault(unit, [])
-                    bucket.append(round(value, 4))
-                    del bucket[:-JOB_STATS_SAMPLE_LIMIT]
-                tmp_path = (
-                    f"{JOB_STATS_PATH}.{os.getpid()}.{threading.get_ident()}."
-                    f"{time.time_ns()}.tmp"
-                )
-                try:
-                    with open(tmp_path, "w", encoding="utf-8") as f:
-                        json.dump(stats, f)
-                    os.replace(tmp_path, JOB_STATS_PATH)
-                finally:
-                    try:
-                        os.remove(tmp_path)
-                    except FileNotFoundError:
-                        pass
-                self.job_stats = stats
+            self.job_stats = _append_job_stat_samples(samples)
         except Exception as e:
             print(f"⚠️ Could not persist phase stats: {e!r}", file=sys.stderr)
 

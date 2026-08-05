@@ -363,6 +363,26 @@ def test_analysis_learning_subtracts_fixed_overhead_and_serializes_writers(monke
     assert long_job._phase_cost_prior("analyze") < 1000.0
 
 
+def test_job_stats_lock_is_exclusive_reusable_and_keeps_its_sidecar(monkeypatch, tmp_path):
+    monkeypatch.setattr(main, "JOB_STATS_PATH", str(tmp_path / ".job_stats.json"))
+
+    with main._job_stats_file_lock():
+        # A second holder must time out while the OS lock is held — even in
+        # the same process, because every acquisition opens its own descriptor.
+        with pytest.raises(TimeoutError):
+            with main._job_stats_file_lock(timeout_seconds=0.2):
+                pass
+
+    # Released cleanly: the very next acquisition succeeds immediately.
+    with main._job_stats_file_lock(timeout_seconds=0.2):
+        pass
+
+    # The sidecar file must survive on purpose. Deleting a locked path would
+    # let the next process lock a fresh file while the old holder still owns
+    # the removed one — the exact double-holder race the OS lock prevents.
+    assert (tmp_path / ".job_stats.json.lock").exists()
+
+
 def test_blocked_gemini_batch_rescues_each_window_once(monkeypatch):
     calls = []
 
