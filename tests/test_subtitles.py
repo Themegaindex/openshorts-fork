@@ -276,7 +276,10 @@ class TestGenerateAss:
         assert "&H00FFFFFF" in content  # pure white, no dimming
 
     def test_neon_sweep_uses_cumulative_line_mask_and_layered_glow(self, tmp_path):
-        from subtitles import _NEON_SWEEP_GLOW_LAYERS, _NEON_SWEEP_PALETTE, generate_ass
+        from subtitles import (
+            _NEON_SWEEP_GLOW_LAYERS, _NEON_SWEEP_PALETTE,
+            _NEON_SWEEP_WHITE_GLOW_INDICES, generate_ass,
+        )
         out = tmp_path / "neon_sweep.ass"
         words = [
             _w(" und", 0.0, 0.30), _w(" meint", 0.30, 0.60),
@@ -292,7 +295,7 @@ class TestGenerateAss:
 
         assert "PlayResX: 162" in content and "PlayResY: 288" in content
         assert "Style: Signature,Arial Black," in content
-        assert r"\blur70.0" in content and r"\blur28.0" in content
+        assert r"\blur22.0" in content and r"\blur8.0" in content
         assert r"\N" in content  # stable renderer-independent line break
         assert len([line for line in events if line.startswith("Dialogue: 7")]) == 4
         # First active event shows one colored word; the second keeps a
@@ -300,12 +303,15 @@ class TestGenerateAss:
         sharp_events = [line for line in events if line.startswith("Dialogue: 7")]
         assert sharp_events[0].count(r"\alpha&H00&") == 1
         assert sharp_events[1].count(r"\alpha&H00&") == 2
-        # Two white layers + four pure-colour layers per spoken interval: the
-        # unspoken words only get the two tight glow stages.
-        assert len(events) == 24
+        # Four white layers + four pure-colour layers per spoken interval.
+        # Complementary masks prevent the white bloom from washing out the
+        # active coloured prefix.
+        assert len(events) == 32
         assert _NEON_SWEEP_PALETTE == ("18F8F4", "19FF43", "FF2038")
-        assert [layer[2] for layer in _NEON_SWEEP_GLOW_LAYERS] == ["0D", "0D", "0D", "00"]
-        assert r"\1a&H0D&" in events[0]
+        assert [layer[1] for layer in _NEON_SWEEP_GLOW_LAYERS] == ["22.0", "8.0", "3.0", "0.0"]
+        assert [layer[2] for layer in _NEON_SWEEP_GLOW_LAYERS] == ["73", "1A", "00", "00"]
+        assert _NEON_SWEEP_WHITE_GLOW_INDICES == (0, 1, 2, 3)
+        assert r"\1a&H73&" in events[0]
 
     def test_neon_sweep_keeps_sharp_cores_above_every_blurred_bloom(self, tmp_path):
         """A coloured wide bloom must never cover a neighbour's white core.
@@ -327,9 +333,9 @@ class TestGenerateAss:
             if not line.startswith("Dialogue:"):
                 continue
             layer = int(line.split(",", 1)[0].split(":")[1])
-            if r"\blur70.0" in line or r"\blur28.0" in line:
+            if any(tag in line for tag in (r"\blur22.0", r"\blur8.0", r"\blur3.0")):
                 blur_layers.append(layer)
-            elif r"\blur0.08" in line:
+            elif r"\blur0.0" in line:
                 sharp_layers.append(layer)
 
         assert blur_layers and sharp_layers
@@ -398,7 +404,9 @@ class TestGenerateAss:
 
     def test_rainbow_word_shows_only_current_word_with_animated_gradient(self, tmp_path):
         import re
-        from subtitles import generate_ass
+        from subtitles import (
+            _NEON_SWEEP_GLOW_LAYERS, _SIGNATURE_GLOW_LAYERS, generate_ass,
+        )
         out = tmp_path / "rainbow_word.ass"
         words = [_w(" brown", 0.0, 0.60), _w(" fox", 0.60, 1.20)]
 
@@ -410,7 +418,8 @@ class TestGenerateAss:
         events = [line for line in content.splitlines() if line.startswith("Dialogue:")]
 
         assert len(events) == 8  # four measured glow/core layers per current word
-        assert r"\blur70.0" in content and r"\blur0.08" in content
+        assert _SIGNATURE_GLOW_LAYERS is _NEON_SWEEP_GLOW_LAYERS
+        assert r"\blur22.0" in content and r"\blur0.0" in content
         assert r"\fad(40,40)" in content
         first_word_events = events[:4]
         second_word_events = events[4:]
