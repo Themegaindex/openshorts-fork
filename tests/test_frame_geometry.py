@@ -396,6 +396,41 @@ def test_resume_source_rejects_yt_dlp_fragments_and_partial_merge(monkeypatch, t
     assert fragment.exists() is True
 
 
+def test_unknown_probe_never_discards_existing_sources(monkeypatch, tmp_path):
+    """ffprobe returning None means "could not check", never "file is broken".
+
+    Every resume path must keep an existing source on an unknown probe:
+    discarding it forces a needless re-download (which can then fail on
+    cookies/network) or even deletes a healthy multi-gigabyte file.
+    """
+    import json as jsonlib
+
+    monkeypatch.setattr(main, "_probe_stream_types", lambda path: None)
+    merged = tmp_path / "Title.mp4"
+    merged.write_bytes(b"x")
+
+    # 1. The resumed-download reuse check must keep the merged file.
+    assert main._reusable_merged_download(str(merged)) is True
+
+    # 2. The source search must keep the candidate even when audio is required.
+    assert main._find_source_video(str(tmp_path), require_audio=True) == str(merged)
+
+    # 3. A checkpointed URL job must keep its recorded input_video.
+    (tmp_path / "Title_analysis_input.json").write_text(jsonlib.dumps({
+        "input_video": str(merged),
+        "source_url": "https://www.youtube.com/watch?v=test",
+        "video_duration": 120.0,
+        "transcript": {"segments": []},
+    }), encoding="utf-8")
+    assert main._load_resume_context(str(tmp_path))["input_video"] == str(merged)
+
+    # A probe that PROVES missing audio still rejects the file everywhere.
+    monkeypatch.setattr(main, "_probe_stream_types", lambda path: {"video"})
+    assert main._reusable_merged_download(str(merged)) is False
+    assert main._find_source_video(str(tmp_path), require_audio=True) is None
+    assert main._load_resume_context(str(tmp_path))["input_video"] is None
+
+
 def test_resume_falls_back_to_persisted_upload_outside_job_dir(monkeypatch, tmp_path):
     job_dir = tmp_path / "job"
     job_dir.mkdir()

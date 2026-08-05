@@ -1942,8 +1942,7 @@ Technical Details: {str(last_error)}
     output_template = os.path.join(output_dir, f'{sanitized_title}.%(ext)s')
     expected_file = os.path.join(output_dir, f'{sanitized_title}.mp4')
     if os.path.exists(expected_file):
-        existing_streams = _probe_stream_types(expected_file) if resume else set()
-        if resume and existing_streams and {"video", "audio"}.issubset(existing_streams):
+        if resume and _reusable_merged_download(expected_file):
             print("✅ Reusing the already complete merged source video.")
             JOB_REPORTER.progress(100.0, message="Download already complete.", important=True, category="download")
             return expected_file, sanitized_title
@@ -2904,7 +2903,11 @@ def _find_source_video(resume_dir: str, *, require_audio: bool = False):
         streams = _probe_stream_types(path)
         if streams is not None and "video" not in streams:
             continue
-        if require_audio and (streams is None or "audio" not in streams):
+        # None means ffprobe could not run, not that audio is missing. The
+        # name filters above already excluded the video-only .fNNN fragments,
+        # so an unprobeable remaining candidate is kept rather than forcing a
+        # needless re-download (see _probe_stream_types).
+        if require_audio and streams is not None and "audio" not in streams:
             continue
         candidates.append(path)
     # If several remain, the source is by far the largest one.
@@ -2933,6 +2936,20 @@ def _probe_stream_types(path: str):
         for line in (result.stdout or b"").decode("utf-8", "ignore").splitlines()
         if line.strip()
     }
+
+
+def _reusable_merged_download(path: str) -> bool:
+    """Whether an existing final mp4 can serve a resumed download.
+
+    The final <title>.mp4 only ever appears through a completed single-file
+    download or a completed merge (FFmpegMergerPP renames its .temp.mp4 only
+    on success), so on an unknown probe result the file is kept: deleting a
+    healthy multi-gigabyte download over a probe hiccup is the worse failure
+    (see _probe_stream_types). Only a probe that PROVES missing streams
+    rejects the file.
+    """
+    streams = _probe_stream_types(path)
+    return streams is None or {"video", "audio"}.issubset(streams)
 
 
 def _clean_partial_download(resume_dir: str):
@@ -3079,8 +3096,13 @@ def _load_resume_context(resume_dir: str, fallback_input: Optional[str] = None):
     input_video = analysis_input_payload.get("input_video")
     source_url = analysis_input_payload.get("source_url")
     if source_url and input_video and os.path.exists(input_video):
+        # The checkpoint recorded this path after a successful download, so
+        # the probe is only a sanity re-check. Discard the file solely when
+        # ffprobe PROVES streams are missing — None means the probe could not
+        # run, and clearing on that would force a needless re-download of a
+        # healthy file (see _probe_stream_types).
         streams = _probe_stream_types(input_video)
-        if streams is None or not {"video", "audio"}.issubset(streams):
+        if streams is not None and not {"video", "audio"}.issubset(streams):
             input_video = None
 
     return {
