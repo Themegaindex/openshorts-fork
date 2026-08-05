@@ -35,7 +35,9 @@ class TestBuildLayerCommand:
         cmd = build_layer_command("in.mp4", "out.mp4", subtitle_filter="ass='s.ass'")
         assert "-vf" in cmd
         assert "-filter_complex" not in cmd
-        assert cmd[cmd.index("-vf") + 1] == f"ass='s.ass',{EVEN_PAD_FILTER}"
+        assert cmd[cmd.index("-vf") + 1] == (
+            f"format=yuv444p,ass='s.ass',{EVEN_PAD_FILTER},format=yuv420p"
+        )
 
     def test_hook_only_uses_overlay(self):
         cmd = build_layer_command("in.mp4", "out.mp4", hook_png="h.png", hook_x=90, hook_y=384)
@@ -53,8 +55,9 @@ class TestBuildLayerCommand:
             subtitle_filter="ass='s.ass'", hook_png="h.png", hook_x=10, hook_y=20,
         )
         fc = cmd[cmd.index("-filter_complex") + 1]
-        assert fc == (f"[0:v]ass='s.ass'[v0];[v0][1:v]overlay=10:20[v1];"
-                      f"[v1]{EVEN_PAD_FILTER}[vout]")
+        assert fc == (f"[0:v]format=yuv444p,ass='s.ass'[v0];"
+                      f"[v0][1:v]overlay=10:20[v1];"
+                      f"[v1]{EVEN_PAD_FILTER},format=yuv420p[vout]")
         # exactly one encode: a single ffmpeg invocation with one output
         assert cmd.count("ffmpeg") == 1
         assert cmd[-1] == "out.mp4"
@@ -64,7 +67,18 @@ class TestBuildLayerCommand:
         assert "+faststart" in cmd
         assert "copy" in cmd  # audio copied, not re-encoded
         assert "libx264" in cmd
+        assert cmd[cmd.index("-preset") + 1] == "slow"
+        assert cmd[cmd.index("-crf") + 1] == "18"
+        assert cmd[cmd.index("-sws_flags") + 1] == (
+            "lanczos+accurate_rnd+full_chroma_int+full_chroma_inp"
+        )
         assert cmd[cmd.index("-pix_fmt") + 1] == "yuv420p"
+
+    def test_hook_only_keeps_fast_encode_path(self):
+        cmd = build_layer_command("in.mp4", "out.mp4", hook_png="h.png")
+        assert cmd[cmd.index("-preset") + 1] == "fast"
+        assert cmd[cmd.index("-crf") + 1] == "23"
+        assert "-sws_flags" not in cmd
 
     def test_hook_coordinates_are_integers(self):
         cmd = build_layer_command("in.mp4", "out.mp4", hook_png="h.png", hook_x=12.7, hook_y=9.2)
@@ -87,9 +101,9 @@ class TestHookEntrance:
                                   hook_png="h.png", hook_x=10, hook_y=20, hook_entrance=True)
         fc = cmd[cmd.index("-filter_complex") + 1]
         assert fc == ("[1:v]format=rgba,fade=t=in:st=0:d=0.35:alpha=1[hk];"
-                      "[0:v]ass='s.ass'[v0];"
+                      "[0:v]format=yuv444p,ass='s.ass'[v0];"
                       "[v0][hk]overlay=10:'20+60*pow(1-min(t/0.5,1),2)'[v1];"
-                      f"[v1]{EVEN_PAD_FILTER}[vout]")
+                      f"[v1]{EVEN_PAD_FILTER},format=yuv420p[vout]")
 
     def test_no_entrance_keeps_static_overlay(self):
         cmd = build_layer_command("in.mp4", "out.mp4", hook_png="h.png",

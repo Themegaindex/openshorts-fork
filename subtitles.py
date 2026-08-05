@@ -358,36 +358,30 @@ _NEON_SWEEP_PALETTE = (
 )
 
 
-# Measured from the two original 100 x 100 CapCut preview WebPs.  The crucial
-# detail is that the wide bloom is a blurred copy of the glyph, not a giant
-# outline.  A giant outline produces the compact, synthetic-looking halo the
-# old renderer had.  These four layers give us the wide bloom, middle glow,
-# close corona and sharp tube, all perfectly centred with zero offset.
-# Ordered widest-first, so the index doubles as the stacking order.
+# Calibrated against the CapCut references and a full-resolution 1214 x 2160
+# render. ASS blur values are expressed on the 162 x 288 script canvas, so the
+# old 70/28 radii expanded into hundreds of output pixels: opaque copies made
+# the glyphs unreadably soft, while reducing their opacity made the light all
+# but disappear. These tighter, brighter copies keep the energy close enough
+# to read as neon, with an unblurred tube stacked above them for sharp edges.
+# Ordered widest-first, so the index doubles as the stacking order. Rainbow
+# Word and Neon Sweep intentionally share this exact geometry.
 _SIGNATURE_GLOW_LAYERS = (
     # border, blur, fill alpha, outline alpha
-    ("0.0", "70.0", "00", "FF"),
-    ("0.0", "28.0", "00", "FF"),
-    ("0.85", "3.5", "00", "00"),
-    ("0.15", "0.08", "00", "18"),
+    ("0.0", "22.0", "73", "FF"),
+    ("0.0", "8.0", "1A", "FF"),
+    ("0.0", "3.0", "00", "FF"),
+    ("0.12", "0.0", "00", "18"),
 )
 
-# Keep the CapCut geometry, but trim only Neon Sweep's three blurred copies by
-# 5%.  ASS alpha is inverted, so 0D is the nearest 8-bit value to 95% opacity.
-# The sharp tube stays fully opaque and Rainbow Word keeps the measured source
-# intensity above.
-_NEON_SWEEP_GLOW_LAYERS = (
-    ("0.0", "70.0", "0D", "FF"),
-    ("0.0", "28.0", "0D", "FF"),
-    ("0.85", "3.5", "0D", "0D"),
-    ("0.15", "0.08", "00", "18"),
-)
+# Keep both signature presets on the approved sharp-neon calibration. ASS
+# alpha is inverted: 73/1A/00 are roughly 55%/90%/100% opacity.
+_NEON_SWEEP_GLOW_LAYERS = _SIGNATURE_GLOW_LAYERS
 
-# Only the two tight stages are drawn for the words that have NOT been spoken
-# yet. Giving them the full four-stage treatment wrapped every caption in a
-# wide white fog that swallowed the coloured active word — and the two large
-# blurs are also by far the most expensive ones to composite.
-_NEON_SWEEP_WHITE_GLOW_INDICES = (2, 3)
+# White words need the same bloom/corona/core structure as the active colour.
+# Complementary masks keep the white copies away from active coloured glyphs,
+# so all four stages can glow without washing out the karaoke sweep.
+_NEON_SWEEP_WHITE_GLOW_INDICES = (0, 1, 2, 3)
 
 # Rainbow Word desaturates the two middle stages slightly; the source preview
 # shows a marginally cooler corona around a fully saturated core.
@@ -1094,6 +1088,18 @@ def build_layer_command(video_path, output_path, subtitle_filter=None,
     if hook_png:
         cmd.extend(['-i', hook_png])
 
+    # Compose subtitle colours in 4:4:4 so saturated cyan/green/red edges are
+    # not subsampled before libass has finished drawing them. The deliverable
+    # remains broadly compatible yuv420p; accurate chroma downsampling happens
+    # only once, after every presentation layer has been composed.
+    if subtitle_filter:
+        cmd.extend([
+            '-sws_flags',
+            'lanczos+accurate_rnd+full_chroma_int+full_chroma_inp',
+        ])
+    subtitle_prefix = "format=yuv444p," if subtitle_filter else ""
+    subtitle_suffix = ",format=yuv420p" if subtitle_filter else ""
+
     hook_src = "[1:v]"
     hook_pre = ""
     y_value = str(int(hook_y))
@@ -1110,9 +1116,9 @@ def build_layer_command(video_path, output_path, subtitle_filter=None,
     if subtitle_filter and hook_png:
         cmd.extend([
             '-filter_complex',
-            f"{hook_pre}[0:v]{subtitle_filter}[v0];"
+            f"{hook_pre}[0:v]{subtitle_prefix}{subtitle_filter}[v0];"
             f"[v0]{hook_src}overlay={int(hook_x)}:{y_value}[v1];"
-            f"[v1]{EVEN_PAD_FILTER}[vout]",
+            f"[v1]{EVEN_PAD_FILTER}{subtitle_suffix}[vout]",
             '-map', '[vout]', '-map', '0:a?',
         ])
     elif hook_png:
@@ -1123,11 +1129,22 @@ def build_layer_command(video_path, output_path, subtitle_filter=None,
             '-map', '[vout]', '-map', '0:a?',
         ])
     else:
-        cmd.extend(['-vf', f"{subtitle_filter},{EVEN_PAD_FILTER}"])
+        cmd.extend([
+            '-vf',
+            f"{subtitle_prefix}{subtitle_filter},{EVEN_PAD_FILTER}{subtitle_suffix}",
+        ])
+
+    # The approved neon reference was rendered at CRF 18 / slow. Preserve
+    # those settings whenever text is burned so the production result keeps
+    # the same sharp core and clean glow gradients. Hook-only renders retain
+    # the existing faster path because they do not contain fine neon edges.
+    if subtitle_filter:
+        video_encode_opts = ['-c:v', 'libx264', '-preset', 'slow', '-crf', '18']
+    else:
+        video_encode_opts = ['-c:v', 'libx264', '-preset', 'fast', '-crf', '23']
 
     cmd.extend([
-        '-c:a', 'copy',
-        '-c:v', 'libx264', '-preset', 'fast', '-crf', '23',
+        '-c:a', 'copy', *video_encode_opts,
         '-pix_fmt', 'yuv420p',
         '-movflags', '+faststart',
         output_path
@@ -1171,4 +1188,3 @@ def burn_subtitles(video_path, srt_path, output_path, alignment=2, fontsize=16,
                        border_width=border_width, bg_color=bg_color,
                        bg_opacity=bg_opacity),
     )
-

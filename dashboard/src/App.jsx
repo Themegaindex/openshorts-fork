@@ -1,4 +1,4 @@
-import React, { useState, useEffect, lazy, Suspense } from 'react';
+import React, { useState, useEffect, useMemo, useRef, lazy, Suspense } from 'react';
 import { Upload, FileVideo, Sparkles, Youtube, Instagram, Share2, LogOut, ChevronDown, Check, Activity, LayoutDashboard, Settings, PlusCircle, History, Menu, X, Terminal, Shield, LayoutGrid, Image, Globe, RotateCcw, Copy, AlertTriangle, Type, Download, Loader2 } from 'lucide-react';
 import KeyInput from './components/KeyInput';
 import MediaInput from './components/MediaInput';
@@ -457,6 +457,29 @@ function App() {
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [uploadPostKey]);
 
+  // The status endpoint returns a snapshot taken at poll time. Without a local
+  // clock every time value would only move in 2s steps and freeze completely
+  // during the error backoff, which makes a remaining-time display useless.
+  const jobMetaReceivedAt = useRef(Date.now());
+  const [clockTick, setClockTick] = useState(0);
+
+  useEffect(() => {
+    jobMetaReceivedAt.current = Date.now();
+  }, [jobMeta]);
+
+  useEffect(() => {
+    if (!['queued', 'processing', 'stalled'].includes(status)) return undefined;
+    const timer = setInterval(() => setClockTick((tick) => tick + 1), 1000);
+    return () => clearInterval(timer);
+  }, [status]);
+
+  const secondsSinceUpdate = useMemo(
+    () => Math.max(0, (Date.now() - jobMetaReceivedAt.current) / 1000),
+    // clockTick drives the recompute; jobMeta resets the anchor it reads from.
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+    [clockTick, jobMeta],
+  );
+
   useEffect(() => {
     // Note: no polling in 'complete' — a finished job's 249 KB status payload
     // was previously re-fetched every 2s forever. Bulk actions refresh once
@@ -478,7 +501,6 @@ function App() {
         if (cancelled) return;
         consecutiveErrors = 0;
         setConnectionIssue(null);
-        console.log("Job status:", data);
         setJobMeta(data);
 
         // Update results if available (real-time)
@@ -796,11 +818,32 @@ function App() {
   const progressPercent = Number(jobMeta?.progress_percent || 0);
   const phaseLabel = jobMeta?.phase_label || (status === 'queued' ? 'Queued' : status === 'processing' ? 'Processing' : 'Idle');
   const isTerminalJob = status === 'complete' || status === 'error' || status === 'archived';
-  const phaseEtaText = jobMeta?.eta_state === 'live'
-    ? formatDuration(jobMeta?.phase_eta_seconds)
-    : jobMeta?.eta_state === 'done'
-      ? 'Fertig'
-      : 'Wird berechnet …';
+
+  const countDown = (value) => (value == null ? null : Math.max(0, Math.round(Number(value) - secondsSinceUpdate)));
+  const countUp = (value) => (value == null ? null : Math.round(Number(value) + secondsSinceUpdate));
+  const liveTotalEta = isTerminalJob ? null : countDown(jobMeta?.total_eta_seconds);
+  const livePhaseEta = isTerminalJob ? null : countDown(jobMeta?.phase_eta_seconds);
+  const liveElapsed = isTerminalJob ? jobMeta?.elapsed_seconds : countUp(jobMeta?.elapsed_seconds);
+  const liveSinceHeartbeat = isTerminalJob
+    ? jobMeta?.seconds_since_finish
+    : countUp(jobMeta?.seconds_since_heartbeat);
+
+  // 'estimated' means the value still comes from prior jobs rather than this
+  // one's measured pace — worth saying, but far better than showing nothing.
+  const etaPrefix = jobMeta?.eta_state === 'estimated' ? 'ca. ' : '';
+  const etaText = (seconds) => {
+    if (jobMeta?.eta_state === 'done') return 'Fertig';
+    if (seconds == null) return 'Wird berechnet …';
+    return `${etaPrefix}${formatDuration(seconds)}`;
+  };
+  const totalEtaText = etaText(liveTotalEta);
+  const phaseEtaText = etaText(livePhaseEta);
+  // The watchdog restarts a stalled job by itself until its budget is used up.
+  const autoResumePending = status === 'stalled'
+    && jobMeta?.auto_resume_pending === true;
+  const autoResumeExhausted = status === 'stalled'
+    && !autoResumePending
+    && (jobMeta?.auto_resume_count ?? 0) >= (jobMeta?.max_auto_resumes ?? 2);
   const phaseDurationLabels = {
     download: 'Download',
     transcribe: 'Transkription',
@@ -1165,30 +1208,38 @@ function App() {
                   <div className="grid grid-cols-2 gap-3 text-xs">
                     <div className="p-3 rounded-xl bg-white/5 border border-white/5">
                       <div className="text-zinc-500 mb-1">
-                        {isTerminalJob ? 'Tatsächliche Gesamtdauer' : 'Restzeit dieser Phase'}
+                        {isTerminalJob ? 'Tatsächliche Gesamtdauer' : 'Restzeit gesamt'}
                       </div>
                       <div className="text-white font-medium">
                         {isTerminalJob
                           ? formatDuration(jobMeta?.actual_duration_seconds ?? jobMeta?.elapsed_seconds)
-                          : phaseEtaText}
+                          : totalEtaText}
                       </div>
-                      {!isTerminalJob && jobMeta?.eta_state === 'live' && (
-                        <div className="text-[10px] text-zinc-500 mt-0.5">live geschätzt</div>
+                      {!isTerminalJob && (
+                        <div className="text-[10px] text-zinc-500 mt-0.5">
+                          {phaseLabel}: {phaseEtaText}
+                          {jobMeta?.eta_state === 'live' && ' · live'}
+                        </div>
                       )}
                     </div>
                     <div className="p-3 rounded-xl bg-white/5 border border-white/5">
                       <div className="text-zinc-500 mb-1">{isTerminalJob ? 'Verstrichene Zeit' : 'Bisher vergangen'}</div>
-                      <div className="text-white font-medium">{formatDuration(jobMeta?.elapsed_seconds)}</div>
+                      <div className="text-white font-medium">{formatDuration(liveElapsed)}</div>
                     </div>
                     <div className="p-3 rounded-xl bg-white/5 border border-white/5">
                       <div className="text-zinc-500 mb-1">{isTerminalJob ? 'Abgeschlossen' : 'Letzte Aktivität'}</div>
                       <div className="text-white font-medium">
-                        {formatLastSeen(isTerminalJob ? jobMeta?.seconds_since_finish : jobMeta?.seconds_since_heartbeat)}
+                        {formatLastSeen(liveSinceHeartbeat)}
                       </div>
                     </div>
                     <div className="p-3 rounded-xl bg-white/5 border border-white/5">
-                      <div className="text-zinc-500 mb-1">Gemini / Resume</div>
-                      <div className="text-white font-medium">{jobMeta?.attempt || 0} / {jobMeta?.resume_count || 0}</div>
+                      <div className="text-zinc-500 mb-1">Neustarts / davon automatisch</div>
+                      <div className="text-white font-medium">
+                        {jobMeta?.resume_count || 0} / {jobMeta?.auto_resume_count || 0}
+                        <span className="text-zinc-500">
+                          {' '}von {jobMeta?.max_auto_resumes ?? 2}
+                        </span>
+                      </div>
                     </div>
                   </div>
 
@@ -1214,7 +1265,9 @@ function App() {
                     )}
                     {jobMeta?.stall_state === 'stalled' && (
                       <span className="text-[10px] px-2 py-1 rounded-full border border-amber-500/20 bg-amber-500/10 text-amber-300">
-                        Hängt wahrscheinlich
+                        {autoResumePending
+                          ? `Hängt — starte automatisch neu (${jobMeta?.auto_resume_count}/${jobMeta?.max_auto_resumes})`
+                          : 'Hängt wahrscheinlich'}
                       </span>
                     )}
                     {jobMeta?.processing_mode === 'full_video_fallback' && (
@@ -1384,7 +1437,21 @@ function App() {
                     ) : status === 'stalled' ? (
                       <div className="h-full flex flex-col items-center justify-center text-amber-300 space-y-3">
                         <p>Der Job hängt wahrscheinlich oder wartet zu lange.</p>
-                        {jobMeta?.is_resumable && (
+                        {autoResumePending ? (
+                          <p className="text-xs text-zinc-400">
+                            Automatischer Neustart {jobMeta?.auto_resume_count} von{' '}
+                            {jobMeta?.max_auto_resumes} läuft — du musst nichts tun.
+                          </p>
+                        ) : autoResumeExhausted ? (
+                          <p className="text-xs text-zinc-400">
+                            Automatische Neustarts sind aufgebraucht.
+                          </p>
+                        ) : (
+                          <p className="text-xs text-zinc-400">
+                            Kein automatischer Neustart ist aktiv. Du kannst den Job sicher fortsetzen.
+                          </p>
+                        )}
+                        {jobMeta?.is_resumable && !autoResumePending && (
                           <button onClick={handleResumeJob} className="btn-primary px-4 py-2 text-sm flex items-center gap-2">
                             <RotateCcw size={14} />
                             Fortsetzen
