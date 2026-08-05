@@ -107,15 +107,143 @@ def _process_group_id(proc: "subprocess.Popen") -> Optional[int]:
     return None if pgid == os.getpgid(0) else pgid
 
 
+# Windows has no process groups a later kill can rely on: taskkill /T walks
+# the parent/child chain, which breaks the moment the parent exits. A Job
+# Object is the kernel's own container for a process AND everything it ever
+# spawns — TerminateJobObject reaches every descendant regardless of whether
+# the parent is still alive, and KILL_ON_JOB_CLOSE makes the kernel wipe the
+# job when its last handle disappears (e.g. because this server crashed).
+if os.name == "nt":
+    import ctypes
+
+    _kernel32 = ctypes.WinDLL("kernel32", use_last_error=True)
+    _kernel32.CreateJobObjectW.restype = ctypes.c_void_p
+    _kernel32.CreateJobObjectW.argtypes = [ctypes.c_void_p, ctypes.c_wchar_p]
+    _kernel32.SetInformationJobObject.argtypes = [
+        ctypes.c_void_p, ctypes.c_int, ctypes.c_void_p, ctypes.c_uint32,
+    ]
+    _kernel32.AssignProcessToJobObject.argtypes = [ctypes.c_void_p, ctypes.c_void_p]
+    _kernel32.TerminateJobObject.argtypes = [ctypes.c_void_p, ctypes.c_uint32]
+    _kernel32.CloseHandle.argtypes = [ctypes.c_void_p]
+
+    _JOB_OBJECT_LIMIT_KILL_ON_JOB_CLOSE = 0x2000
+    _JobObjectExtendedLimitInformation = 9
+
+    class _IO_COUNTERS(ctypes.Structure):
+        _fields_ = [
+            ("ReadOperationCount", ctypes.c_uint64),
+            ("WriteOperationCount", ctypes.c_uint64),
+            ("OtherOperationCount", ctypes.c_uint64),
+            ("ReadTransferCount", ctypes.c_uint64),
+            ("WriteTransferCount", ctypes.c_uint64),
+            ("OtherTransferCount", ctypes.c_uint64),
+        ]
+
+    class _JOBOBJECT_BASIC_LIMIT_INFORMATION(ctypes.Structure):
+        _fields_ = [
+            ("PerProcessUserTimeLimit", ctypes.c_int64),
+            ("PerJobUserTimeLimit", ctypes.c_int64),
+            ("LimitFlags", ctypes.c_uint32),
+            ("MinimumWorkingSetSize", ctypes.c_size_t),
+            ("MaximumWorkingSetSize", ctypes.c_size_t),
+            ("ActiveProcessLimit", ctypes.c_uint32),
+            ("Affinity", ctypes.c_size_t),
+            ("PriorityClass", ctypes.c_uint32),
+            ("SchedulingClass", ctypes.c_uint32),
+        ]
+
+    class _JOBOBJECT_EXTENDED_LIMIT_INFORMATION(ctypes.Structure):
+        _fields_ = [
+            ("BasicLimitInformation", _JOBOBJECT_BASIC_LIMIT_INFORMATION),
+            ("IoInfo", _IO_COUNTERS),
+            ("ProcessMemoryLimit", ctypes.c_size_t),
+            ("JobMemoryLimit", ctypes.c_size_t),
+            ("PeakProcessMemoryUsed", ctypes.c_size_t),
+            ("PeakJobMemoryUsed", ctypes.c_size_t),
+        ]
+else:
+    _kernel32 = None
+
+
+def _create_kill_on_close_job_object():
+    """A Windows Job Object handle with KILL_ON_JOB_CLOSE, or None."""
+    if _kernel32 is None:
+        return None
+    try:
+        handle = _kernel32.CreateJobObjectW(None, None)
+        if not handle:
+            return None
+        info = _JOBOBJECT_EXTENDED_LIMIT_INFORMATION()
+        info.BasicLimitInformation.LimitFlags = _JOB_OBJECT_LIMIT_KILL_ON_JOB_CLOSE
+        if not _kernel32.SetInformationJobObject(
+            handle, _JobObjectExtendedLimitInformation,
+            ctypes.byref(info), ctypes.sizeof(info),
+        ):
+            _kernel32.CloseHandle(handle)
+            return None
+        return handle
+    except Exception:
+        return None
+
+
+def _assign_process_to_job_object(proc: "subprocess.Popen") -> None:
+    """Contain a freshly spawned worker in its own kill-on-close job.
+
+    Must run right after Popen: the worker is still busy with the Python
+    interpreter startup, so it cannot have spawned children that would escape
+    the job. Assignment can fail on pre-Windows-8 nesting restrictions; the
+    taskkill fallback then still applies.
+    """
+    proc._job_object_handle = None
+    handle = _create_kill_on_close_job_object()
+    if handle is None:
+        return
+    try:
+        if _kernel32.AssignProcessToJobObject(handle, ctypes.c_void_p(int(proc._handle))):
+            proc._job_object_handle = handle
+            return
+    except Exception:
+        pass
+    try:
+        _kernel32.CloseHandle(handle)
+    except Exception:
+        pass
+
+
+def _terminate_job_object(handle) -> bool:
+    """Kill every process inside the job. Works after the parent exited."""
+    if not handle or _kernel32 is None:
+        return False
+    try:
+        return bool(_kernel32.TerminateJobObject(handle, 1))
+    except Exception:
+        return False
+
+
+def _release_job_object(proc: "subprocess.Popen") -> None:
+    """Close the worker's job handle; KILL_ON_JOB_CLOSE sweeps any stragglers."""
+    handle = getattr(proc, "_job_object_handle", None)
+    proc._job_object_handle = None
+    if not handle or _kernel32 is None:
+        return
+    try:
+        _kernel32.CloseHandle(handle)
+    except Exception:
+        pass
+
+
 def _register_job_process(job_id: str, proc: "subprocess.Popen") -> None:
     # Resolve the group while the process is still alive. Once it is reaped its
     # pid is gone and any surviving FFmpeg children can no longer be located.
     proc._job_pgid = _process_group_id(proc)
+    if os.name == "nt":
+        _assign_process_to_job_object(proc)
     with job_processes_lock:
         job_processes.setdefault(job_id, set()).add(proc)
 
 
 def _unregister_job_process(job_id: str, proc: "subprocess.Popen") -> None:
+    _release_job_object(proc)
     with job_processes_lock:
         procs = job_processes.get(job_id)
         if procs:
@@ -133,7 +261,12 @@ def _kill_process_tree(proc: "subprocess.Popen") -> bool:
     """
     try:
         if os.name == "nt":
-            # /T walks the tree, so this has to run while the parent still exists.
+            # The job object reaches every descendant even after the parent
+            # exited, so it is the reliable path. taskkill /T only remains as
+            # a fallback when assignment failed; it has to walk the tree, so
+            # it must run while the parent still exists.
+            if _terminate_job_object(getattr(proc, "_job_object_handle", None)):
+                return True
             subprocess.run(
                 ["taskkill", "/F", "/T", "/PID", str(proc.pid)],
                 stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL, timeout=15,
@@ -163,7 +296,8 @@ def _stop_process(proc: "subprocess.Popen") -> None:
                 proc.wait(timeout=5)
         else:
             # Parent already exited — sweep whatever it left behind. Works even
-            # after reaping because the group was recorded at registration.
+            # after reaping because the process group (POSIX) or job object
+            # handle (Windows) was recorded at registration.
             _kill_process_tree(proc)
     except Exception as e:
         print(f"⚠️ Failed to stop process: {e}")

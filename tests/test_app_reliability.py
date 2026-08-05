@@ -458,6 +458,54 @@ def test_stale_auto_resume_token_cannot_resume_later_stall(monkeypatch, tmp_path
     assert job["status"] == "stalled"
 
 
+def test_kill_process_tree_uses_job_object_even_after_parent_exit(monkeypatch):
+    terminated = []
+    taskkills = []
+    monkeypatch.setattr(app.os, "name", "nt")
+    monkeypatch.setattr(
+        app, "_terminate_job_object",
+        lambda handle: bool(handle) and (terminated.append(handle) or True),
+    )
+    monkeypatch.setattr(
+        app.subprocess, "run",
+        lambda *args, **kwargs: taskkills.append(args[0]),
+    )
+
+    # The job object does not care whether the parent pid still exists — that
+    # is the whole point of holding the handle.
+    proc = SimpleNamespace(pid=4321, _job_object_handle=1234)
+    assert app._kill_process_tree(proc) is True
+    assert terminated == [1234]
+    assert taskkills == []
+
+    # Without a job object (assignment failed) the taskkill fallback runs.
+    fallback_proc = SimpleNamespace(pid=8765, _job_object_handle=None)
+    assert app._kill_process_tree(fallback_proc) is True
+    assert taskkills == [["taskkill", "/F", "/T", "/PID", "8765"]]
+
+
+def test_unregister_job_process_closes_the_job_object_handle(monkeypatch):
+    closed = []
+    monkeypatch.setattr(
+        app, "_kernel32",
+        SimpleNamespace(CloseHandle=lambda handle: closed.append(handle)),
+    )
+
+    class _Proc:
+        _job_object_handle = 77
+
+    proc = _Proc()
+    monkeypatch.setattr(app, "job_processes", {"job-close": {proc}})
+
+    app._unregister_job_process("job-close", proc)
+
+    # KILL_ON_JOB_CLOSE means closing the handle is what sweeps stragglers, so
+    # it must happen exactly once and the stored handle must be gone.
+    assert closed == [77]
+    assert proc._job_object_handle is None
+    assert "job-close" not in app.job_processes
+
+
 def test_auxiliary_jobs_recover_after_restart(monkeypatch, tmp_path):
     _configure_aux_state(monkeypatch, tmp_path)
 
