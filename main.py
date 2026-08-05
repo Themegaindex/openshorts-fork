@@ -1650,7 +1650,7 @@ def sanitize_filename(filename):
 
 def _make_ytdlp_progress_hooks():
     """Create per-download yt-dlp hooks with isolated throttling state."""
-    progress_state = {"last_emit": 0.0, "last_bucket": -1}
+    progress_state = {"last_emit": 0.0, "last_bucket": -1, "downloaded_by_file": {}}
 
     def download_progress_hook(data):
         if data.get("status") != "downloading":
@@ -1662,8 +1662,15 @@ def _make_ytdlp_progress_hooks():
             # bytes are real work. Without marking them the download
             # operation's freeze deadline would kill a healthy long download
             # after BLOCKING_OPERATION_STALL_SECONDS even though data flows.
-            if downloaded > progress_state.get("last_downloaded_bytes", 0):
-                progress_state["last_downloaded_bytes"] = downloaded
+            # bestvideo+bestaudio arrives as separate files whose byte
+            # counters restart at zero, so movement is tracked per file — a
+            # shared counter would read the second stream as "no new bytes"
+            # until it outgrew the first one. The dict stays tiny: one entry
+            # per downloaded file of this job.
+            file_key = data.get("filename") or data.get("tmpfilename") or ""
+            seen_bytes = progress_state["downloaded_by_file"]
+            if downloaded > seen_bytes.get(file_key, 0):
+                seen_bytes[file_key] = downloaded
                 JOB_REPORTER.heartbeat(
                     f"Downloading video... {downloaded / 1_000_000:.1f} MB "
                     "(total size unknown)",

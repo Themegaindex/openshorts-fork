@@ -337,13 +337,28 @@ def test_ytdlp_unknown_size_download_marks_byte_movement_as_work(monkeypatch):
 
     # No total size reported: received bytes must count as work so the
     # download operation's freeze deadline keeps moving.
-    progress_hook({"status": "downloading", "downloaded_bytes": 5_000_000})
+    progress_hook({"status": "downloading", "downloaded_bytes": 5_000_000,
+                   "filename": "Title.f625.mp4"})
     assert heartbeats[-1][1].get("counts_as_work") is True
     assert "5.0 MB" in heartbeats[-1][0]
 
     # Same byte count again means nothing new arrived — that is only a
     # keepalive and must not extend the deadline.
-    progress_hook({"status": "downloading", "downloaded_bytes": 5_000_000})
+    progress_hook({"status": "downloading", "downloaded_bytes": 5_000_000,
+                   "filename": "Title.f625.mp4"})
+    assert heartbeats[-1][1].get("counts_as_work") is not True
+
+    # bestvideo+bestaudio: the audio file restarts its byte counter at zero.
+    # Its (smaller) byte movement is real work for THIS file and must extend
+    # the deadline even though it never exceeds the video file's count.
+    progress_hook({"status": "downloading", "downloaded_bytes": 1_000_000,
+                   "filename": "Title.f140.m4a"})
+    assert heartbeats[-1][1].get("counts_as_work") is True
+
+    # And the same guard applies per file: an unchanged audio byte count is
+    # again only a keepalive.
+    progress_hook({"status": "downloading", "downloaded_bytes": 1_000_000,
+                   "filename": "Title.f140.m4a"})
     assert heartbeats[-1][1].get("counts_as_work") is not True
 
 
