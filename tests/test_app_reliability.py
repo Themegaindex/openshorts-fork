@@ -458,6 +458,42 @@ def test_stale_auto_resume_token_cannot_resume_later_stall(monkeypatch, tmp_path
     assert job["status"] == "stalled"
 
 
+def test_resume_passes_surviving_upload_to_the_worker(monkeypatch, tmp_path):
+    upload = tmp_path / "upload.mp4"
+    upload.write_bytes(b"x")
+    job = {
+        "job_id": "resume-upload",
+        "status": "stalled",
+        "is_resumable": True,
+        "output_dir": str(tmp_path),
+        "input_path": str(upload),
+        "raw_logs": [],
+        "important_logs": [],
+    }
+    monkeypatch.setattr(app, "jobs", {"resume-upload": job})
+    monkeypatch.setattr(app, "job_resume_locks", {})
+    monkeypatch.setattr(app, "_terminate_job_processes", lambda _job_id: None)
+
+    async def processes_stopped(*_args, **_kwargs):
+        return True
+
+    monkeypatch.setattr(app, "_wait_for_job_processes_stopped", processes_stopped)
+
+    async def resume():
+        monkeypatch.setattr(app, "job_queue", asyncio.Queue())
+        return await app._resume_job_internal("resume-upload", api_key="key", manual=True)
+
+    assert asyncio.run(resume())["status"] == "queued"
+    cmd = job["cmd"]
+    assert cmd[cmd.index("--input") + 1] == str(upload)
+
+    # A deleted upload must not be passed along — the worker would fail on it.
+    upload.unlink()
+    job["status"] = "stalled"
+    assert asyncio.run(resume())["status"] == "queued"
+    assert "--input" not in job["cmd"]
+
+
 def test_kill_process_tree_uses_job_object_even_after_parent_exit(monkeypatch):
     terminated = []
     taskkills = []

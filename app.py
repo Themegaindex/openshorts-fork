@@ -1472,10 +1472,17 @@ class ResumeRequest(BaseModel):
     phase: Optional[str] = None
 
 
-def _build_resume_command(job_id: str, output_dir: str, phase: Optional[str] = None) -> List[str]:
+def _build_resume_command(job_id: str, output_dir: str, phase: Optional[str] = None,
+                          input_path: Optional[str] = None) -> List[str]:
     cmd = [sys.executable, "-u", "main.py", "--resume-dir", output_dir, "--job-id", job_id]
     if phase:
         cmd.extend(["--resume-phase", phase])
+    if input_path:
+        # Local uploads live outside the job directory (uploads/), so a job
+        # that stalled before its first checkpoint has no source video the
+        # resume could find in --resume-dir. Passing the persisted upload path
+        # lets the worker fall back to it instead of failing the resume.
+        cmd.extend(["--input", input_path])
     return cmd
 
 def enqueue_output(out, job_id):
@@ -2075,7 +2082,10 @@ async def _resume_job_internal(job_id: str, *, phase: Optional[str] = None,
                 return {"job_id": job_id, "status": "blocked"}
             raise HTTPException(status_code=503, detail="Previous worker is still running")
 
-        cmd = _build_resume_command(job_id, output_dir, phase)
+        input_path = job.get("input_path")
+        if input_path and not os.path.exists(input_path):
+            input_path = None
+        cmd = _build_resume_command(job_id, output_dir, phase, input_path=input_path)
         env = dict(job.get("env") or os.environ)
         if api_key:
             env["GEMINI_API_KEY"] = api_key
