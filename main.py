@@ -610,11 +610,19 @@ class JobReporter:
             **extra,
         )
 
-    def heartbeat(self, message: Optional[str] = None, *, force: bool = False, **extra):
+    def heartbeat(self, message: Optional[str] = None, *, force: bool = False,
+                  counts_as_work: bool = False, **extra):
         # message stays positional-friendly on purpose: a keyword-only signature
         # here silently broke the keepalive thread for months (TypeError eaten by
         # a bare except), and every long blocking step was then flagged as stalled.
         now = time.time()
+        if counts_as_work:
+            # Byte-level progress (e.g. an unknown-size download) is real work
+            # even though it cannot be expressed as a percentage. Refresh the
+            # operation deadline before the throttle check so the next emitted
+            # event always carries the extended deadline. Plain keepalives must
+            # never pass this flag — a genuinely frozen operation still expires.
+            self._mark_work_activity(now)
         with self._state_lock:
             if not force and now - self.last_heartbeat_at < HEARTBEAT_INTERVAL_SECONDS:
                 return
@@ -1650,7 +1658,20 @@ def _make_ytdlp_progress_hooks():
         total_bytes = data.get("total_bytes") or data.get("total_bytes_estimate") or 0
         downloaded = data.get("downloaded_bytes") or 0
         if not total_bytes:
-            JOB_REPORTER.heartbeat(message="Downloading video...", category="download")
+            # Unknown total size: a percentage is impossible, but received
+            # bytes are real work. Without marking them the download
+            # operation's freeze deadline would kill a healthy long download
+            # after BLOCKING_OPERATION_STALL_SECONDS even though data flows.
+            if downloaded > progress_state.get("last_downloaded_bytes", 0):
+                progress_state["last_downloaded_bytes"] = downloaded
+                JOB_REPORTER.heartbeat(
+                    f"Downloading video... {downloaded / 1_000_000:.1f} MB "
+                    "(total size unknown)",
+                    counts_as_work=True,
+                    category="download",
+                )
+            else:
+                JOB_REPORTER.heartbeat(message="Downloading video...", category="download")
             return
         percent = max(0.0, min(100.0, (downloaded / total_bytes) * 100.0))
         now = time.time()
@@ -2960,7 +2981,7 @@ def _load_render_config(output_dir: str) -> dict:
     return {}
 
 
-def _load_resume_context(resume_dir: str):
+def _load_resume_context(resume_dir: str, fallback_input: Optional[str] = None):
     analysis_input_files = sorted(glob.glob(os.path.join(resume_dir, "*_analysis_input.json")))
     if not analysis_input_files:
         # The job died before the transcript/analysis checkpoints were written
@@ -2976,6 +2997,15 @@ def _load_resume_context(resume_dir: str):
             except Exception:
                 pass
         source_video = _find_source_video(resume_dir, require_audio=bool(source_url))
+        if not source_video and fallback_input and os.path.exists(fallback_input):
+            # Local uploads live outside the job directory (uploads/), so
+            # nothing can be found in resume_dir. The server passes the
+            # persisted upload path back in for exactly this case. ffprobe
+            # returning None means it could not run — keep the file then, the
+            # policy _probe_stream_types documents.
+            streams = _probe_stream_types(fallback_input)
+            if streams is None or "video" in streams:
+                source_video = fallback_input
 
         if not source_video:
             # Job died mid-download (only a .part file left, or nothing at
@@ -3108,7 +3138,7 @@ if __name__ == '__main__':
 
         if args.resume_dir:
             output_dir = _ensure_dir(args.resume_dir)
-            resume_context = _load_resume_context(output_dir)
+            resume_context = _load_resume_context(output_dir, fallback_input=args.input)
             _render_config = _load_render_config(output_dir)
             output_format = normalize_output_format(
                 _render_config.get("output_format") or args.output_format

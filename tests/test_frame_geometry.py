@@ -178,6 +178,27 @@ def test_operation_deadline_moves_only_with_real_work(monkeypatch, tmp_path):
     assert reporter.operation_deadline_at == 1160.0
 
 
+def test_work_heartbeat_extends_deadline_but_keepalive_does_not(monkeypatch, tmp_path):
+    clock = [1000.0]
+    monkeypatch.setattr(main.time, "time", lambda: clock[0])
+    monkeypatch.setattr(main, "JOB_STATS_PATH", str(tmp_path / ".job_stats.json"))
+    reporter = main.JobReporter(job_id="byte-progress")
+
+    reporter.begin_operation("yt-dlp download", timeout_seconds=1800)
+    assert reporter.operation_deadline_at == 2800.0
+
+    # Byte movement in an unknown-size download is real work: the freeze
+    # deadline must move with it.
+    clock[0] = 2000.0
+    reporter.heartbeat("received bytes", force=True, counts_as_work=True)
+    assert reporter.operation_deadline_at == 3800.0
+
+    # The plain keepalive still proves nothing and must not extend anything.
+    clock[0] = 2100.0
+    reporter.heartbeat("Worker alive.", force=True)
+    assert reporter.operation_deadline_at == 3800.0
+
+
 def test_nested_operation_restores_parent_with_fresh_deadline(monkeypatch, tmp_path):
     clock = [1000.0]
     monkeypatch.setattr(main.time, "time", lambda: clock[0])
@@ -302,6 +323,30 @@ def test_ytdlp_hooks_reserve_progress_and_eta_for_merge(monkeypatch):
     assert calls[-1][0] == "finish"
 
 
+def test_ytdlp_unknown_size_download_marks_byte_movement_as_work(monkeypatch):
+    heartbeats = []
+
+    class Reporter:
+        video_duration = None
+
+        def heartbeat(self, message=None, **kwargs):
+            heartbeats.append((message, kwargs))
+
+    monkeypatch.setattr(main, "JOB_REPORTER", Reporter())
+    progress_hook, _ = main._make_ytdlp_progress_hooks()
+
+    # No total size reported: received bytes must count as work so the
+    # download operation's freeze deadline keeps moving.
+    progress_hook({"status": "downloading", "downloaded_bytes": 5_000_000})
+    assert heartbeats[-1][1].get("counts_as_work") is True
+    assert "5.0 MB" in heartbeats[-1][0]
+
+    # Same byte count again means nothing new arrived — that is only a
+    # keepalive and must not extend the deadline.
+    progress_hook({"status": "downloading", "downloaded_bytes": 5_000_000})
+    assert heartbeats[-1][1].get("counts_as_work") is not True
+
+
 def test_resume_source_rejects_yt_dlp_fragments_and_partial_merge(monkeypatch, tmp_path):
     fragment = tmp_path / "Title.f625.mp4"
     partial_merge = tmp_path / "Title.temp.mp4"
@@ -334,6 +379,33 @@ def test_resume_source_rejects_yt_dlp_fragments_and_partial_merge(monkeypatch, t
     assert "Title.temp.mp4" in removed
     assert partial_merge.exists() is False
     assert fragment.exists() is True
+
+
+def test_resume_falls_back_to_persisted_upload_outside_job_dir(monkeypatch, tmp_path):
+    job_dir = tmp_path / "job"
+    job_dir.mkdir()
+    upload = tmp_path / "uploads" / "presentation.mp4"
+    upload.parent.mkdir()
+    upload.write_bytes(b"x")
+    monkeypatch.setattr(main, "_probe_stream_types", lambda path: {"video", "audio"})
+
+    # Local uploads live outside the job directory, so a job that stalled
+    # before its first checkpoint has nothing to find in resume_dir. Without
+    # the fallback that used to fail the whole resume.
+    with pytest.raises(FileNotFoundError):
+        main._load_resume_context(str(job_dir))
+
+    context = main._load_resume_context(str(job_dir), fallback_input=str(upload))
+    assert context["input_video"] == str(upload)
+    assert context["video_title"] == "presentation"
+    assert context["transcript"] is None
+    # Checkpoints of the resumed run must land in the job dir, not in uploads/.
+    assert context["analysis_input_file"].startswith(str(job_dir))
+
+    # A deleted upload must not be resurrected.
+    upload.unlink()
+    with pytest.raises(FileNotFoundError):
+        main._load_resume_context(str(job_dir), fallback_input=str(upload))
 
 
 def test_analysis_learning_subtracts_fixed_overhead_and_serializes_writers(monkeypatch, tmp_path):
