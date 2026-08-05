@@ -93,6 +93,10 @@ GEMINI_SLOW_WARNING_SECONDS = int(os.environ.get("GEMINI_SLOW_WARNING_SECONDS", 
 GEMINI_REQUEST_TIMEOUT_SECONDS = int(os.environ.get("GEMINI_REQUEST_TIMEOUT_SECONDS", "600"))
 GEMINI_MAX_TIMEOUT_SECONDS = int(os.environ.get("GEMINI_MAX_TIMEOUT_SECONDS", "900"))
 GEMINI_REQUEST_TIMEOUT_SECONDS = min(GEMINI_REQUEST_TIMEOUT_SECONDS, GEMINI_MAX_TIMEOUT_SECONDS)
+GEMINI_REQUEST_WATCHDOG_GRACE_SECONDS = max(
+    10,
+    int(os.environ.get("GEMINI_REQUEST_WATCHDOG_GRACE_SECONDS", "30")),
+)
 GEMINI_WINDOW_SECONDS = int(os.environ.get("GEMINI_WINDOW_SECONDS", "90"))
 GEMINI_WINDOW_OVERLAP_SECONDS = int(os.environ.get("GEMINI_WINDOW_OVERLAP_SECONDS", "30"))
 # Analysis model, overridable per task (GEMINI_MODEL_ANALYSIS) or globally (GEMINI_MODEL).
@@ -439,6 +443,15 @@ class JobReporter:
     def operation(self, name: str, *, timeout_seconds: float,
                   expected_seconds: Optional[float] = None,
                   message: Optional[str] = None, **extra):
+        # Blocking operations may contain smaller independently bounded work.
+        # Preserve the parent so completing a child both restores its watchdog
+        # and counts as real progress for the parent's activity deadline.
+        with self._state_lock:
+            parent_operation = (
+                self.operation_name,
+                self.operation_timeout_seconds,
+                self.operation_expected_end_at,
+            )
         self.begin_operation(
             name,
             timeout_seconds=timeout_seconds,
@@ -449,7 +462,23 @@ class JobReporter:
         try:
             yield
         finally:
-            self.finish_operation(**extra)
+            parent_name, parent_timeout_seconds, parent_expected_end_at = parent_operation
+            if parent_name is None or parent_timeout_seconds is None:
+                self.finish_operation(**extra)
+            else:
+                now = time.time()
+                with self._state_lock:
+                    finished_name = self.operation_name
+                    self.operation_name = parent_name
+                    self.operation_timeout_seconds = parent_timeout_seconds
+                    self.operation_deadline_at = now + parent_timeout_seconds
+                    self.operation_expected_end_at = parent_expected_end_at
+                    self.last_work_activity_at = now
+                self.heartbeat(
+                    f"Finished {finished_name}; resumed {parent_name}.",
+                    force=True,
+                    **extra,
+                )
 
     def emit(self, event_type: str, message: Optional[str] = None, **extra):
         if event_type in {"phase", "progress", "resume", "artifact"}:
@@ -793,6 +822,38 @@ def _call_gemini_worker(
     mode, payload, *, output_dir, video_title, strategy, batch_index,
     total_batches, attempt, timeout_seconds=GEMINI_REQUEST_TIMEOUT_SECONDS,
     artifact_suffix=None,
+):
+    request_timeout = max(1.0, float(timeout_seconds))
+    request_name = (
+        f"Gemini {mode} batch {batch_index + 1}/{total_batches} "
+        f"attempt {attempt}"
+    )
+    with JOB_REPORTER.operation(
+        request_name,
+        timeout_seconds=request_timeout + GEMINI_REQUEST_WATCHDOG_GRACE_SECONDS,
+        message=f"Starting {request_name}.",
+        category="gemini",
+        attempt=attempt,
+        batch_index=batch_index + 1,
+        total_batches=total_batches,
+    ):
+        return _run_gemini_worker(
+            mode,
+            payload,
+            output_dir=output_dir,
+            video_title=video_title,
+            strategy=strategy,
+            batch_index=batch_index,
+            total_batches=total_batches,
+            attempt=attempt,
+            timeout_seconds=request_timeout,
+            artifact_suffix=artifact_suffix,
+        )
+
+
+def _run_gemini_worker(
+    mode, payload, *, output_dir, video_title, strategy, batch_index,
+    total_batches, attempt, timeout_seconds, artifact_suffix=None,
 ):
     suffix = f"_{sanitize_filename(str(artifact_suffix))}" if artifact_suffix else ""
     artifact_stem = f"{video_title}_{mode}_batch_{batch_index + 1}{suffix}_attempt_{attempt}"

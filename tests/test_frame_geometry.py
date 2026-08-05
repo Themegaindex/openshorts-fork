@@ -178,6 +178,84 @@ def test_operation_deadline_moves_only_with_real_work(monkeypatch, tmp_path):
     assert reporter.operation_deadline_at == 1160.0
 
 
+def test_nested_operation_restores_parent_with_fresh_deadline(monkeypatch, tmp_path):
+    clock = [1000.0]
+    monkeypatch.setattr(main.time, "time", lambda: clock[0])
+    monkeypatch.setattr(main, "JOB_STATS_PATH", str(tmp_path / ".job_stats.json"))
+    reporter = main.JobReporter(job_id="nested-watchdog")
+
+    reporter.begin_operation("Gemini analysis", timeout_seconds=1800)
+    assert reporter.operation_deadline_at == 2800.0
+
+    clock[0] = 1500.0
+    with pytest.raises(TimeoutError):
+        with reporter.operation("Gemini score attempt", timeout_seconds=630):
+            assert reporter.operation_name == "Gemini score attempt"
+            assert reporter.operation_deadline_at == 2130.0
+
+            clock[0] = 2100.0
+            reporter.heartbeat("keepalive", force=True)
+            assert reporter.operation_deadline_at == 2130.0
+            raise TimeoutError("request timed out")
+
+    assert reporter.operation_name == "Gemini analysis"
+    assert reporter.operation_timeout_seconds == 1800.0
+    assert reporter.operation_deadline_at == 3900.0
+    assert reporter.last_work_activity_at == 2100.0
+
+
+def test_gemini_worker_has_request_scoped_watchdog(monkeypatch):
+    operations = []
+    worker_calls = []
+
+    class Operation:
+        def __enter__(self):
+            operations[-1]["entered"] = True
+
+        def __exit__(self, exc_type, exc_value, traceback):
+            operations[-1]["exited"] = True
+
+    class Reporter:
+        def operation(self, name, **kwargs):
+            operations.append({"name": name, **kwargs})
+            return Operation()
+
+    def fake_worker(mode, payload, **kwargs):
+        worker_calls.append((mode, payload, kwargs))
+        return {"payload": {"windows": []}}
+
+    monkeypatch.setattr(main, "JOB_REPORTER", Reporter())
+    monkeypatch.setattr(main, "_run_gemini_worker", fake_worker)
+
+    result = main._call_gemini_worker(
+        "score",
+        {"windows": []},
+        output_dir=".",
+        video_title="watchdog",
+        strategy="structured-schema",
+        batch_index=1,
+        total_batches=3,
+        attempt=2,
+        timeout_seconds=123,
+        artifact_suffix="rescue_window_1",
+    )
+
+    assert result == {"payload": {"windows": []}}
+    assert operations == [{
+        "name": "Gemini score batch 2/3 attempt 2",
+        "timeout_seconds": 123 + main.GEMINI_REQUEST_WATCHDOG_GRACE_SECONDS,
+        "message": "Starting Gemini score batch 2/3 attempt 2.",
+        "category": "gemini",
+        "attempt": 2,
+        "batch_index": 2,
+        "total_batches": 3,
+        "entered": True,
+        "exited": True,
+    }]
+    assert worker_calls[0][2]["timeout_seconds"] == 123.0
+    assert worker_calls[0][2]["artifact_suffix"] == "rescue_window_1"
+
+
 def test_ytdlp_hooks_reserve_progress_and_eta_for_merge(monkeypatch):
     calls = []
 
