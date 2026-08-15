@@ -30,3 +30,5 @@ The workflows use HTML comments in PR comments to enforce bounded loops:
 - `<!-- claude-diagram-review:pass sha=FULL_SHA -->`
 
 Do not invent, delete, or rewrite these markers. At most two CI-fix rounds and two reviewer-fix rounds are allowed for a PR.
+
+<!-- Draft-only Claude gate smoke test; never merge this marker. -->
