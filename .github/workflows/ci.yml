@@ -46,6 +46,15 @@ jobs:
       - name: Build
         run: npm run build
 
+  workflows-lint:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v6
+      - name: Check GitHub Actions workflows
+        uses: docker://rhysd/actionlint:1.7.12
+        with:
+          args: -color
+
   docker-build:
     runs-on: ubuntu-latest
     steps:

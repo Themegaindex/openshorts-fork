@@ -37,22 +37,22 @@ jobs:
         uses: actions/setup-python@v6
         with:
           python-version: "3.11"
-          cache: pip
-          cache-dependency-path: requirements-test.txt
 
       - name: Set up Node.js
         uses: actions/setup-node@v5
         with:
           node-version: "20"
-          cache: npm
-          cache-dependency-path: dashboard/package-lock.json
 
-      - name: Prepare test dependencies
+      - name: Prepare backend test dependencies
+        id: backend-deps
         continue-on-error: true
-        shell: bash
-        run: |
-          python -m pip install -r requirements-test.txt
-          npm --prefix dashboard ci
+        run: python -m pip install -r requirements-test.txt
+
+      - name: Prepare frontend dependencies
+        id: frontend-deps
+        continue-on-error: true
+        working-directory: dashboard
+        run: npm ci
 
       - name: Diagnose and fix CI with Claude
         id: claude
@@ -66,6 +66,8 @@ jobs:
             Failed CI run ID: ${{ github.event.workflow_run.id }}
             Head branch: ${{ github.event.workflow_run.head_branch }}
             Head SHA: ${{ github.event.workflow_run.head_sha }}
+            Backend dependency setup: ${{ steps.backend-deps.outcome }}
+            Frontend dependency setup: ${{ steps.frontend-deps.outcome }}
           base_branch: ${{ github.event.workflow_run.head_branch }}
           branch_prefix: "claude/ci-fix-"
           branch_name_template: "{{prefix}}{{entityNumber}}-{{timestamp}}"

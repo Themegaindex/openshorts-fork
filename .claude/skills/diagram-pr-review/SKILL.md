@@ -6,7 +6,8 @@ allowed-tools: Read, Write, Edit, Glob, Grep, Agent, Bash(gh pr diff:*), Bash(gh
 
 # Post-CI review gate
 
-The prompt supplies the repository, PR number, head branch, and head SHA. CI is already green for that SHA.
+The prompt supplies the repository, PR number, head branch, head SHA, and the
+backend/frontend dependency setup outcomes. CI is already green for that SHA.
 
 1. Read `CLAUDE.md`, `AGENTS.md`, the PR title/body/comments, and the complete diff.
 2. Skip closed, draft, empty, or already-passed PRs. A pass is current only when `<!-- claude-diagram-review:pass sha=HEAD_SHA -->` matches the supplied full SHA.
@@ -15,7 +16,7 @@ The prompt supplies the repository, PR number, head branch, and head SHA. CI is 
    - **Security reviewer:** trust boundaries, injection, secrets, permissions, unsafe files/URLs/subprocesses, races, cleanup, and resource exhaustion.
    - **Repository reviewer:** `CLAUDE.md`/`AGENTS.md` compliance, API compatibility, CI coverage, and maintainability defects that can cause concrete failures.
 4. Require every proposed finding to identify changed file/line evidence, a concrete failure path, severity, and a minimal fix. Ignore style, speculation, linter findings, and pre-existing defects.
-5. Validate every candidate against the actual changed code. Deduplicate overlapping findings. Keep only confirmed, high-confidence defects introduced by the PR.
+5. Validate every candidate against the actual changed code. Deduplicate overlapping findings. Keep only confirmed, high-confidence defects introduced by the PR. Use the dependency setup outcomes when judging which local validations were available; if one failed, retry that install once and do not turn an infrastructure-only failure into a PR finding or fix round.
 6. If no confirmed defects remain:
    - post one concise German PR comment containing `<!-- claude-diagram-review:pass sha=HEAD_SHA -->`, replacing `HEAD_SHA` with the supplied full commit SHA;
    - state that the three reviewer lanes passed;
