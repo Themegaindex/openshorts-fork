@@ -1,0 +1,102 @@
+name: Claude CI Fix
+
+on:
+  workflow_run:
+    workflows: ["CI"]
+    types: [completed]
+
+concurrency:
+  group: claude-ci-fix-${{ github.event.workflow_run.head_branch }}
+  cancel-in-progress: false
+
+permissions:
+  contents: write
+  pull-requests: write
+  issues: write
+  actions: read
+  id-token: write
+
+jobs:
+  fix:
+    if: >-
+      github.event.workflow_run.conclusion == 'failure' &&
+      github.event.workflow_run.event == 'pull_request' &&
+      github.event.workflow_run.pull_requests[0] &&
+      github.event.workflow_run.head_repository.full_name == github.repository
+    runs-on: ubuntu-latest
+    timeout-minutes: 60
+
+    steps:
+      - name: Checkout failed PR branch
+        uses: actions/checkout@v6
+        with:
+          ref: ${{ github.event.workflow_run.head_branch }}
+          fetch-depth: 0
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+          cache: pip
+          cache-dependency-path: requirements-test.txt
+
+      - name: Set up Node.js
+        uses: actions/setup-node@v4
+        with:
+          node-version: "20"
+          cache: npm
+          cache-dependency-path: dashboard/package-lock.json
+
+      - name: Prepare test dependencies
+        continue-on-error: true
+        shell: bash
+        run: |
+          python -m pip install -r requirements-test.txt
+          npm --prefix dashboard ci
+
+      - name: Diagnose and fix CI with Claude
+        id: claude
+        uses: anthropics/claude-code-action@v1
+        with:
+          claude_code_oauth_token: ${{ secrets.CLAUDE_CODE_OAUTH_TOKEN }}
+          prompt: |
+            /fix-ci
+            Repository: ${{ github.repository }}
+            PR number: ${{ github.event.workflow_run.pull_requests[0].number }}
+            Failed CI run ID: ${{ github.event.workflow_run.id }}
+            Head branch: ${{ github.event.workflow_run.head_branch }}
+            Head SHA: ${{ github.event.workflow_run.head_sha }}
+          base_branch: ${{ github.event.workflow_run.head_branch }}
+          branch_prefix: "claude/ci-fix-"
+          branch_name_template: "{{prefix}}{{entityNumber}}-{{timestamp}}"
+          allowed_bots: "claude[bot]"
+          use_commit_signing: true
+          additional_permissions: |
+            actions: read
+          claude_args: >-
+            --allowedTools
+            "Read,Write,Edit,Glob,Grep,Agent,Bash(gh run view:*),Bash(gh pr view:*),Bash(gh pr comment:*),Bash(git:*),Bash(python:*),Bash(pytest:*),Bash(pip:*),Bash(npm:*),Bash(npx:*)"
+
+      - name: Push verified fix back to the PR branch
+        if: steps.claude.outputs.branch_name != ''
+        env:
+          GH_TOKEN: ${{ steps.claude.outputs.github_token }}
+          RESULT_BRANCH: ${{ steps.claude.outputs.branch_name }}
+          HEAD_BRANCH: ${{ github.event.workflow_run.head_branch }}
+        shell: bash
+        run: |
+          if ! git ls-remote --exit-code origin "refs/heads/${RESULT_BRANCH}" >/dev/null 2>&1; then
+            echo "No remote fix branch was created."
+            exit 0
+          fi
+
+          git fetch origin "${RESULT_BRANCH}" "${HEAD_BRANCH}"
+          RESULT_SHA=$(git rev-parse "origin/${RESULT_BRANCH}")
+          HEAD_SHA=$(git rev-parse "origin/${HEAD_BRANCH}")
+          if [ "${RESULT_SHA}" = "${HEAD_SHA}" ]; then
+            echo "Claude made no code change."
+            exit 0
+          fi
+
+          gh auth setup-git
+          git push origin "${RESULT_SHA}:refs/heads/${HEAD_BRANCH}"

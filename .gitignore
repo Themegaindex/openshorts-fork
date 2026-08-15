@@ -33,10 +33,9 @@ output/
 # Cache dirs
 .cache/
 .config/
-# Multi-agent Skills
+# Local agent state
 .agents/
 .agent/
-.claude/
 skills/
 skills-lock.json
 
@@ -52,8 +51,11 @@ cookies.txt
 .phase_stats.json
 Planundfixes.md
 
-# Local AI dev instructions (not published)
-CLAUDE.md
+# Repository-owned Claude instructions and skills are intentionally published
+# so GitHub Actions can load the issue and review workflows.
+!.claude/
+!.claude/skills/
+!.claude/skills/**
 
 # Personal branding assets (configured via WATERMARK_IMAGE in .env)
 logo.png
