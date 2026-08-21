@@ -3021,6 +3021,37 @@ async def download_all_clips(job_id: str):
     )
 
 
+@app.get("/api/jobs/{job_id}/clips/{clip_index}/download")
+async def download_clip(job_id: str, clip_index: int):
+    """Stream the current clip version as an attachment without browser buffering."""
+    job = _get_job(job_id)
+    result = (job or {}).get("result")
+    clips = result.get("clips") if isinstance(result, dict) else None
+    if not isinstance(clips, list) or not 0 <= clip_index < len(clips):
+        raise HTTPException(status_code=404, detail="Clip not found")
+
+    clip = clips[clip_index]
+    if not isinstance(clip, dict):
+        raise HTTPException(status_code=404, detail="Clip not found")
+    candidate = clip.get("video_url") or clip.get("output_filename")
+    filename = os.path.basename(str(candidate or "").split("?", 1)[0])
+    if not filename:
+        raise HTTPException(status_code=404, detail="Clip file not found")
+
+    output_dir = os.path.realpath(
+        (job or {}).get("output_dir") or os.path.join(OUTPUT_DIR, job_id)
+    )
+    path = os.path.realpath(os.path.join(output_dir, filename))
+    try:
+        inside_output_dir = os.path.commonpath([output_dir, path]) == output_dir
+    except ValueError:
+        inside_output_dir = False
+    if not inside_output_dir or not os.path.isfile(path) or os.path.getsize(path) <= 0:
+        raise HTTPException(status_code=404, detail="Clip file not found")
+
+    return FileResponse(path, media_type="video/mp4", filename=filename)
+
+
 class HookRequest(BaseModel):
     job_id: str
     clip_index: int = Field(ge=0)

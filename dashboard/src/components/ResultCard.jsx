@@ -352,25 +352,18 @@ export default function ResultCard({ clip, index, jobId, uploadPostKey, uploadUs
         }
     };
 
-    const handleDownload = async (event) => {
+    const handleDownload = (event) => {
         event.preventDefault();
-        try {
-            const response = await fetch(currentVideoUrl);
-            if (!response.ok) throw new Error('Download failed');
-            const blob = await response.blob();
-            const url = window.URL.createObjectURL(blob);
-            const anchor = document.createElement('a');
-            anchor.style.display = 'none';
-            anchor.href = url;
-            anchor.download = isLong ? 'long-video.mp4' : `clip-${index + 1}.mp4`;
-            document.body.appendChild(anchor);
-            anchor.click();
-            window.URL.revokeObjectURL(url);
-            document.body.removeChild(anchor);
-        } catch (error) {
-            console.error('Download error:', error);
-            window.open(currentVideoUrl, '_blank');
-        }
+        const downloadUrl = jobId
+            ? getApiUrl(`/api/jobs/${encodeURIComponent(jobId)}/clips/${index}/download`)
+            : currentVideoUrl;
+        const anchor = document.createElement('a');
+        anchor.style.display = 'none';
+        anchor.href = downloadUrl;
+        anchor.download = isLong ? 'long-video.mp4' : `clip-${index + 1}.mp4`;
+        document.body.appendChild(anchor);
+        anchor.click();
+        document.body.removeChild(anchor);
     };
 
     return (

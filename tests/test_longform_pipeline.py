@@ -1,6 +1,7 @@
 from contextlib import contextmanager
 import json
 import os
+from pathlib import Path
 
 import pytest
 
@@ -233,3 +234,19 @@ def test_auto_threshold_considers_nine_minute_sources():
     target_min, target_max, _warnings = main._longform_target_range(9 * 60)
     assert target_min == 480
     assert target_max == 540
+
+
+def test_explicit_long_source_is_rejected_before_transcription():
+    with pytest.raises(RuntimeError, match="needs at least"):
+        main._validate_longform_source_duration(
+            "long", main.LONGFORM_HARD_MIN_SOURCE_SECONDS - 1,
+        )
+
+    main._validate_longform_source_duration("auto", 1)
+    source = Path(main.__file__).read_text(encoding="utf-8")
+    cli_start = source.index("if __name__ == '__main__':")
+    early_guard = source.index(
+        "_validate_longform_source_duration(video_type, duration)", cli_start,
+    )
+    transcription = source.index("transcript = transcribe_video(input_video, duration)", cli_start)
+    assert early_guard < transcription

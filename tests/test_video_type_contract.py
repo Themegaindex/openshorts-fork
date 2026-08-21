@@ -1,6 +1,7 @@
 import asyncio
 import json
 import os
+from pathlib import Path
 import zipfile
 
 import pytest
@@ -98,6 +99,33 @@ def test_download_all_uses_output_filename_for_untouched_short_and_long(monkeypa
 
     with zipfile.ZipFile(response.path) as archive:
         assert archive.namelist() == ["clip_01_short.mp4", "long_01_long.mp4"]
+
+
+def test_single_clip_download_streams_the_current_long_file(monkeypatch, tmp_path):
+    job_id = "download-long"
+    output_dir = tmp_path / job_id
+    output_dir.mkdir()
+    video_path = output_dir / "long.mp4"
+    video_path.write_bytes(b"long video")
+    monkeypatch.setattr(app, "jobs", {
+        job_id: {
+            "output_dir": str(output_dir),
+            "result": {"clips": [{
+                "video_url": f"/videos/{job_id}/long.mp4",
+                "video_type": "long",
+            }]},
+        },
+    })
+
+    response = asyncio.run(app.download_clip(job_id, 0))
+
+    assert response.path == str(video_path)
+    assert response.headers["content-disposition"].startswith("attachment;")
+    result_card = (
+        Path(__file__).parents[1] / "dashboard" / "src" / "components" / "ResultCard.jsx"
+    ).read_text(encoding="utf-8")
+    assert "response.blob()" not in result_card
+    assert "/clips/${index}/download" in result_card
 
 
 def test_social_post_rejects_long_before_vendor_request(monkeypatch):

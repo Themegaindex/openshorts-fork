@@ -2974,6 +2974,14 @@ def _longform_target_range(video_duration):
     return round(target_min, 3), round(target_max, 3), warnings
 
 
+def _validate_longform_source_duration(video_type, duration):
+    if video_type == "long" and float(duration) < LONGFORM_HARD_MIN_SOURCE_SECONDS:
+        raise RuntimeError(
+            f"Long Video needs at least {int(LONGFORM_HARD_MIN_SOURCE_SECONDS)} seconds of source material "
+            f"(received {int(duration)}s)."
+        )
+
+
 def _longform_analysis_coverage(windows, scored_windows, skipped_score_ids, *, plan_attempted):
     scored_ids = {str(item.get("id")) for item in scored_windows or []}
     return {
@@ -3653,11 +3661,7 @@ def _run_video_type_pipeline(
 ):
     del source_url  # Source provenance already lives in analysis_input.json.
     JOB_REPORTER.stats_excluded_phases = {"analyze", "render"}
-    if video_type == "long" and duration < LONGFORM_HARD_MIN_SOURCE_SECONDS:
-        raise RuntimeError(
-            f"Long Video needs at least {int(LONGFORM_HARD_MIN_SOURCE_SECONDS)} seconds of source material "
-            f"(received {int(duration)}s)."
-        )
+    _validate_longform_source_duration(video_type, duration)
 
     shorts_data = None
     long_result = None
@@ -4202,6 +4206,13 @@ if __name__ == '__main__':
         reporter.artifact("source_video", input_video, message=f"Source video ready: {input_video}")
         duration = duration or _get_video_duration(input_video)
         reporter.emit("heartbeat", message="Source video loaded.", video_duration_seconds=round(float(duration), 3), important=False)
+
+        # Explicit Long mode can never produce a valid result below the hard
+        # source minimum. Reject it immediately after probing so Whisper is
+        # not run for a job that is guaranteed to fail. --skip-analysis keeps
+        # its documented precedence and still renders the complete source.
+        if not args.skip_analysis:
+            _validate_longform_source_duration(video_type, duration)
 
         transcript_file = os.path.join(output_dir, f"{video_title}_transcript.json")
         words_file = os.path.join(output_dir, f"{video_title}_words.json")
