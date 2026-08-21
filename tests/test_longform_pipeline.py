@@ -26,7 +26,9 @@ def _stub_missing_pipeline_dependencies():
     if missing("cv2"):
         sys.modules["cv2"] = MagicMock()
     if missing("numpy"):
-        sys.modules["numpy"] = MagicMock()
+        numpy_stub = ModuleType("numpy")
+        numpy_stub._openshorts_test_stub = True
+        sys.modules["numpy"] = numpy_stub
     if missing("torch"):
         torch_stub = ModuleType("torch")
         torch_stub.cuda = SimpleNamespace(is_available=lambda: False)
@@ -98,6 +100,12 @@ def _stub_missing_pipeline_dependencies():
 _stub_missing_pipeline_dependencies()
 
 import main
+
+# pytest itself probes an imported numpy module when evaluating approx(). The
+# pipeline keeps its direct module reference, while removing only our stub here
+# prevents that optional-dependency probe from mistaking a test double for numpy.
+if getattr(sys.modules.get("numpy"), "_openshorts_test_stub", False):
+    sys.modules.pop("numpy", None)
 
 
 class _Reporter:
