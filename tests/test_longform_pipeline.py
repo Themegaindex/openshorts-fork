@@ -123,6 +123,44 @@ def test_score_fallback_does_not_pad_with_unscored_windows():
     assert plan is None
 
 
+def test_score_stage_recovers_every_window_omitted_by_a_batch(monkeypatch):
+    reporter = _Reporter()
+    monkeypatch.setattr(main, "JOB_REPORTER", reporter)
+    windows = [
+        {"id": f"window_{index:03d}", "start": index * 60, "end": (index + 1) * 60, "text": "text"}
+        for index in range(9)
+    ]
+
+    def fake_worker(_mode, payload, **_kwargs):
+        batch = payload["windows"]
+        returned = batch if len(batch) == 1 else batch[:3]
+        return {
+            "payload": {
+                "windows": [{
+                    "id": item["id"],
+                    "start": item["start"] + 5,
+                    "end": item["end"] - 5,
+                    "score": 50,
+                    "reason": "scored",
+                } for item in returned],
+            },
+        }
+
+    monkeypatch.setattr(main, "_call_gemini_worker", fake_worker)
+
+    scores, processed, skipped, attempts, _costs = main._run_score_stage(
+        windows, "en", 540, None, None,
+    )
+
+    assert [item["id"] for item in scores] == [item["id"] for item in windows]
+    assert [(item["start"], item["end"]) for item in scores] == [
+        (item["start"], item["end"]) for item in windows
+    ]
+    assert processed == {item["id"] for item in windows}
+    assert skipped == set()
+    assert sum(item["name"] == "single-window-rescue" for item in attempts) == 5
+
+
 def test_longform_resume_reuses_valid_checkpoint_without_gemini(monkeypatch, tmp_path):
     reporter = _Reporter()
     monkeypatch.setattr(main, "JOB_REPORTER", reporter)

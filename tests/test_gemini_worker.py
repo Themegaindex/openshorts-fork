@@ -3,6 +3,12 @@ from types import SimpleNamespace
 import gemini_worker
 
 
+def test_score_prompt_requires_a_score_for_every_window():
+    assert "Score every candidate window" in gemini_worker.SCORE_PROMPT_TEMPLATE
+    assert "exactly one entry for every input window" in gemini_worker.SCORE_PROMPT_TEMPLATE
+    assert "up to 3 windows" not in gemini_worker.SCORE_PROMPT_TEMPLATE
+
+
 def test_empty_response_diagnostics_preserve_block_and_finish_reasons():
     response = SimpleNamespace(
         prompt_feedback=SimpleNamespace(

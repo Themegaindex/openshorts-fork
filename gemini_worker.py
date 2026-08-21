@@ -86,11 +86,12 @@ def _log(message: str) -> None:
 
 SCORE_PROMPT_TEMPLATE = """
 You are a senior short-form video strategist.
-Select the MOST viral candidate windows from this batch.
+Score every candidate window in this batch.
 
 Rules:
 - Return only valid JSON.
-- Choose up to 3 windows from this batch.
+- Return exactly one entry for every input window, preserving its `id`, `start`,
+  and `end`. Never omit weak windows; give them a low score instead.
 - `score` must be an integer from 0 to 100.
 - THE 2-SECOND TEST is the main criterion: would the first 2 seconds of this
   moment force a cold viewer (no context) to keep watching? Windows that only

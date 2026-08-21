@@ -876,6 +876,36 @@ def _normalize_scored_windows(payload, video_duration):
     return normalized
 
 
+def _align_scores_to_input_windows(scored_windows, input_windows):
+    """Keep one score per known input id and restore authoritative boundaries."""
+    expected = {
+        str(window.get("id")): window
+        for window in input_windows
+        if str(window.get("id") or "")
+    }
+    by_id = {}
+    for item in sorted(scored_windows, key=lambda candidate: candidate.get("score", 0), reverse=True):
+        window_id = str(item.get("id") or "")
+        if window_id in expected and window_id not in by_id:
+            by_id[window_id] = item
+
+    aligned = []
+    missing = []
+    for window in input_windows:
+        window_id = str(window.get("id") or "")
+        score = by_id.get(window_id)
+        if score is None:
+            missing.append(window)
+            continue
+        aligned.append({
+            **score,
+            "id": window_id,
+            "start": round(float(window.get("start", 0.0)), 3),
+            "end": round(float(window.get("end", 0.0)), 3),
+        })
+    return aligned, missing
+
+
 class GeminiWorkerError(RuntimeError):
     def __init__(self, message, result=None):
         super().__init__(message)
@@ -2589,6 +2619,54 @@ def _run_score_stage(windows, transcript_language, video_duration, output_dir, v
     skipped_score_ids = set()
     total_score_batches = max(1, math.ceil(len(windows) / GEMINI_SCORE_BATCH_SIZE))
 
+    def rescue_missing_scores(batch_index, missing_windows):
+        if not missing_windows:
+            return
+        rescued, failed_ids, rescue_costs, rescue_attempts = _rescue_gemini_windows(
+            "score",
+            missing_windows,
+            video_duration=video_duration,
+            language=transcript_language,
+            output_dir=output_dir,
+            video_title=video_title,
+            batch_index=batch_index,
+            total_batches=total_score_batches,
+        )
+        all_costs.extend(rescue_costs)
+        attempts.extend(rescue_attempts)
+        for window, worker_result in rescued:
+            window_id = str(window.get("id"))
+            try:
+                normalized_scores = _normalize_scored_windows(
+                    worker_result.get("payload", {}), video_duration,
+                )
+                aligned_scores, still_missing = _align_scores_to_input_windows(
+                    normalized_scores, [window],
+                )
+            except Exception as exc:
+                failed_ids.append(window_id)
+                JOB_REPORTER.warning(
+                    f"Rescued score window {window_id} returned invalid data: {exc}",
+                    category="gemini",
+                )
+                continue
+            if still_missing:
+                failed_ids.append(window_id)
+                JOB_REPORTER.warning(
+                    f"Rescued score window {window_id} was omitted from Gemini's response.",
+                    category="gemini",
+                )
+                continue
+            scored_windows.extend(aligned_scores)
+            scored_input_ids.add(window_id)
+        skipped_score_ids.update(failed_ids)
+        if failed_ids:
+            JOB_REPORTER.warning(
+                f"Score coverage incomplete: {len(set(failed_ids))} individual window(s) still failed "
+                f"in batch {batch_index + 1}.",
+                category="gemini",
+            )
+
     for batch_index, batch_windows in _iter_batches(windows, GEMINI_SCORE_BATCH_SIZE):
         JOB_REPORTER.progress(
             (batch_index / max(total_score_batches, 1)) * 45.0,
@@ -2655,46 +2733,24 @@ def _run_score_stage(windows, transcript_language, video_duration, output_dir, v
                     time.sleep(min(10.0, float(2 ** attempt_number)))
 
         if batch_result is not None:
-            scored_input_ids.update(str(window.get("id")) for window in batch_windows)
-            scored_windows.extend(batch_result)
+            aligned_scores, missing_windows = _align_scores_to_input_windows(
+                batch_result, batch_windows,
+            )
+            scored_windows.extend(aligned_scores)
+            scored_input_ids.update(str(item.get("id")) for item in aligned_scores)
+            if missing_windows:
+                JOB_REPORTER.warning(
+                    f"Gemini omitted {len(missing_windows)} score window(s) in batch {batch_index + 1}; "
+                    "recovering them individually.",
+                    category="gemini",
+                )
+                rescue_missing_scores(batch_index, missing_windows)
         elif last_error_type in RESCUABLE_GEMINI_ERROR_TYPES:
             JOB_REPORTER.warning(
                 f"Recovering score batch {batch_index + 1}/{total_score_batches} one window at a time.",
                 category="gemini",
             )
-            rescued, failed_ids, rescue_costs, rescue_attempts = _rescue_gemini_windows(
-                "score",
-                batch_windows,
-                video_duration=video_duration,
-                language=transcript_language,
-                output_dir=output_dir,
-                video_title=video_title,
-                batch_index=batch_index,
-                total_batches=total_score_batches,
-            )
-            all_costs.extend(rescue_costs)
-            attempts.extend(rescue_attempts)
-            for window, worker_result in rescued:
-                window_id = str(window.get("id"))
-                try:
-                    normalized_scores = _normalize_scored_windows(
-                        worker_result.get("payload", {}), video_duration,
-                    )
-                except Exception as exc:
-                    failed_ids.append(window_id)
-                    JOB_REPORTER.warning(
-                        f"Rescued score window {window_id} returned invalid data: {exc}",
-                        category="gemini",
-                    )
-                    continue
-                scored_windows.extend(normalized_scores)
-                scored_input_ids.add(window_id)
-            skipped_score_ids.update(failed_ids)
-            if failed_ids:
-                JOB_REPORTER.warning(
-                    f"Score coverage incomplete: {len(failed_ids)} individual window(s) still failed in batch {batch_index + 1}.",
-                    category="gemini",
-                )
+            rescue_missing_scores(batch_index, batch_windows)
         elif last_error:
             skipped_score_ids.update(str(window.get("id")) for window in batch_windows)
             JOB_REPORTER.warning(
