@@ -1,0 +1,99 @@
+name: Claude Issue Fix
+
+on:
+  issues:
+    types: [opened, reopened]
+
+concurrency:
+  group: claude-issue-${{ github.event.issue.number }}
+  cancel-in-progress: false
+
+permissions:
+  contents: write
+  pull-requests: write
+  issues: write
+  actions: read
+  id-token: write
+
+jobs:
+  fix:
+    if: >-
+      contains(fromJSON('["OWNER","MEMBER","COLLABORATOR"]'),
+      github.event.issue.author_association)
+    runs-on: ubuntu-latest
+    timeout-minutes: 60
+
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v6
+        with:
+          fetch-depth: 0
+
+      - name: Set up Python
+        uses: actions/setup-python@v6
+        with:
+          python-version: "3.11"
+
+      - name: Set up Node.js
+        uses: actions/setup-node@v5
+        with:
+          node-version: "20"
+
+      - name: Prepare backend test dependencies
+        id: backend-deps
+        continue-on-error: true
+        run: python -m pip install -r requirements-test.txt
+
+      - name: Prepare frontend dependencies
+        id: frontend-deps
+        continue-on-error: true
+        working-directory: dashboard
+        run: npm ci
+
+      - name: Reproduce and fix issue with Claude
+        id: claude
+        uses: anthropics/claude-code-action@v1
+        with:
+          claude_code_oauth_token: ${{ secrets.CLAUDE_CODE_OAUTH_TOKEN }}
+          prompt: |
+            /issue-fix
+            Repository: ${{ github.repository }}
+            Issue number: ${{ github.event.issue.number }}
+            Backend dependency setup: ${{ steps.backend-deps.outcome }}
+            Frontend dependency setup: ${{ steps.frontend-deps.outcome }}
+          branch_prefix: "claude/issue-"
+          branch_name_template: "{{prefix}}{{entityNumber}}-{{description}}"
+          track_progress: true
+          use_commit_signing: true
+          additional_permissions: |
+            actions: read
+          claude_args: >-
+            --allowedTools
+            "Read,Write,Edit,Glob,Grep,Agent,Bash(gh issue view:*),Bash(gh issue comment:*),Bash(git:*),Bash(python:*),Bash(pytest:*),Bash(pip:*),Bash(npm:*),Bash(npx:*)"
+
+      - name: Open pull request for the issue fix
+        if: steps.claude.outputs.branch_name != ''
+        env:
+          GH_TOKEN: ${{ steps.claude.outputs.github_token }}
+          FIX_BRANCH: ${{ steps.claude.outputs.branch_name }}
+          ISSUE_NUMBER: ${{ github.event.issue.number }}
+          ISSUE_TITLE: ${{ github.event.issue.title }}
+        shell: bash
+        run: |
+          if ! git ls-remote --exit-code origin "refs/heads/${FIX_BRANCH}" >/dev/null 2>&1; then
+            echo "Claude produced no pushed change branch."
+            exit 0
+          fi
+
+          EXISTING_PR=$(gh pr list --head "${FIX_BRANCH}" --state open --json number --jq '.[0].number // empty')
+          if [ -n "${EXISTING_PR}" ]; then
+            echo "Pull request #${EXISTING_PR} already exists."
+            exit 0
+          fi
+
+          PR_BODY=$(printf 'Automatischer Claude-Fix für #%s.\n\nCloses #%s\n\nDer PR muss die vollständige CI-, Claude- und Codex-Prüfkette durchlaufen.' "${ISSUE_NUMBER}" "${ISSUE_NUMBER}")
+          gh pr create \
+            --base "${{ github.event.repository.default_branch }}" \
+            --head "${FIX_BRANCH}" \
+            --title "fix: ${ISSUE_TITLE}" \
+            --body "${PR_BODY}"

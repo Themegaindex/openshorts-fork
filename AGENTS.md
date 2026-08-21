@@ -100,3 +100,30 @@ Async job queue with semaphore-based concurrency control. Configure via `MAX_CON
 - **Frontend:** React 18, Vite 4, Tailwind CSS 3.4
 - **External APIs:** Google Gemini, ElevenLabs Dubbing, Upload-Post
 - **Infrastructure:** Docker + Docker Compose, AWS S3
+
+## Automated Issue and Pull Request Flow
+
+Follow this repository workflow when reviewing or fixing changes:
+
+1. Reproduce the GitHub issue and record the clean baseline.
+2. Implement the smallest complete fix and add a regression test.
+3. Require backend tests, frontend lint/build, and Docker builds to pass in CI.
+4. After green CI, run three independent reviewers in parallel:
+   - correctness, regressions, edge cases, and tests;
+   - security, concurrency, resource handling, and secrets;
+   - repository-rule compliance and maintainability risks.
+5. Validate and deduplicate all findings before changing code.
+6. Allow at most two automated review/fix rounds. Every code change must return through CI.
+7. After Claude reports no confirmed findings, run Codex Code Review and Security Review.
+8. Never merge automatically. The protected `main` branch and final CI decide whether the PR is mergeable.
+
+## Code Review Rules
+
+- Report only concrete bugs or security problems introduced by the pull request.
+- Require a specific file and line reference plus a reproducible failure path for every finding.
+- Ignore formatting that ESLint already enforces and avoid subjective style comments.
+- Distinguish new regressions from pre-existing problems.
+- Check input validation, path and command injection, authentication, authorization, secret exposure, unsafe file handling, race conditions, cleanup, and unbounded resource use.
+- Treat media uploads, URLs, filenames, subprocess arguments, FFmpeg filters, and external API responses as untrusted input.
+- Require regression tests for fixes whenever a deterministic test is practical.
+- Focus Codex review comments on P0 and P1 findings.
