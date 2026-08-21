@@ -2761,14 +2761,36 @@ def _run_score_stage(windows, transcript_language, video_duration, output_dir, v
     return scored_windows, scored_input_ids, skipped_score_ids, attempts, all_costs
 
 
-def get_viral_clips(transcript_result, video_duration, output_dir=None, video_title=None):
+def _report_shorts_analysis_failure(error_message, *, defer_terminal_error=False):
+    """Report a Shorts failure without prematurely failing an Auto job."""
+    if defer_terminal_error:
+        JOB_REPORTER.warning(
+            error_message,
+            category="analyze",
+            recoverable=True,
+        )
+    else:
+        JOB_REPORTER.error(error_message)
+
+
+def get_viral_clips(
+    transcript_result,
+    video_duration,
+    output_dir=None,
+    video_title=None,
+    *,
+    defer_terminal_error=False,
+):
     print("🤖  Analyzing with Gemini...")
 
     api_key = os.getenv("GEMINI_API_KEY")
     if not api_key:
         error_message = "GEMINI_API_KEY not found in environment variables."
         print(f"❌ Error: {error_message}")
-        JOB_REPORTER.error(error_message)
+        _report_shorts_analysis_failure(
+            error_message,
+            defer_terminal_error=defer_terminal_error,
+        )
         return {
             "clips_data": None,
             "error": error_message,
@@ -2779,7 +2801,10 @@ def get_viral_clips(transcript_result, video_duration, output_dir=None, video_ti
     if not os.path.exists(GEMINI_WORKER_SCRIPT):
         error_message = f"Gemini worker script not found: {GEMINI_WORKER_SCRIPT}"
         print(f"❌ Error: {error_message}")
-        JOB_REPORTER.error(error_message)
+        _report_shorts_analysis_failure(
+            error_message,
+            defer_terminal_error=defer_terminal_error,
+        )
         return {
             "clips_data": None,
             "error": error_message,
@@ -2803,7 +2828,10 @@ def get_viral_clips(transcript_result, video_duration, output_dir=None, video_ti
     if not scored_windows:
         error_message = "Gemini could not score any transcript windows."
         print(f"❌ Gemini Error: {error_message}")
-        JOB_REPORTER.error(error_message)
+        _report_shorts_analysis_failure(
+            error_message,
+            defer_terminal_error=defer_terminal_error,
+        )
         return {
             "clips_data": None,
             "error": error_message,
@@ -2963,7 +2991,10 @@ def get_viral_clips(transcript_result, video_duration, output_dir=None, video_ti
     if not collected_clips:
         error_message = "Gemini did not produce any valid clips from the shortlisted windows."
         print(f"❌ Gemini Error: {error_message}")
-        JOB_REPORTER.error(error_message)
+        _report_shorts_analysis_failure(
+            error_message,
+            defer_terminal_error=defer_terminal_error,
+        )
         return {
             "clips_data": None,
             "error": error_message,
@@ -3734,6 +3765,7 @@ def _run_video_type_pipeline(
                 duration,
                 output_dir=output_dir,
                 video_title=video_title,
+                defer_terminal_error=True,
             )
             _save_json_file(analysis_result_file, analysis_result)
             JOB_REPORTER.artifact("analysis_result", analysis_result_file)

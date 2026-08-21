@@ -79,6 +79,82 @@ def test_detail_failure_keeps_score_data_for_auto_longform(monkeypatch):
     assert result["clips_data"] is None
     assert result["windows"][0]["id"] == "window_001"
     assert result["scored_windows"] == scored
+    assert any(event[0] == "error" for event in reporter.events)
+
+
+def test_auto_detail_failure_stays_nonterminal_when_longform_succeeds(monkeypatch, tmp_path):
+    reporter = _Reporter()
+    monkeypatch.setattr(main, "JOB_REPORTER", reporter)
+    monkeypatch.setenv("GEMINI_API_KEY", "key")
+
+    scored = [{"id": "window_001", "start": 0, "end": 90, "score": 92, "reason": "strong"}]
+    monkeypatch.setattr(
+        main,
+        "_run_score_stage",
+        lambda *_args, **_kwargs: (scored, {"window_001"}, set(), [], []),
+    )
+
+    def fail_detail(*_args, **_kwargs):
+        raise RuntimeError("detail unavailable")
+
+    monkeypatch.setattr(
+        main,
+        "_call_gemini_worker",
+        fail_detail,
+    )
+    monkeypatch.setattr(
+        main,
+        "_analyze_longform_with_fallback",
+        lambda *_args, **_kwargs: {
+            "plan_data": {
+                "viable": True,
+                "video_title": "Recovered long video",
+                "youtube_description": "",
+                "segments": [{
+                    "start": 0,
+                    "end": 500,
+                    "chapter_title": "Story",
+                    "role": "body",
+                }],
+                "total_duration": 500,
+                "warnings": [],
+            },
+            "error": None,
+            "attempts": [],
+        },
+    )
+    rendered = []
+    monkeypatch.setattr(
+        main,
+        "_render_longform_video",
+        lambda *_args, **_kwargs: rendered.append(True) or str(tmp_path / "Video_long_1.mp4"),
+    )
+
+    metadata = main._run_video_type_pipeline(
+        "auto",
+        transcript=_transcript(),
+        duration=900,
+        analysis_result=None,
+        output_dir=str(tmp_path),
+        video_title="Video",
+        input_video="source.mp4",
+        output_format="vertical",
+        layout_style="smart",
+        resume_requested=False,
+        resume_phase=None,
+        metadata_file=str(tmp_path / "metadata.json"),
+        analysis_result_file=str(tmp_path / "analysis.json"),
+        source_url=None,
+    )
+
+    assert metadata["processing_mode"] == "long_video"
+    assert metadata["analysis_status"] == "partial"
+    assert rendered == [True]
+    assert not any(event[0] == "error" for event in reporter.events)
+    assert any(
+        event[0] == "warning" and event[2].get("recoverable") is True
+        for event in reporter.events
+    )
 
 
 def test_score_fallback_builds_bounded_chronological_story():
