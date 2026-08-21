@@ -640,12 +640,14 @@ function App() {
           force_low_quality: forceLowQuality,
           output_format: data.outputFormat || 'vertical',
           layout_style: data.layoutStyle || 'smart',
+          video_type: data.videoType || 'shorts',
         });
       } else {
         const formData = new FormData();
         formData.append('file', data.payload);
         formData.append('output_format', data.outputFormat || 'vertical');
         formData.append('layout_style', data.layoutStyle || 'smart');
+        formData.append('video_type', data.videoType || 'shorts');
         body = formData;
       }
 
@@ -702,8 +704,12 @@ function App() {
 
   const handleBulkSubtitles = async (options) => {
     const clips = results?.clips || [];
-    if (!jobId || clips.length === 0) return;
-    const total = clips.length;
+    const subtitleClipIndices = clips
+      .map((clip, index) => ({ clip, index }))
+      .filter(({ clip }) => clip?.video_type !== 'long')
+      .map(({ index }) => index);
+    if (!jobId || subtitleClipIndices.length === 0) return;
+    const total = subtitleClipIndices.length;
     const failed = [];
     bulkCancelRef.current = false;
     setBulkSubResult(null);
@@ -712,9 +718,10 @@ function App() {
     // Sequential on purpose: each burn is an FFmpeg run; parallel requests
     // would hammer the box without finishing sooner.
     let processed = 0;
-    for (let i = 0; i < total; i++) {
+    for (let position = 0; position < total; position++) {
       if (bulkCancelRef.current) break;
-      setBulkSubProgress({ running: true, current: i + 1, total, errors: failed.length });
+      const i = subtitleClipIndices[position];
+      setBulkSubProgress({ running: true, current: position + 1, total, errors: failed.length });
       try {
         const res = await fetch(getApiUrl('/api/subtitle'), {
           method: 'POST',
@@ -1147,23 +1154,25 @@ function App() {
 
           {/* View: Dashboard (Idle) */}
           {activeTab === 'dashboard' && status === 'idle' && (
-            <div className="h-full flex flex-col items-center justify-center p-6 animate-[fadeIn_0.3s_ease-out]">
-              <div className="max-w-xl w-full text-center space-y-8">
-                <div className="space-y-4">
-                  <h1 className="text-4xl md:text-5xl font-black bg-gradient-to-b from-white to-white/60 bg-clip-text text-transparent">
-                    Create Viral Shorts
-                  </h1>
-                  <p className="text-zinc-400 text-lg">
-                    Drop your long-form video URL or file below to instantly generate viral clips with AI.
-                  </p>
-                </div>
+            <div className="h-full overflow-y-auto custom-scrollbar">
+              <div className="min-h-full flex flex-col items-center justify-center p-6 animate-[fadeIn_0.3s_ease-out]">
+                <div className="max-w-xl w-full text-center space-y-8">
+                  <div className="space-y-4">
+                    <h1 className="text-4xl md:text-5xl font-black bg-gradient-to-b from-white to-white/60 bg-clip-text text-transparent">
+                      Create Viral Videos
+                    </h1>
+                    <p className="text-zinc-400 text-lg">
+                      Turn one long-form source into Shorts, a cohesive long edit, or both with AI.
+                    </p>
+                  </div>
 
-                <MediaInput onProcess={handleProcess} isProcessing={status === 'processing' || status === 'queued'} />
+                  <MediaInput onProcess={handleProcess} isProcessing={status === 'processing' || status === 'queued'} />
 
-                <div className="flex items-center justify-center gap-8 text-zinc-500 text-sm">
-                  <span className="flex items-center gap-2"><Youtube size={16} /> YouTube</span>
-                  <span className="flex items-center gap-2"><Instagram size={16} /> Instagram</span>
-                  <span className="flex items-center gap-2"><TikTokIcon size={16} /> TikTok</span>
+                  <div className="flex items-center justify-center gap-8 text-zinc-500 text-sm">
+                    <span className="flex items-center gap-2"><Youtube size={16} /> YouTube</span>
+                    <span className="flex items-center gap-2"><Instagram size={16} /> Instagram</span>
+                    <span className="flex items-center gap-2"><TikTokIcon size={16} /> TikTok</span>
+                  </div>
                 </div>
               </div>
             </div>
@@ -1366,36 +1375,38 @@ function App() {
               <div className={`${status === 'complete' ? 'w-full md:w-[70%] lg:w-[75%]' : 'w-full md:w-[45%] lg:w-[40%]'} h-full flex flex-col bg-background p-6 transition-all duration-700 ease-in-out`}>
                 <h2 className="text-lg font-semibold mb-6 flex items-center gap-2 shrink-0">
                   <Sparkles className="text-yellow-400" size={20} />
-                  Generated Shorts
+                  Generated Videos
                   {results?.clips?.length > 0 && (
                     <span className="text-xs bg-white/10 text-white px-2 py-0.5 rounded-full ml-auto">
-                      {results.clips.length} Clips
+                      {results.clips.length} {results.clips.length === 1 ? 'Video' : 'Videos'}
                     </span>
                   )}
                   {status === 'complete' && results?.clips?.length > 0 && (
                     <>
-                      <button
-                        onClick={() => setShowBulkSubtitles(true)}
-                        disabled={bulkSubProgress.running}
-                        className="text-xs flex items-center gap-1.5 bg-yellow-500/10 border border-yellow-500/20 text-yellow-400 hover:bg-yellow-500/20 px-2.5 py-1 rounded-full transition-colors disabled:opacity-60"
-                        title="Untertitel-Style einmal wählen und auf alle Clips anwenden"
-                      >
-                        {bulkSubProgress.running ? (
-                          <>
-                            <Loader2 size={12} className="animate-spin" />
-                            Subtitles {bulkSubProgress.current}/{bulkSubProgress.total}
-                          </>
-                        ) : (
-                          <>
-                            <Type size={12} />
-                            Subtitles für alle
-                          </>
-                        )}
-                      </button>
+                      {results.clips.some((clip) => clip.video_type !== 'long') && (
+                        <button
+                          onClick={() => setShowBulkSubtitles(true)}
+                          disabled={bulkSubProgress.running}
+                          className="text-xs flex items-center gap-1.5 bg-yellow-500/10 border border-yellow-500/20 text-yellow-400 hover:bg-yellow-500/20 px-2.5 py-1 rounded-full transition-colors disabled:opacity-60"
+                          title="Untertitel-Style einmal wählen und auf alle Shorts anwenden"
+                        >
+                          {bulkSubProgress.running ? (
+                            <>
+                              <Loader2 size={12} className="animate-spin" />
+                              Subtitles {bulkSubProgress.current}/{bulkSubProgress.total}
+                            </>
+                          ) : (
+                            <>
+                              <Type size={12} />
+                              Subtitles für Shorts
+                            </>
+                          )}
+                        </button>
+                      )}
                       <a
                         href={getApiUrl(`/api/jobs/${jobId}/download-all`)}
                         className="text-xs flex items-center gap-1.5 bg-white/5 border border-white/10 text-zinc-300 hover:bg-white/10 px-2.5 py-1 rounded-full transition-colors"
-                        title="Alle Clips als ZIP herunterladen"
+                        title="Alle Videos als ZIP herunterladen"
                       >
                         <Download size={12} />
                         Alle laden
