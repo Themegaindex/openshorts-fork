@@ -3078,7 +3078,7 @@ def get_viral_clips(
             {"shorts": collected_clips}, video_duration, words=words,
             max_clips=max_clips,
         )
-    except ValueError as exc:
+    except (TypeError, ValueError, OverflowError) as exc:
         error_message = f"Gemini clips failed validation: {exc}"
         print(f"❌ Gemini Error: {error_message}")
         attempts.append({
@@ -3980,7 +3980,8 @@ def _run_video_type_pipeline(
     if not has_shorts and not has_long:
         details = "; ".join(part for part in (short_error, long_error, long_skipped_reason) if part)
         auto_fallback_allowed = (
-            AUTO_FULL_VIDEO_FALLBACK_MAX_SECONDS > 0
+            duration > 0
+            and AUTO_FULL_VIDEO_FALLBACK_MAX_SECONDS > 0
             and duration <= AUTO_FULL_VIDEO_FALLBACK_MAX_SECONDS
         )
         if video_type == "auto" and auto_fallback_allowed:
@@ -4000,7 +4001,9 @@ def _run_video_type_pipeline(
                 long_video_skipped_reason=long_skipped_reason,
             )
         if video_type == "auto":
-            if AUTO_FULL_VIDEO_FALLBACK_MAX_SECONDS <= 0:
+            if duration <= 0:
+                fallback_limit = "full-video fallback disabled because source duration is unknown"
+            elif AUTO_FULL_VIDEO_FALLBACK_MAX_SECONDS <= 0:
                 fallback_limit = "full-video fallback disabled by configuration"
             else:
                 fallback_limit = (

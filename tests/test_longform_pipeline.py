@@ -450,6 +450,41 @@ def test_auto_does_not_render_unbounded_full_video_fallback(monkeypatch, tmp_pat
         )
 
 
+def test_auto_does_not_render_full_video_when_duration_is_unknown(monkeypatch, tmp_path):
+    reporter = _Reporter()
+    monkeypatch.setattr(main, "JOB_REPORTER", reporter)
+    monkeypatch.setattr(
+        main,
+        "_render_clip",
+        lambda *_args, **_kwargs: pytest.fail("unknown-duration Auto fallback must not render"),
+    )
+
+    with pytest.raises(RuntimeError, match="source duration is unknown"):
+        main._run_video_type_pipeline(
+            "auto",
+            transcript=_transcript(0),
+            duration=0,
+            analysis_result={
+                "clips_data": None,
+                "error": "no valid Shorts",
+                "attempts": [],
+                "cost_analysis": None,
+                "windows": [],
+                "scored_windows": [],
+            },
+            output_dir=str(tmp_path),
+            video_title="UnknownDuration",
+            input_video="input.mp4",
+            output_format="vertical",
+            layout_style="smart",
+            resume_requested=False,
+            resume_phase=None,
+            metadata_file=str(tmp_path / "metadata.json"),
+            analysis_result_file=str(tmp_path / "analysis.json"),
+            source_url=None,
+        )
+
+
 def test_long_mode_ignores_stale_shorts_resume_analysis(monkeypatch, tmp_path):
     reporter = _Reporter()
     monkeypatch.setattr(main, "JOB_REPORTER", reporter)
