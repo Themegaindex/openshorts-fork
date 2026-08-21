@@ -5,7 +5,7 @@ import os
 from pathlib import Path
 import sys
 from types import ModuleType, SimpleNamespace
-from unittest.mock import MagicMock
+from unittest.mock import MagicMock, patch
 
 import pytest
 
@@ -15,7 +15,8 @@ def _stub_missing_pipeline_dependencies():
 
     The functions in this module mock every renderer/model boundary they touch,
     so importing multi-gigabyte video/ML packages would add cost without adding
-    coverage. Local video environments continue to use their real packages.
+    coverage. Model packages are always stubbed because their constructors can
+    download weights even after a successful package import.
     """
     def unavailable(name):
         try:
@@ -60,33 +61,31 @@ def _stub_missing_pipeline_dependencies():
         detectors_stub.ContentDetector = MagicMock
         sys.modules["scenedetect"] = scene_stub
         sys.modules["scenedetect.detectors"] = detectors_stub
-    if unavailable("ultralytics"):
-        ultralytics_stub = ModuleType("ultralytics")
-        ultralytics_stub.YOLO = MagicMock
-        sys.modules["ultralytics"] = ultralytics_stub
-    if unavailable("mediapipe"):
-        mediapipe_stub = ModuleType("mediapipe")
-        mediapipe_stub.__path__ = []
-        mediapipe_stub.Image = MagicMock
-        mediapipe_stub.ImageFormat = SimpleNamespace(SRGB="SRGB")
-        tasks_stub = ModuleType("mediapipe.tasks")
-        tasks_stub.__path__ = []
-        python_stub = ModuleType("mediapipe.tasks.python")
-        python_stub.__path__ = []
-        python_stub.BaseOptions = MagicMock
-        vision_stub = ModuleType("mediapipe.tasks.python.vision")
-        vision_stub.FaceDetectorOptions = MagicMock
-        vision_stub.RunningMode = SimpleNamespace(IMAGE="IMAGE")
-        vision_stub.FaceDetector = SimpleNamespace(
-            create_from_options=MagicMock(return_value=MagicMock()),
-        )
-        tasks_stub.python = python_stub
-        python_stub.vision = vision_stub
-        mediapipe_stub.tasks = tasks_stub
-        sys.modules["mediapipe"] = mediapipe_stub
-        sys.modules["mediapipe.tasks"] = tasks_stub
-        sys.modules["mediapipe.tasks.python"] = python_stub
-        sys.modules["mediapipe.tasks.python.vision"] = vision_stub
+    ultralytics_stub = ModuleType("ultralytics")
+    ultralytics_stub.YOLO = MagicMock
+    sys.modules["ultralytics"] = ultralytics_stub
+    mediapipe_stub = ModuleType("mediapipe")
+    mediapipe_stub.__path__ = []
+    mediapipe_stub.Image = MagicMock
+    mediapipe_stub.ImageFormat = SimpleNamespace(SRGB="SRGB")
+    tasks_stub = ModuleType("mediapipe.tasks")
+    tasks_stub.__path__ = []
+    python_stub = ModuleType("mediapipe.tasks.python")
+    python_stub.__path__ = []
+    python_stub.BaseOptions = MagicMock
+    vision_stub = ModuleType("mediapipe.tasks.python.vision")
+    vision_stub.FaceDetectorOptions = MagicMock
+    vision_stub.RunningMode = SimpleNamespace(IMAGE="IMAGE")
+    vision_stub.FaceDetector = SimpleNamespace(
+        create_from_options=MagicMock(return_value=MagicMock()),
+    )
+    tasks_stub.python = python_stub
+    python_stub.vision = vision_stub
+    mediapipe_stub.tasks = tasks_stub
+    sys.modules["mediapipe"] = mediapipe_stub
+    sys.modules["mediapipe.tasks"] = tasks_stub
+    sys.modules["mediapipe.tasks.python"] = python_stub
+    sys.modules["mediapipe.tasks.python.vision"] = vision_stub
     if unavailable("google.genai"):
         if unavailable("google"):
             google_stub = ModuleType("google")
@@ -107,7 +106,10 @@ def _stub_missing_pipeline_dependencies():
 
 _stub_missing_pipeline_dependencies()
 
-import main
+# A fresh checkout intentionally has no ignored model files. Keep collection
+# network-free while main initializes the already-stubbed MediaPipe boundary.
+with patch("urllib.request.urlretrieve", return_value=(None, None)):
+    import main
 
 # pytest itself probes an imported numpy module when evaluating approx(). The
 # pipeline keeps its direct module reference, while removing only our stub here
@@ -276,6 +278,62 @@ def test_auto_detail_failure_stays_nonterminal_when_longform_succeeds(monkeypatc
     assert metadata["processing_mode"] == "long_video"
     assert metadata["analysis_status"] == "partial"
     assert rendered == [True]
+    assert not any(event[0] == "error" for event in reporter.events)
+    assert any(
+        event[0] == "warning" and event[2].get("recoverable") is True
+        for event in reporter.events
+    )
+
+
+def test_auto_invalid_short_payload_reaches_bounded_fallback(monkeypatch, tmp_path):
+    reporter = _Reporter()
+    monkeypatch.setattr(main, "JOB_REPORTER", reporter)
+    monkeypatch.setenv("GEMINI_API_KEY", "key")
+    scored = [{"id": "window_001", "start": 0, "end": 120, "score": 92, "reason": "strong"}]
+    monkeypatch.setattr(
+        main,
+        "_run_score_stage",
+        lambda *_args, **_kwargs: (scored, {"window_001"}, set(), [], []),
+    )
+    monkeypatch.setattr(
+        main,
+        "_call_gemini_worker",
+        lambda *_args, **_kwargs: {
+            "payload": {"shorts": [{"start": "invalid", "end": 30}]},
+            "cost_analysis": None,
+        },
+    )
+    monkeypatch.setattr(
+        main,
+        "_analyze_longform_with_fallback",
+        lambda *_args, **_kwargs: pytest.fail("short Auto sources must skip long-form planning"),
+    )
+
+    def render_fallback(_input, output, **_kwargs):
+        Path(output).write_bytes(b"video")
+        return True
+
+    monkeypatch.setattr(main, "_render_clip", render_fallback)
+
+    metadata = main._run_video_type_pipeline(
+        "auto",
+        transcript=_transcript(120),
+        duration=120,
+        analysis_result=None,
+        output_dir=str(tmp_path),
+        video_title="Video",
+        input_video="source.mp4",
+        output_format="vertical",
+        layout_style="smart",
+        resume_requested=False,
+        resume_phase=None,
+        metadata_file=str(tmp_path / "metadata.json"),
+        analysis_result_file=str(tmp_path / "analysis.json"),
+        source_url=None,
+    )
+
+    assert metadata["processing_mode"] == "full_video_fallback"
+    assert "failed validation" in metadata["analysis_error"]
     assert not any(event[0] == "error" for event in reporter.events)
     assert any(
         event[0] == "warning" and event[2].get("recoverable") is True

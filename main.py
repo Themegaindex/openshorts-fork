@@ -3064,10 +3064,6 @@ def get_viral_clips(
             "scored_windows": scored_windows,
         }
 
-    normalized_payload = _normalize_shorts_payload(
-        {"shorts": collected_clips}, video_duration, words=words,
-        max_clips=max_clips,
-    )
     cost_analysis = _merge_cost_analyses(all_costs)
     analysis_coverage = {
         "score_windows_total": len(windows),
@@ -3077,6 +3073,32 @@ def get_viral_clips(
         "detail_windows_processed": len(detailed_input_ids),
         "detail_windows_skipped": sorted(skipped_detail_ids),
     }
+    try:
+        normalized_payload = _normalize_shorts_payload(
+            {"shorts": collected_clips}, video_duration, words=words,
+            max_clips=max_clips,
+        )
+    except ValueError as exc:
+        error_message = f"Gemini clips failed validation: {exc}"
+        print(f"❌ Gemini Error: {error_message}")
+        attempts.append({
+            "stage": "normalize",
+            "status": "failed",
+            "error": str(exc),
+        })
+        _report_shorts_analysis_failure(
+            error_message,
+            defer_terminal_error=defer_terminal_error,
+        )
+        return {
+            "clips_data": None,
+            "error": error_message,
+            "attempts": attempts,
+            "cost_analysis": cost_analysis,
+            "analysis_coverage": analysis_coverage,
+            "windows": windows,
+            "scored_windows": scored_windows,
+        }
     normalized_payload["analysis_coverage"] = analysis_coverage
     if cost_analysis:
         normalized_payload["cost_analysis"] = cost_analysis
