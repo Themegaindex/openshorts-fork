@@ -7,6 +7,7 @@ import HookModal from './HookModal';
 import TranslateModal from './TranslateModal';
 
 export default function ResultCard({ clip, index, jobId, uploadPostKey, uploadUserId, geminiApiKey, elevenLabsKey, onVersionChange, onPlay, onPause }) {
+    const isLong = clip.video_type === 'long';
     const [showModal, setShowModal] = useState(false);
     const [showSubtitleModal, setShowSubtitleModal] = useState(false);
     const videoRef = React.useRef(null);
@@ -36,6 +37,7 @@ export default function ResultCard({ clip, index, jobId, uploadPostKey, uploadUs
     // them so the remove buttons survive a page reload.
     const [layers, setLayers] = useState(clip.layers || { subtitle: false, hook: false });
     const [removingLayer, setRemovingLayer] = useState(null);
+    const [copiedField, setCopiedField] = useState(null);
 
     useEffect(() => {
         if (clip.layers) setLayers(clip.layers);
@@ -339,10 +341,35 @@ export default function ResultCard({ clip, index, jobId, uploadPostKey, uploadUs
         }
     };
 
+    const copyText = async (field, value) => {
+        if (!value) return;
+        try {
+            await navigator.clipboard.writeText(value);
+            setCopiedField(field);
+            setTimeout(() => setCopiedField(null), 1600);
+        } catch (error) {
+            console.error('Copy failed:', error);
+        }
+    };
+
+    const handleDownload = (event) => {
+        event.preventDefault();
+        const downloadUrl = jobId
+            ? getApiUrl(`/api/jobs/${encodeURIComponent(jobId)}/clips/${index}/download`)
+            : currentVideoUrl;
+        const anchor = document.createElement('a');
+        anchor.style.display = 'none';
+        anchor.href = downloadUrl;
+        anchor.download = isLong ? 'long-video.mp4' : `clip-${index + 1}.mp4`;
+        document.body.appendChild(anchor);
+        anchor.click();
+        document.body.removeChild(anchor);
+    };
+
     return (
-        <div className="bg-surface border border-white/5 rounded-2xl overflow-hidden flex flex-col md:flex-row group hover:border-white/10 transition-all animate-[fadeIn_0.5s_ease-out] min-h-[300px] h-auto" style={{ animationDelay: `${index * 0.1}s` }}>
+        <div className={`bg-surface border border-white/5 rounded-2xl overflow-hidden flex group hover:border-white/10 transition-all animate-[fadeIn_0.5s_ease-out] h-auto ${isLong ? 'xl:col-span-2 flex-col min-h-[520px]' : 'flex-col md:flex-row min-h-[300px]'}`} style={{ animationDelay: `${index * 0.1}s` }}>
             {/* Left: Video Preview (Responsive Width) */}
-            <div className="w-full md:w-[180px] lg:w-[200px] bg-black relative shrink-0 aspect-[9/16] md:aspect-auto group/video">
+            <div className={`${isLong ? 'w-full aspect-video border-b border-white/5' : 'w-full md:w-[180px] lg:w-[200px] aspect-[9/16] md:aspect-auto'} bg-black relative shrink-0 group/video`}>
                 <video
                     ref={videoRef}
                     src={currentVideoUrl}
@@ -350,10 +377,13 @@ export default function ResultCard({ clip, index, jobId, uploadPostKey, uploadUs
                     className="w-full h-full object-contain"
                     playsInline
                     onPlay={() => {
+                        // A long edit has a discontinuous assembled timeline,
+                        // so its playback time cannot seek the original preview.
+                        if (isLong) return;
                         const currentTime = videoRef.current ? videoRef.current.currentTime : 0;
                         onPlay && onPlay(clip.start + currentTime);
                     }}
-                    onPause={() => onPause && onPause()}
+                    onPause={() => !isLong && onPause && onPause()}
                     onEnded={() => {
                         if (videoRef.current) {
                             videoRef.current.currentTime = 0;
@@ -363,12 +393,12 @@ export default function ResultCard({ clip, index, jobId, uploadPostKey, uploadUs
                 />
                 <div className="absolute top-3 left-3 flex gap-2">
                     <span className="bg-black/60 backdrop-blur-md text-white text-[10px] font-bold px-2 py-1 rounded-md border border-white/10 uppercase tracking-wide">
-                        Clip {index + 1}
+                        {isLong ? 'Long Video · 16:9' : `Clip ${index + 1}`}
                     </span>
                 </div>
 
                 {/* Auto Edit Overlay if Processing */}
-                {isEditing && (
+                {!isLong && isEditing && (
                     <div className="absolute inset-0 bg-black/60 backdrop-blur-sm flex flex-col items-center justify-center z-10 p-4 text-center">
                         <Loader2 size={32} className="text-primary animate-spin mb-3" />
                         <span className="text-xs font-bold text-white uppercase tracking-wider">AI Magic in Progress...</span>
@@ -378,43 +408,96 @@ export default function ResultCard({ clip, index, jobId, uploadPostKey, uploadUs
             </div>
 
             {/* Right: Content & Details */}
-            <div className="flex-1 p-4 md:p-5 flex flex-col bg-[#121214] overflow-hidden min-w-0">
+            <div className={`flex-1 flex flex-col bg-[#121214] overflow-hidden min-w-0 ${isLong ? 'p-5 md:p-7' : 'p-4 md:p-5'}`}>
                 <div className="mb-4">
-                    <h3 className="text-base font-bold text-white leading-tight line-clamp-2 mb-2 break-words" title={clip.video_title_for_youtube_short}>
-                        {clip.video_title_for_youtube_short || "Viral Clip Generated"}
-                    </h3>
+                    <div className="flex items-start gap-3">
+                        <h3 className={`${isLong ? 'text-xl md:text-2xl max-w-3xl' : 'text-base line-clamp-2'} flex-1 font-bold text-white leading-tight mb-2 break-words`} title={isLong ? clip.title : clip.video_title_for_youtube_short}>
+                            {isLong ? (clip.title || "Long Video Generated") : (clip.video_title_for_youtube_short || "Viral Clip Generated")}
+                        </h3>
+                        {isLong && (
+                            <button
+                                type="button"
+                                onClick={() => copyText('title', clip.title)}
+                                className="mt-0.5 rounded-lg border border-white/10 bg-white/5 p-2 text-zinc-400 transition-colors hover:bg-white/10 hover:text-white"
+                                title="Copy title"
+                            >
+                                {copiedField === 'title' ? <CheckCircle size={14} className="text-emerald-400" /> : <Copy size={14} />}
+                            </button>
+                        )}
+                    </div>
                     <div className="flex flex-wrap gap-2 text-[10px] text-zinc-500 font-mono">
-                        <span className="bg-white/5 px-1.5 py-0.5 rounded border border-white/5 shrink-0">{Math.floor(clip.end - clip.start)}s</span>
-                        <span className="bg-white/5 px-1.5 py-0.5 rounded border border-white/5 shrink-0">#shorts</span>
-                        <span className="bg-white/5 px-1.5 py-0.5 rounded border border-white/5 shrink-0">#viral</span>
+                        <span className="bg-white/5 px-1.5 py-0.5 rounded border border-white/5 shrink-0">{Math.floor(clip.duration ?? (clip.end - clip.start))}s</span>
+                        {isLong ? (
+                            <>
+                                <span className="bg-sky-500/10 px-1.5 py-0.5 rounded border border-sky-500/20 text-sky-300 shrink-0">16:9 canvas</span>
+                                <span className="bg-white/5 px-1.5 py-0.5 rounded border border-white/5 shrink-0">YouTube-ready</span>
+                            </>
+                        ) : (
+                            <>
+                                <span className="bg-white/5 px-1.5 py-0.5 rounded border border-white/5 shrink-0">#shorts</span>
+                                <span className="bg-white/5 px-1.5 py-0.5 rounded border border-white/5 shrink-0">#viral</span>
+                            </>
+                        )}
                     </div>
                 </div>
 
                 {/* Scrollable Descriptions Area */}
-                <div className="flex-1 overflow-y-auto custom-scrollbar space-y-3 pr-2 mb-4">
-                    {/* YouTube */}
-                    <div className="bg-black/20 rounded-lg p-3 border border-white/5">
-                        <div className="flex items-center gap-2 text-[10px] font-bold text-red-400 mb-1.5 uppercase tracking-wider">
-                            <Youtube size={12} className="shrink-0" /> <span className="truncate">YouTube Title</span>
+                {isLong ? (
+                    <div className="mb-5 grid flex-1 gap-px overflow-hidden rounded-xl border border-white/5 bg-white/5 md:grid-cols-[1.35fr_0.65fr]">
+                        <div className="min-w-0 bg-black/30 p-4 md:p-5">
+                            <div className="mb-3 flex items-center justify-between gap-3">
+                                <div className="flex items-center gap-2 text-[10px] font-bold uppercase tracking-[0.16em] text-red-400">
+                                    <Youtube size={13} /> Description + chapters
+                                </div>
+                                <button
+                                    type="button"
+                                    onClick={() => copyText('description', clip.description_with_chapters)}
+                                    className="flex items-center gap-1.5 rounded-md border border-white/10 px-2 py-1 text-[10px] text-zinc-400 transition-colors hover:bg-white/10 hover:text-white"
+                                >
+                                    {copiedField === 'description' ? <CheckCircle size={11} className="text-emerald-400" /> : <Copy size={11} />}
+                                    {copiedField === 'description' ? 'Copied' : 'Copy'}
+                                </button>
+                            </div>
+                            <p className="whitespace-pre-wrap text-xs leading-relaxed text-zinc-300 select-all break-words">
+                                {clip.description_with_chapters || clip.youtube_description || "No description generated."}
+                            </p>
                         </div>
-                        <p className="text-xs text-zinc-300 select-all break-words">
-                            {clip.video_title_for_youtube_short || "Viral Short Video"}
-                        </p>
+                        <div className="bg-[#101012] p-4 md:p-5">
+                            <div className="mb-3 text-[10px] font-bold uppercase tracking-[0.16em] text-zinc-500">Timeline</div>
+                            <ol className="max-h-48 space-y-2 overflow-y-auto pr-1 font-mono text-[10px] custom-scrollbar">
+                                {(clip.chapters || []).map((chapter, chapterIndex) => (
+                                    <li key={`${chapter.formatted}-${chapterIndex}`} className="grid grid-cols-[42px_1fr] gap-2 border-b border-white/5 pb-2 last:border-0">
+                                        <span className="text-sky-400">{chapter.formatted}</span>
+                                        <span className="text-zinc-300">{chapter.title}</span>
+                                    </li>
+                                ))}
+                            </ol>
+                        </div>
                     </div>
+                ) : (
+                    <div className="flex-1 overflow-y-auto custom-scrollbar space-y-3 pr-2 mb-4">
+                        <div className="bg-black/20 rounded-lg p-3 border border-white/5">
+                            <div className="flex items-center gap-2 text-[10px] font-bold text-red-400 mb-1.5 uppercase tracking-wider">
+                                <Youtube size={12} className="shrink-0" /> <span className="truncate">YouTube Title</span>
+                            </div>
+                            <p className="text-xs text-zinc-300 select-all break-words">
+                                {clip.video_title_for_youtube_short || "Viral Short Video"}
+                            </p>
+                        </div>
 
-                    {/* TikTok / IG */}
-                    <div className="bg-black/20 rounded-lg p-3 border border-white/5">
-                        <div className="flex items-center gap-2 text-[10px] font-bold text-zinc-400 mb-1.5 uppercase tracking-wider">
-                            <Video size={12} className="text-cyan-400 shrink-0" />
-                            <span className="text-zinc-500">/</span>
-                            <Instagram size={12} className="text-pink-400 shrink-0" />
-                            <span className="truncate">Caption</span>
+                        <div className="bg-black/20 rounded-lg p-3 border border-white/5">
+                            <div className="flex items-center gap-2 text-[10px] font-bold text-zinc-400 mb-1.5 uppercase tracking-wider">
+                                <Video size={12} className="text-cyan-400 shrink-0" />
+                                <span className="text-zinc-500">/</span>
+                                <Instagram size={12} className="text-pink-400 shrink-0" />
+                                <span className="truncate">Caption</span>
+                            </div>
+                            <p className="text-xs text-zinc-300 line-clamp-3 hover:line-clamp-none transition-all cursor-pointer select-all break-words">
+                                {clip.video_description_for_tiktok || clip.video_description_for_instagram}
+                            </p>
                         </div>
-                        <p className="text-xs text-zinc-300 line-clamp-3 hover:line-clamp-none transition-all cursor-pointer select-all break-words">
-                            {clip.video_description_for_tiktok || clip.video_description_for_instagram}
-                        </p>
                     </div>
-                </div>
+                )}
 
                 {/* Error Message */}
                 {editError && (
@@ -426,7 +509,7 @@ export default function ResultCard({ clip, index, jobId, uploadPostKey, uploadUs
 
                 {/* Applied layers. Burning one in used to be a one-way door:
                     the only way out was overwriting it with another style. */}
-                {(layers.subtitle || layers.hook) && (
+                {!isLong && (layers.subtitle || layers.hook) && (
                     <div className="mt-auto flex flex-wrap items-center gap-2 pt-4 text-[10px]">
                         <span className="text-zinc-600 uppercase tracking-wider">Applied</span>
                         {[
@@ -450,6 +533,24 @@ export default function ResultCard({ clip, index, jobId, uploadPostKey, uploadUs
                 )}
 
                 {/* Actions Footer */}
+                {isLong ? (
+                    <div className="mt-auto grid grid-cols-2 gap-3 border-t border-white/5 pt-4">
+                        <button
+                            onClick={() => setShowTranslateModal(true)}
+                            disabled={isTranslating}
+                            className="flex items-center justify-center gap-2 rounded-lg bg-gradient-to-r from-green-500 to-teal-600 px-3 py-2.5 text-xs font-bold text-white shadow-lg shadow-green-500/20 transition-all hover:from-green-400 hover:to-teal-500 active:scale-[0.98] disabled:opacity-60"
+                        >
+                            {isTranslating ? <Loader2 size={14} className="animate-spin" /> : <Languages size={14} />}
+                            {isTranslating ? 'Translating...' : 'Dub Voice'}
+                        </button>
+                        <button
+                            onClick={handleDownload}
+                            className="flex items-center justify-center gap-2 rounded-lg border border-white/10 bg-white/5 px-3 py-2.5 text-xs font-medium text-zinc-300 transition-colors hover:bg-white/10 hover:text-white"
+                        >
+                            <Download size={14} /> Download Long Video
+                        </button>
+                    </div>
+                ) : (
                 <div className={`grid grid-cols-2 gap-3 ${layers.subtitle || layers.hook ? 'mt-3' : 'mt-auto'} pt-4 border-t border-white/5`}>
                     <button
                         onClick={handleAutoEdit}
@@ -494,35 +595,17 @@ export default function ResultCard({ clip, index, jobId, uploadPostKey, uploadUs
                         <Share2 size={14} className="shrink-0" /> Post
                     </button>
                     <button
-                        onClick={async (e) => {
-                            e.preventDefault();
-                            try {
-                                const response = await fetch(currentVideoUrl);
-                                if (!response.ok) throw new Error('Download failed');
-                                const blob = await response.blob();
-                                const url = window.URL.createObjectURL(blob);
-                                const a = document.createElement('a');
-                                a.style.display = 'none';
-                                a.href = url;
-                                a.download = `clip-${index + 1}.mp4`;
-                                document.body.appendChild(a);
-                                a.click();
-                                window.URL.revokeObjectURL(url);
-                                document.body.removeChild(a);
-                            } catch (err) {
-                                console.error('Download error:', err);
-                                window.open(currentVideoUrl, '_blank');
-                            }
-                        }}
+                        onClick={handleDownload}
                         className="col-span-1 py-2 bg-white/5 hover:bg-white/10 text-zinc-300 hover:text-white rounded-lg text-xs font-medium transition-colors flex items-center justify-center gap-2 border border-white/5 truncate px-2"
                     >
                         <Download size={14} className="shrink-0" /> Download
                     </button>
                 </div>
+                )}
             </div>
 
             {/* Post Modal */}
-            {showModal && (
+            {!isLong && showModal && (
                 <div className="fixed inset-0 z-[100] flex items-center justify-center p-4 bg-black/80 backdrop-blur-sm animate-[fadeIn_0.2s_ease-out]">
                     <div className="bg-[#121214] border border-white/10 p-6 rounded-2xl w-full max-w-md shadow-2xl relative max-h-[90vh] overflow-y-auto custom-scrollbar">
                         <button

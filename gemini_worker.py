@@ -44,6 +44,24 @@ class DetailResponse(BaseModel):
     shorts: List[DetailClipModel]
 
 
+class LongformSegmentModel(BaseModel):
+    start: float
+    end: float
+    chapter_title: str
+    priority: int
+    continuity_importance: int
+    required: bool
+    role: str
+    reason: str
+
+
+class LongformPlanResponse(BaseModel):
+    viable: bool
+    video_title: str
+    youtube_description: str
+    segments: List[LongformSegmentModel]
+
+
 def _configure_stdio() -> None:
     for stream_name in ("stdout", "stderr"):
         stream = getattr(sys, stream_name, None)
@@ -68,11 +86,12 @@ def _log(message: str) -> None:
 
 SCORE_PROMPT_TEMPLATE = """
 You are a senior short-form video strategist.
-Select the MOST viral candidate windows from this batch.
+Score every candidate window in this batch.
 
 Rules:
 - Return only valid JSON.
-- Choose up to 3 windows from this batch.
+- Return exactly one entry for every input window, preserving its `id`, `start`,
+  and `end`. Never omit weak windows; give them a low score instead.
 - `score` must be an integer from 0 to 100.
 - THE 2-SECOND TEST is the main criterion: would the first 2 seconds of this
   moment force a cold viewer (no context) to keep watching? Windows that only
@@ -150,6 +169,68 @@ Return only:
       "video_description_for_instagram": "<description + hashtags>",
       "video_title_for_youtube_short": "<title max 100 chars>",
       "viral_hook_text": "<short overlay max 10 words>"
+    }}
+  ]
+}}
+"""
+
+
+LONGFORM_PLAN_PROMPT_TEMPLATE = """
+You are a senior YouTube editor and story producer. Build ONE coherent long-form
+video that feels deliberately edited, never like unrelated shorts stitched
+together. The requested assembled duration is {target_min_seconds} to
+{target_max_seconds} seconds.
+
+STORY RULES:
+- Return only valid JSON.
+- Preserve one clear through-line: context/setup -> development/bridges -> payoff.
+- Apart from the optional cold open, every segment MUST be in chronological
+  source order and use absolute seconds from the source video.
+- Prefer a few substantial passages (60-180 seconds is ideal). Every body
+  segment must be between {min_segment_seconds} and {max_segment_seconds} seconds.
+- Preserve connective tissue that a viewer needs to understand the next scene.
+  Remove greetings, sponsors, housekeeping, repetition and unrelated tangents.
+- Begin on a sentence boundary and end after a complete sentence.
+- Scores indicate audience interest, but narrative coherence beats a higher score.
+- Use `role` values setup, bridge, body or payoff. Mark indispensable context
+  with `required: true`, and rate `continuity_importance` from 0 to 100.
+- If the material cannot honestly sustain {target_min_seconds} coherent seconds,
+  return `viable: false` instead of padding it. In that case still return all
+  schema fields, using an empty `youtube_description` and `segments: []`.
+
+COLD OPEN:
+- You may add exactly one first segment with `role: "cold_open"`: a 5-15 second
+  teaser of the strongest moment, without spoiling the complete payoff.
+- Its content may appear again later in full chronological context.
+
+CHAPTERS AND COPY:
+- Give related consecutive body segments the same short `chapter_title`, written
+  in TRANSCRIPT_LANGUAGE. Use a distinct title when the story actually advances.
+- `video_title` must be curiosity-driven, truthful and at most 100 characters.
+- `youtube_description` must be 2-4 sentences without timestamps; chapters are
+  appended by the application.
+- All generated text must use TRANSCRIPT_LANGUAGE ({language}).
+
+TRANSCRIPT_LANGUAGE: {language}
+VIDEO_DURATION_SECONDS: {video_duration}
+WINDOWS_JSON:
+{windows_json}
+
+Return only:
+{{
+  "viable": true,
+  "video_title": "<title>",
+  "youtube_description": "<2-4 sentences>",
+  "segments": [
+    {{
+      "start": <absolute seconds>,
+      "end": <absolute seconds>,
+      "chapter_title": "<short chapter>",
+      "priority": <integer 0-100>,
+      "continuity_importance": <integer 0-100>,
+      "required": <true or false>,
+      "role": "cold_open|setup|bridge|body|payoff",
+      "reason": "<short editorial reason>"
     }}
   ]
 }}
@@ -327,13 +408,25 @@ def _config_for_strategy(strategy: str, mode: str, model_name: str) -> genai_typ
         "response_mime_type": "application/json",
         "candidate_count": 1,
     }
-    if strategy == "strict-json":
+    if mode == "longform_plan":
+        kwargs["temperature"] = {
+            "structured-schema": 0.4,
+            "strict-json": 0.2,
+            "json-text-recovery": 0.1,
+        }.get(strategy, 0.2)
+    elif strategy == "strict-json":
         kwargs["temperature"] = 0.7 if creative else 0.1
     elif strategy == "json-text-recovery":
         kwargs["temperature"] = 0.2 if creative else 0.0
-    else:  # structured-schema: schema-enforced output, primary strategy
+    else:  # structured-schema primary temperature
         kwargs["temperature"] = 0.9 if creative else 0.2
-        kwargs["response_schema"] = DetailResponse if mode == "detail" else ScoreResponse
+
+    if strategy == "structured-schema":
+        kwargs["response_schema"] = {
+            "detail": DetailResponse,
+            "score": ScoreResponse,
+            "longform_plan": LongformPlanResponse,
+        }[mode]
         if mode == "score":
             thinking = _thinking_config_from_env(model_name)
             if thinking is not None:
@@ -344,8 +437,8 @@ def _config_for_strategy(strategy: str, mode: str, model_name: str) -> genai_typ
 def main() -> int:
     _configure_stdio()
 
-    parser = argparse.ArgumentParser(description="Run a single Gemini request for clip scoring/detailing.")
-    parser.add_argument("--mode", choices=["score", "detail"], required=True)
+    parser = argparse.ArgumentParser(description="Run one Gemini request for clip or long-form analysis.")
+    parser.add_argument("--mode", choices=["score", "detail", "longform_plan"], required=True)
     parser.add_argument("--input", dest="input_path", required=True)
     parser.add_argument("--output", dest="output_path", required=True)
     parser.add_argument("--strategy", default="structured-schema")
@@ -364,11 +457,19 @@ def main() -> int:
     config = _config_for_strategy(args.strategy, args.mode, model_name)
     language = str(payload.get("language") or "unknown")
 
-    template = SCORE_PROMPT_TEMPLATE if args.mode == "score" else DETAIL_PROMPT_TEMPLATE
+    template = {
+        "score": SCORE_PROMPT_TEMPLATE,
+        "detail": DETAIL_PROMPT_TEMPLATE,
+        "longform_plan": LONGFORM_PLAN_PROMPT_TEMPLATE,
+    }[args.mode]
     prompt = template.format(
         video_duration=payload["video_duration"],
         language=language,
         windows_json=json.dumps(payload["windows"], ensure_ascii=False),
+        target_min_seconds=payload.get("target_min_seconds", 480),
+        target_max_seconds=payload.get("target_max_seconds", 600),
+        min_segment_seconds=payload.get("min_segment_seconds", 20),
+        max_segment_seconds=payload.get("max_segment_seconds", 240),
     )
 
     _log(f"🤖 Gemini worker request: mode={args.mode} strategy={args.strategy} model={model_name} items={len(payload.get('windows', []))}")

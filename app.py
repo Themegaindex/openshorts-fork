@@ -523,6 +523,47 @@ def _get_job_resume_lock(job_id: str) -> asyncio.Lock:
     return lock
 
 
+def _metadata_clip_filenames(clip: dict) -> set:
+    filenames = set()
+    for value in (clip.get("video_url"), clip.get("output_filename")):
+        if value:
+            filename = os.path.basename(str(value).split("?")[0])
+            if filename:
+                filenames.add(filename)
+    return filenames
+
+
+def _lookup_metadata_clip(metadata: dict, clip_index: int, result_clip: Optional[dict] = None):
+    """Resolve a public combined result index back to its metadata container."""
+    if not isinstance(metadata, dict) or clip_index < 0:
+        raise HTTPException(status_code=404, detail="Clip metadata not found")
+    shorts = metadata.get("shorts") if isinstance(metadata.get("shorts"), list) else []
+    long_videos = metadata.get("long_videos") if isinstance(metadata.get("long_videos"), list) else []
+
+    if isinstance(result_clip, dict):
+        wanted_type = "long" if result_clip.get("video_type") == "long" else "short"
+        wanted_filenames = _metadata_clip_filenames(result_clip)
+        search_order = [
+            (long_videos, "long"), (shorts, "short")
+        ] if wanted_type == "long" else [
+            (shorts, "short"), (long_videos, "long")
+        ]
+        for container, video_type in search_order:
+            for local_index, candidate in enumerate(container):
+                if not isinstance(candidate, dict):
+                    continue
+                if wanted_filenames and wanted_filenames & _metadata_clip_filenames(candidate):
+                    return container, local_index, video_type
+
+    # Stable fallback for the normal no-holes contract: Shorts first, then Long.
+    if clip_index < len(shorts):
+        return shorts, clip_index, "short"
+    long_index = clip_index - len(shorts)
+    if 0 <= long_index < len(long_videos):
+        return long_videos, long_index, "long"
+    raise HTTPException(status_code=404, detail="Clip metadata not found")
+
+
 def _update_clip_version(
     job_id: str,
     clip_index: int,
@@ -554,15 +595,15 @@ def _update_clip_version(
         raise HTTPException(status_code=404, detail="Metadata not found")
 
     metadata = _read_json(metadata_path)
-    metadata_clips = metadata.get("shorts") if isinstance(metadata, dict) else None
-    if not isinstance(metadata_clips, list) or not 0 <= clip_index < len(metadata_clips):
-        raise HTTPException(status_code=404, detail="Clip metadata not found")
+    metadata_clips, metadata_index, _video_type = _lookup_metadata_clip(
+        metadata, clip_index, result_clips[clip_index],
+    )
 
-    metadata_clips[clip_index]["video_url"] = video_url
+    metadata_clips[metadata_index]["video_url"] = video_url
     if layers is not None:
         # Surfaced to the dashboard so it can offer to remove exactly the
         # layers a clip actually carries, and keep doing so after a reload.
-        metadata_clips[clip_index]["layers"] = layers
+        metadata_clips[metadata_index]["layers"] = layers
     _safe_write_json(metadata_path, metadata)
     result_clips[clip_index]["video_url"] = video_url
     if layers is not None:
@@ -671,6 +712,7 @@ def _serialize_job(job: dict) -> dict:
         "important_logs",
         "result",
         "processing_mode",
+        "video_type",
         "analysis_error",
         "analysis_status",
         "analysis_coverage",
@@ -748,6 +790,7 @@ def _build_job_state(job_id: str, *, output_dir: str, source_type: Optional[str]
         "analysis_error": None,
         "analysis_coverage": None,
         "processing_mode": None,
+        "video_type": None,
     }
 
 
@@ -771,6 +814,8 @@ def _set_job_result(job_id: str, result: dict) -> None:
     if not job:
         return
     job["result"] = result
+    if result.get("video_type") is not None:
+        job["video_type"] = result.get("video_type")
     job["updated_at"] = _now_ts()
     _persist_job_state(job_id)
 
@@ -1016,6 +1061,7 @@ def _build_archive_payload(job: dict) -> dict:
         "phase": job.get("phase"),
         "progress_percent": job.get("progress_percent"),
         "video_duration_seconds": job.get("video_duration_seconds"),
+        "video_type": job.get("video_type"),
         "is_resumable": False,
     }
 
@@ -1082,12 +1128,13 @@ def _relocate_root_job_artifacts(job_id: str, job_output_dir: str) -> bool:
         if os.path.abspath(metadata_path) != os.path.abspath(dest_metadata):
             shutil.move(metadata_path, dest_metadata)
 
-        # Move any clips that match the same base_name into the job folder
-        clip_pattern = os.path.join(root, f"{base_name}_clip_*.mp4")
-        for clip_path in glob.glob(clip_pattern):
-            dest_clip = os.path.join(job_output_dir, os.path.basename(clip_path))
-            if os.path.abspath(clip_path) != os.path.abspath(dest_clip):
-                shutil.move(clip_path, dest_clip)
+        # Move any Shorts/Long outputs that match the same base_name.
+        for suffix in ("clip", "long"):
+            clip_pattern = os.path.join(root, f"{base_name}_{suffix}_*.mp4")
+            for clip_path in glob.glob(clip_pattern):
+                dest_clip = os.path.join(job_output_dir, os.path.basename(clip_path))
+                if os.path.abspath(clip_path) != os.path.abspath(dest_clip):
+                    shutil.move(clip_path, dest_clip)
 
         # Also move any temp_ clips that might remain
         temp_clip_pattern = os.path.join(root, f"temp_{base_name}_clip_*.mp4")
@@ -1122,25 +1169,40 @@ def _build_result_from_metadata(job_id: str, metadata_path: str, output_dir: str
     base_name = os.path.basename(metadata_path).replace('_metadata.json', '')
     clips = []
 
-    for i, clip in enumerate(data.get('shorts', [])):
-        if not isinstance(clip, dict):
+    containers = (
+        ("shorts", data.get("shorts", [])),
+        ("long_videos", data.get("long_videos", [])),
+    )
+    for container_name, entries in containers:
+        if not isinstance(entries, list):
             continue
+        for i, clip in enumerate(entries):
+            if not isinstance(clip, dict):
+                continue
 
-        clip_filename = _resolve_clip_filename(clip, base_name, i)
-        clip_path = os.path.join(output_dir, clip_filename)
-        if not os.path.exists(clip_path) or os.path.getsize(clip_path) <= 0:
-            continue
+            clip_filename = _resolve_clip_filename(clip, base_name, i)
+            if container_name == "long_videos" and not clip.get("output_filename") and not clip.get("video_url"):
+                clip_filename = f"{base_name}_long_{i + 1}.mp4"
+            clip_path = os.path.join(output_dir, clip_filename)
+            if not os.path.exists(clip_path) or os.path.getsize(clip_path) <= 0:
+                continue
 
-        clip_data = dict(clip)
-        clip_data['output_filename'] = clip_filename
-        clip_data['video_url'] = f"/videos/{job_id}/{clip_filename}"
-        clips.append(clip_data)
+            clip_data = dict(clip)
+            if container_name == "long_videos":
+                clip_data["video_type"] = "long"
+            clip_data['output_filename'] = clip_filename
+            clip_data['video_url'] = f"/videos/{job_id}/{clip_filename}"
+            clips.append(clip_data)
 
     if not clips:
         return None
 
     result = {'clips': clips, 'cost_analysis': data.get('cost_analysis')}
-    for extra_key in ('analysis_status', 'analysis_error', 'analysis_coverage', 'processing_mode'):
+    for extra_key in (
+        'analysis_status', 'analysis_error', 'analysis_coverage',
+        'longform_analysis_coverage', 'processing_mode', 'video_type',
+        'long_video_skipped_reason',
+    ):
         if extra_key in data:
             result[extra_key] = data.get(extra_key)
 
@@ -1624,6 +1686,7 @@ def _build_status_payload(job: dict) -> dict:
         "analysis_error": job.get("analysis_error"),
         "analysis_coverage": job.get("analysis_coverage"),
         "processing_mode": job.get("processing_mode"),
+        "video_type": job.get("video_type"),
         "artifacts": job.get("artifacts", {}),
     }
 
@@ -1822,7 +1885,8 @@ async def process_endpoint(
     file: Optional[UploadFile] = File(None),
     url: Optional[str] = Form(None),
     output_format: Optional[str] = Form(None),
-    layout_style: Optional[str] = Form(None)
+    layout_style: Optional[str] = Form(None),
+    video_type: Optional[str] = Form(None),
 ):
     api_key = request.headers.get("X-Gemini-Key")
     if not api_key:
@@ -1837,10 +1901,13 @@ async def process_endpoint(
         force_low_quality = bool(body.get("force_low_quality"))
         output_format = body.get("output_format")
         layout_style = body.get("layout_style")
+        video_type = body.get("video_type")
 
     output_format = normalize_output_format(output_format)
     if layout_style not in ("zoom", "wide"):
         layout_style = "smart"
+    if video_type not in ("long", "auto"):
+        video_type = "shorts"
 
     if not url and not file:
         raise HTTPException(status_code=400, detail="Must provide URL or File")
@@ -1889,6 +1956,8 @@ async def process_endpoint(
     cmd.extend(["-o", job_output_dir])
     cmd.extend(["--format", output_format])
     cmd.extend(["--layout", layout_style])
+    if video_type != "shorts":
+        cmd.extend(["--video-type", video_type])
 
     # Enqueue Job
     jobs[job_id] = _build_job_state(
@@ -1904,6 +1973,7 @@ async def process_endpoint(
         'cmd': cmd,
         'env': env,
         'execution_id': uuid.uuid4().hex,
+        'video_type': video_type,
     })
     _append_log(job_id, f"Job {job_id} queued.", category="queue", important=True)
 
@@ -1947,6 +2017,7 @@ def _build_support_log_text(job: dict) -> str:
         f"Source Type: {job.get('source_type')}",
         f"Source URL: {job.get('source_url') or ''}",
         f"Processing Mode: {job.get('processing_mode') or ''}",
+        f"Video Type: {job.get('video_type') or ''}",
         f"Analysis Status: {job.get('analysis_status') or ''}",
         f"Analysis Coverage: {job.get('analysis_coverage') or {}}",
         f"Error Summary: {job.get('error_summary') or ''}",
@@ -2914,11 +2985,19 @@ async def download_all_clips(job_id: str):
         data = json.load(f)
 
     files = []
-    for i, clip in enumerate(data.get('shorts', [])):
-        filename = os.path.basename(clip.get('video_url', '').split('/')[-1])
-        path = os.path.join(output_dir, filename)
-        if filename and os.path.exists(path):
-            files.append((i, path))
+    base_name = os.path.basename(json_files[0]).replace('_metadata.json', '')
+    for prefix, entries in (("clip", data.get("shorts", [])), ("long", data.get("long_videos", []))):
+        if not isinstance(entries, list):
+            continue
+        for i, clip in enumerate(entries):
+            if not isinstance(clip, dict):
+                continue
+            filename = _resolve_clip_filename(clip, base_name, i)
+            if prefix == "long" and not clip.get("video_url") and not clip.get("output_filename"):
+                filename = f"{base_name}_long_{i + 1}.mp4"
+            path = os.path.join(output_dir, filename)
+            if filename and os.path.exists(path) and os.path.getsize(path) > 0:
+                files.append((f"{prefix}_{i + 1:02d}_{os.path.basename(path)}", path))
 
     if not files:
         raise HTTPException(status_code=404, detail="No clip files found for this job")
@@ -2928,8 +3007,8 @@ async def download_all_clips(job_id: str):
     def build_zip():
         # Videos are already compressed; store instead of deflate for speed.
         with zipfile.ZipFile(zip_path, 'w', zipfile.ZIP_STORED) as zf:
-            for i, path in files:
-                zf.write(path, arcname=f"clip_{i + 1:02d}_{os.path.basename(path)}")
+            for arcname, path in files:
+                zf.write(path, arcname=arcname)
 
     loop = asyncio.get_event_loop()
     await loop.run_in_executor(None, build_zip)
@@ -2940,6 +3019,37 @@ async def download_all_clips(job_id: str):
         filename=f"openshorts_clips_{job_id[:8]}.zip",
         background=BackgroundTask(os.remove, zip_path),
     )
+
+
+@app.get("/api/jobs/{job_id}/clips/{clip_index}/download")
+async def download_clip(job_id: str, clip_index: int):
+    """Stream the current clip version as an attachment without browser buffering."""
+    job = _get_job(job_id)
+    result = (job or {}).get("result")
+    clips = result.get("clips") if isinstance(result, dict) else None
+    if not isinstance(clips, list) or not 0 <= clip_index < len(clips):
+        raise HTTPException(status_code=404, detail="Clip not found")
+
+    clip = clips[clip_index]
+    if not isinstance(clip, dict):
+        raise HTTPException(status_code=404, detail="Clip not found")
+    candidate = clip.get("video_url") or clip.get("output_filename")
+    filename = os.path.basename(str(candidate or "").split("?", 1)[0])
+    if not filename:
+        raise HTTPException(status_code=404, detail="Clip file not found")
+
+    output_dir = os.path.realpath(
+        (job or {}).get("output_dir") or os.path.join(OUTPUT_DIR, job_id)
+    )
+    path = os.path.realpath(os.path.join(output_dir, filename))
+    try:
+        inside_output_dir = os.path.commonpath([output_dir, path]) == output_dir
+    except ValueError:
+        inside_output_dir = False
+    if not inside_output_dir or not os.path.isfile(path) or os.path.getsize(path) <= 0:
+        raise HTTPException(status_code=404, detail="Clip file not found")
+
+    return FileResponse(path, media_type="video/mp4", filename=filename)
 
 
 class HookRequest(BaseModel):
@@ -3059,11 +3169,13 @@ async def _translate_clip_locked(req: TranslateRequest, x_elevenlabs_key: Option
     with open(json_files[0], 'r', encoding='utf-8') as f:
         data = json.load(f)
 
-    clips = data.get('shorts', [])
-    if req.clip_index >= len(clips):
+    result_clips = job.get("result", {}).get("clips", []) if isinstance(job.get("result"), dict) else []
+    if req.clip_index >= len(result_clips):
         raise HTTPException(status_code=404, detail="Clip not found")
-
-    clip_data = clips[req.clip_index]
+    metadata_clips, metadata_index, _video_type = _lookup_metadata_clip(
+        data, req.clip_index, result_clips[req.clip_index],
+    )
+    clip_data = metadata_clips[metadata_index]
 
     requested_filename = os.path.basename(req.input_filename) if req.input_filename else None
     if not requested_filename and not _filename_from_clip(clip_data):
@@ -3163,6 +3275,11 @@ async def post_to_socials(req: SocialPostRequest):
         
     try:
         clip = job['result']['clips'][req.clip_index]
+        if clip.get("video_type") == "long":
+            raise HTTPException(
+                status_code=400,
+                detail="Direct posting is not supported for long videos yet. Download the video and upload it through YouTube Studio.",
+            )
         # Video URL is relative /videos/..., we need absolute file path
         # clip['video_url'] is like "/videos/{job_id}/{filename}"
         # We constructed it as: f"/videos/{job_id}/{clip_filename}"
