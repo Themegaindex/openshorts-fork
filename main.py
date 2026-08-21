@@ -170,6 +170,7 @@ JOB_STATS_SAMPLE_LIMIT = 20
 JOB_STATS_LOCK_TIMEOUT_SECONDS = 10.0
 BLOCKING_OPERATION_STALL_SECONDS = int(os.environ.get("JOB_BLOCKING_STALL_SECONDS", "1800"))
 YTDLP_PROBE_STALL_SECONDS = int(os.environ.get("JOB_YTDLP_PROBE_STALL_SECONDS", "600"))
+YTDLP_REFUSAL_BACKOFF_SECONDS = int(os.environ.get("JOB_YTDLP_REFUSAL_BACKOFF_SECONDS", "20"))
 MERGE_SECONDS_PER_SOURCE_SECOND = float(os.environ.get("JOB_MERGE_SECONDS_PER_SOURCE_SECOND", "0.015"))
 MERGE_MIN_SECONDS = float(os.environ.get("JOB_MERGE_MIN_SECONDS", "30"))
 MERGE_MAX_SECONDS = float(os.environ.get("JOB_MERGE_MAX_SECONDS", "900"))
@@ -1741,6 +1742,20 @@ def _make_ytdlp_progress_hooks():
     return download_progress_hook, download_postprocessor_hook
 
 
+_YOUTUBE_REFUSAL_MARKERS = (
+    "403", "forbidden", "429", "too many requests",
+    "unable to download video data", "fragment not found",
+)
+
+
+def _is_youtube_refusal(error):
+    """True when YouTube blocked the transfer itself, rather than something on
+    our side failing. Only these are worth retrying with a different format or
+    session — a full disk or a dead URL would fail the same way every time."""
+    text = str(error).lower()
+    return any(marker in text for marker in _YOUTUBE_REFUSAL_MARKERS)
+
+
 def download_youtube_video(url, output_dir=".", resume=False):
     """
     Downloads a YouTube video using yt-dlp.
@@ -1949,26 +1964,57 @@ Technical Details: {str(last_error)}
         os.remove(expected_file)
         print("🗑️  Removed existing file before downloading video")
     
-    ydl_opts = {
-        **_COMMON_YDL_OPTS,
-        'format': 'bestvideo[ext=mp4]+bestaudio[ext=m4a]/bestvideo[ext=mp4]+bestaudio/bestvideo+bestaudio/best[ext=mp4]/best',
-        'outtmpl': output_template,
-        'merge_output_format': 'mp4',
-        # A resume must reuse the format files a killed run already finished.
-        # Overwriting them would re-download gigabytes just to redo the merge.
-        'overwrites': not resume,
-        'continuedl': True,
-    }
-    
-    with JOB_REPORTER.operation(
-        "yt-dlp download",
-        timeout_seconds=BLOCKING_OPERATION_STALL_SECONDS,
-        message="YouTube download worker started.",
-        category="download",
-    ):
-        with yt_dlp.YoutubeDL(ydl_opts) as ydl:
-            ydl.download([url])
-    
+    best_format = 'bestvideo[ext=mp4]+bestaudio[ext=m4a]/bestvideo[ext=mp4]+bestaudio/bestvideo+bestaudio/best[ext=mp4]/best'
+    hd_format = ('bestvideo[height<=1080][ext=mp4]+bestaudio[ext=m4a]/'
+                 'bestvideo[height<=1080]+bestaudio/best[height<=1080][ext=mp4]/best')
+
+    # YouTube answers a mid-stream 403 when it refuses to keep serving a request.
+    # Repeating it unchanged only earns the same 403, so every fallback drops one
+    # of the two things that provoke it: the multi-gigabyte 4K format, and the
+    # signed-in session. A short pause between attempts lets the block expire.
+    download_attempts = [(_COMMON_YDL_OPTS, best_format, f"best available ({best_height}p)")]
+    if best_height > 1080:
+        download_attempts.append((_COMMON_YDL_OPTS, hd_format, "1080p"))
+    if _COMMON_YDL_OPTS.get('cookiefile'):
+        download_attempts.append(
+            ({**_COMMON_YDL_OPTS, 'cookiefile': None}, hd_format, "1080p without cookies"))
+
+    for index, (attempt_opts, format_spec, attempt_label) in enumerate(download_attempts):
+        ydl_opts = {
+            **attempt_opts,
+            'format': format_spec,
+            'outtmpl': output_template,
+            'merge_output_format': 'mp4',
+            # A resume must reuse the format files a killed run already finished.
+            # Overwriting them would re-download gigabytes just to redo the merge.
+            'overwrites': not resume,
+            'continuedl': True,
+        }
+
+        try:
+            with JOB_REPORTER.operation(
+                "yt-dlp download",
+                timeout_seconds=BLOCKING_OPERATION_STALL_SECONDS,
+                message=f"YouTube download worker started ({attempt_label}).",
+                category="download",
+            ):
+                with yt_dlp.YoutubeDL(ydl_opts) as ydl:
+                    ydl.download([url])
+            break
+        except Exception as e:
+            is_last_attempt = index == len(download_attempts) - 1
+            if is_last_attempt or not _is_youtube_refusal(e):
+                raise
+            next_label = download_attempts[index + 1][2]
+            JOB_REPORTER.warning(
+                f"YouTube refused the download ({attempt_label}): {e}. "
+                f"Retrying with {next_label} in {YTDLP_REFUSAL_BACKOFF_SECONDS}s.",
+                category="download",
+            )
+            print(f"⚠️ YouTube refused the {attempt_label} download — falling back to {next_label}.")
+            time.sleep(YTDLP_REFUSAL_BACKOFF_SECONDS)
+
+
     downloaded_file = os.path.join(output_dir, f'{sanitized_title}.mp4')
     
     if not os.path.exists(downloaded_file):
