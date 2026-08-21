@@ -267,3 +267,15 @@ def test_model_not_viable_is_preserved_for_score_fallback_decision():
     )
     assert result["viable"] is False
     assert result["warnings"] == ["model_marked_not_viable"]
+
+
+def test_body_segment_cap_of_one_is_a_hard_limit():
+    body = [
+        _segment(index * 30, index * 30 + 25, f"Part {index}", priority=50 + index)
+        for index in range(5)
+    ]
+
+    capped, changed = longform._cap_body_segments(body, 1)
+
+    assert changed is True
+    assert len(capped) == 1

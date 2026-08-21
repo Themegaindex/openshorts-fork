@@ -4,9 +4,10 @@ torch
 torchvision
 tqdm
 # Nightly, not stable: stable 2026.07.04 downloads via the android_vr client,
-# which YouTube answers with 403 mid-stream (yt-dlp issue #17456). Naming a
-# .dev version here is what makes pip accept pre-releases for this package.
-yt-dlp[default]>=2026.8.18.122307.dev0
+# which YouTube answers with 403 mid-stream (yt-dlp issue #17456). The exact
+# pin keeps Docker/CI reproducible. Raise it deliberately once a tested stable
+# release contains the fix.
+yt-dlp[default]==2026.8.18.122307.dev0
 faster-whisper
 google-genai
 python-dotenv

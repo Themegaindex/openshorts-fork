@@ -1,14 +1,101 @@
 from contextlib import contextmanager
+import importlib.util
 import json
 import os
 from pathlib import Path
+import sys
+from types import ModuleType, SimpleNamespace
+from unittest.mock import MagicMock
 
 import pytest
 
-pytest.importorskip("cv2")
-pytest.importorskip("ultralytics")
-pytest.importorskip("mediapipe")
-pytest.importorskip("google.genai")
+
+def _stub_missing_pipeline_dependencies():
+    """Let dependency-free pipeline tests collect in lightweight CI.
+
+    The functions in this module mock every renderer/model boundary they touch,
+    so importing multi-gigabyte video/ML packages would add cost without adding
+    coverage. Local video environments continue to use their real packages.
+    """
+    def missing(name):
+        try:
+            return importlib.util.find_spec(name) is None
+        except (ImportError, ModuleNotFoundError, ValueError):
+            return True
+
+    if missing("cv2"):
+        sys.modules["cv2"] = MagicMock()
+    if missing("numpy"):
+        sys.modules["numpy"] = MagicMock()
+    if missing("torch"):
+        torch_stub = ModuleType("torch")
+        torch_stub.cuda = SimpleNamespace(is_available=lambda: False)
+        sys.modules["torch"] = torch_stub
+    if missing("tqdm"):
+        tqdm_stub = ModuleType("tqdm")
+        tqdm_stub.tqdm = lambda iterable, *_args, **_kwargs: iterable
+        sys.modules["tqdm"] = tqdm_stub
+    if missing("yt_dlp"):
+        yt_dlp_stub = ModuleType("yt_dlp")
+        yt_dlp_stub.YoutubeDL = MagicMock()
+        yt_dlp_stub.version = SimpleNamespace(__version__="test-stub")
+        sys.modules["yt_dlp"] = yt_dlp_stub
+    if missing("scenedetect"):
+        scene_stub = ModuleType("scenedetect")
+        scene_stub.__path__ = []
+        scene_stub.SceneManager = MagicMock
+        scene_stub.VideoManager = MagicMock
+        scene_stub.open_video = MagicMock()
+        detectors_stub = ModuleType("scenedetect.detectors")
+        detectors_stub.ContentDetector = MagicMock
+        sys.modules["scenedetect"] = scene_stub
+        sys.modules["scenedetect.detectors"] = detectors_stub
+    if missing("ultralytics"):
+        ultralytics_stub = ModuleType("ultralytics")
+        ultralytics_stub.YOLO = MagicMock
+        sys.modules["ultralytics"] = ultralytics_stub
+    if missing("mediapipe"):
+        mediapipe_stub = ModuleType("mediapipe")
+        mediapipe_stub.__path__ = []
+        mediapipe_stub.Image = MagicMock
+        mediapipe_stub.ImageFormat = SimpleNamespace(SRGB="SRGB")
+        tasks_stub = ModuleType("mediapipe.tasks")
+        tasks_stub.__path__ = []
+        python_stub = ModuleType("mediapipe.tasks.python")
+        python_stub.__path__ = []
+        python_stub.BaseOptions = MagicMock
+        vision_stub = ModuleType("mediapipe.tasks.python.vision")
+        vision_stub.FaceDetectorOptions = MagicMock
+        vision_stub.RunningMode = SimpleNamespace(IMAGE="IMAGE")
+        vision_stub.FaceDetector = SimpleNamespace(
+            create_from_options=MagicMock(return_value=MagicMock()),
+        )
+        tasks_stub.python = python_stub
+        python_stub.vision = vision_stub
+        mediapipe_stub.tasks = tasks_stub
+        sys.modules["mediapipe"] = mediapipe_stub
+        sys.modules["mediapipe.tasks"] = tasks_stub
+        sys.modules["mediapipe.tasks.python"] = python_stub
+        sys.modules["mediapipe.tasks.python.vision"] = vision_stub
+    if missing("google.genai"):
+        if missing("google"):
+            google_stub = ModuleType("google")
+            google_stub.__path__ = []
+            sys.modules["google"] = google_stub
+        else:
+            import google as google_stub
+        genai_stub = ModuleType("google.genai")
+        genai_stub.__path__ = []
+        genai_stub.Client = MagicMock
+        genai_types_stub = ModuleType("google.genai.types")
+        genai_types_stub.GenerateContentConfig = MagicMock
+        genai_stub.types = genai_types_stub
+        google_stub.genai = genai_stub
+        sys.modules["google.genai"] = genai_stub
+        sys.modules["google.genai.types"] = genai_types_stub
+
+
+_stub_missing_pipeline_dependencies()
 
 import main
 
@@ -56,6 +143,27 @@ def _transcript(duration=900):
             "words": [],
         }],
     }
+
+
+@pytest.mark.parametrize("message", [
+    "ERROR: unable to download video data: HTTP Error 403: Forbidden",
+    "HTTP Error 429: Too Many Requests",
+    "ERROR: fragment 3 not found",
+    "Sign in to confirm you're not a bot",
+])
+def test_youtube_refusal_detection_matches_transfer_blocks(message):
+    assert main._is_youtube_refusal(RuntimeError(message)) is True
+
+
+@pytest.mark.parametrize("message", [
+    "ERROR: [youtube] xY403abcDe: Video unavailable",
+    "ERROR: Content too short (expected 12345 bytes and served 4291)",
+    r"C:\videos\403\source.mp4: No space left on device",
+    "Video titled Too Many Requests is unavailable",
+    "Video unavailable",
+])
+def test_youtube_refusal_detection_ignores_unrelated_numbers(message):
+    assert main._is_youtube_refusal(RuntimeError(message)) is False
 
 
 def test_detail_failure_keeps_score_data_for_auto_longform(monkeypatch):
@@ -157,6 +265,116 @@ def test_auto_detail_failure_stays_nonterminal_when_longform_succeeds(monkeypatc
     )
 
 
+def test_auto_uses_full_video_fallback_when_no_edit_is_viable(monkeypatch, tmp_path):
+    reporter = _Reporter()
+    monkeypatch.setattr(main, "JOB_REPORTER", reporter)
+
+    def no_shorts(*_args, **kwargs):
+        assert kwargs["defer_terminal_error"] is True
+        return {
+            "clips_data": None,
+            "error": "no valid Shorts",
+            "attempts": [{"stage": "detail", "status": "failed"}],
+            "cost_analysis": None,
+            "windows": [],
+            "scored_windows": [],
+        }
+
+    monkeypatch.setattr(main, "get_viral_clips", no_shorts)
+    monkeypatch.setattr(
+        main,
+        "_analyze_longform_with_fallback",
+        lambda *_args, **_kwargs: pytest.fail("short Auto sources must skip long-form planning"),
+    )
+    render_calls = []
+
+    def render_fallback(_input, output, **kwargs):
+        render_calls.append(kwargs)
+        Path(output).write_bytes(b"video")
+        return True
+
+    monkeypatch.setattr(main, "_render_clip", render_fallback)
+    metadata_file = tmp_path / "metadata.json"
+
+    metadata = main._run_video_type_pipeline(
+        "auto",
+        transcript=_transcript(120),
+        duration=120,
+        analysis_result=None,
+        output_dir=str(tmp_path),
+        video_title="Video",
+        input_video="source.mp4",
+        output_format="vertical",
+        layout_style="smart",
+        resume_requested=False,
+        resume_phase=None,
+        metadata_file=str(metadata_file),
+        analysis_result_file=str(tmp_path / "analysis.json"),
+        source_url=None,
+    )
+
+    assert metadata["processing_mode"] == "full_video_fallback"
+    assert metadata["video_type"] == "auto"
+    assert metadata["long_video_skipped_reason"].startswith("source_too_short")
+    assert len(render_calls) == 1
+    assert render_calls[0]["output_format"] == "vertical"
+    assert render_calls[0]["layout_style"] == "smart"
+    assert callable(render_calls[0]["progress_callback"])
+    assert json.loads(metadata_file.read_text(encoding="utf-8"))["video_type"] == "auto"
+    assert not any(event[0] == "error" for event in reporter.events)
+
+
+def test_long_mode_ignores_stale_shorts_resume_analysis(monkeypatch, tmp_path):
+    reporter = _Reporter()
+    monkeypatch.setattr(main, "JOB_REPORTER", reporter)
+    long_result = {
+        "plan_data": {
+            "viable": True,
+            "video_title": "Long result",
+            "youtube_description": "",
+            "segments": [{
+                "start": 0,
+                "end": 500,
+                "chapter_title": "Story",
+                "role": "body",
+            }],
+            "total_duration": 500,
+            "warnings": [],
+        },
+        "error": None,
+        "attempts": [{"stage": "longform_plan", "status": "success"}],
+        "cost_analysis": {"total_cost": 0.1},
+    }
+    monkeypatch.setattr(main, "_analyze_longform_with_fallback", lambda *_args, **_kwargs: long_result)
+    monkeypatch.setattr(main, "_render_longform_video", lambda *_args, **_kwargs: "long.mp4")
+
+    metadata = main._run_video_type_pipeline(
+        "long",
+        transcript=_transcript(),
+        duration=900,
+        analysis_result={
+            "error": "stale Shorts failure",
+            "attempts": [{"stage": "detail", "status": "failed"}],
+            "cost_analysis": {"total_cost": 99},
+        },
+        output_dir=str(tmp_path),
+        video_title="Video",
+        input_video="source.mp4",
+        output_format="vertical",
+        layout_style="smart",
+        resume_requested=True,
+        resume_phase="render",
+        metadata_file=str(tmp_path / "metadata.json"),
+        analysis_result_file=str(tmp_path / "analysis.json"),
+        source_url=None,
+    )
+
+    assert metadata["analysis_status"] == "success"
+    assert metadata["analysis_error"] is None
+    assert metadata["analysis_attempts"] == long_result["attempts"]
+    assert "stale Shorts failure" not in json.dumps(metadata)
+
+
 def test_score_fallback_builds_bounded_chronological_story():
     windows = [
         {"id": f"window_{index:03d}", "start": index * 90, "end": (index + 1) * 90, "text": "text"}
@@ -235,6 +453,57 @@ def test_score_stage_recovers_every_window_omitted_by_a_batch(monkeypatch):
     assert processed == {item["id"] for item in windows}
     assert skipped == set()
     assert sum(item["name"] == "single-window-rescue" for item in attempts) == 5
+
+
+def test_score_stage_caps_individual_rescue_calls_per_job(monkeypatch):
+    reporter = _Reporter()
+    monkeypatch.setattr(main, "JOB_REPORTER", reporter)
+    monkeypatch.setattr(main, "GEMINI_MAX_SCORE_RESCUE_CALLS", 2)
+    windows = [
+        {"id": f"window_{index:03d}", "start": index * 60, "end": (index + 1) * 60, "text": "text"}
+        for index in range(8)
+    ]
+    calls = []
+
+    def fake_worker(_mode, payload, **_kwargs):
+        batch = payload["windows"]
+        calls.append([item["id"] for item in batch])
+        returned = batch[:1]
+        return {
+            "payload": {
+                "windows": [{
+                    "id": item["id"],
+                    "start": item["start"],
+                    "end": item["end"],
+                    "score": 50,
+                    "reason": "scored",
+                } for item in returned],
+            },
+        }
+
+    monkeypatch.setattr(main, "_call_gemini_worker", fake_worker)
+
+    _scores, processed, skipped, _attempts, _costs = main._run_score_stage(
+        windows, "en", 480, None, None,
+    )
+
+    assert len(calls) == 3  # one batch plus the configured two individual rescues
+    assert len(processed) == 3
+    assert len(skipped) == 5
+    assert any(
+        event[0] == "warning" and "per-job limit" in event[1][0]
+        for event in reporter.events
+    )
+
+
+def test_score_fallback_normalizes_distance_for_long_sources():
+    selected = [{"start": 0, "end": 90, "score": 100}]
+    far_strong = {"start": 3600, "end": 3690, "score": 95}
+    near_weak = {"start": 120, "end": 210, "score": 5}
+
+    assert main._score_fallback_selection_value(far_strong, selected, 7200) > (
+        main._score_fallback_selection_value(near_weak, selected, 7200)
+    )
 
 
 @pytest.mark.parametrize("resume_phase", [None, "render"])

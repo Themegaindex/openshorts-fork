@@ -1136,12 +1136,19 @@ def _relocate_root_job_artifacts(job_id: str, job_output_dir: str) -> bool:
                 if os.path.abspath(clip_path) != os.path.abspath(dest_clip):
                     shutil.move(clip_path, dest_clip)
 
-        # Also move any temp_ clips that might remain
-        temp_clip_pattern = os.path.join(root, f"temp_{base_name}_clip_*.mp4")
-        for clip_path in glob.glob(temp_clip_pattern):
-            dest_clip = os.path.join(job_output_dir, os.path.basename(clip_path))
-            if os.path.abspath(clip_path) != os.path.abspath(dest_clip):
-                shutil.move(clip_path, dest_clip)
+        # Also relocate interrupted Shorts and long-form render intermediates.
+        # Long jobs can leave segment mp4s, a joined mp4 and a concat manifest.
+        temp_patterns = (
+            os.path.join(root, f"temp_{base_name}_clip_*.mp4"),
+            os.path.join(root, f"temp_{base_name}_long_*"),
+        )
+        for temp_pattern in temp_patterns:
+            for temp_path in glob.glob(temp_pattern):
+                if not os.path.isfile(temp_path):
+                    continue
+                destination = os.path.join(job_output_dir, os.path.basename(temp_path))
+                if os.path.abspath(temp_path) != os.path.abspath(destination):
+                    shutil.move(temp_path, destination)
 
         return True
     except Exception:

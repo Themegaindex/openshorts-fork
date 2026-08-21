@@ -72,6 +72,30 @@ def test_full_video_artifact_recovery_supports_every_canonical_format(tmp_path, 
     assert result["clips"][0]["video_title_for_youtube_short"] == "My Show"
 
 
+def test_root_artifact_recovery_relocates_longform_temp_files(monkeypatch, tmp_path):
+    job_id = "job-long"
+    base_name = f"{job_id}_Video"
+    job_output_dir = tmp_path / job_id
+    monkeypatch.setattr(app, "OUTPUT_DIR", str(tmp_path))
+    (tmp_path / f"{base_name}_metadata.json").write_text(
+        json.dumps({"shorts": [], "long_videos": []}),
+        encoding="utf-8",
+    )
+    temp_names = [
+        f"temp_{base_name}_long_seg_001.mp4",
+        f"temp_{base_name}_long_joined.mp4",
+        f"temp_{base_name}_long_concat.txt",
+    ]
+    for name in temp_names:
+        (tmp_path / name).write_bytes(b"temp")
+
+    assert app._relocate_root_job_artifacts(job_id, str(job_output_dir)) is True
+
+    for name in temp_names:
+        assert (job_output_dir / name).exists()
+        assert not (tmp_path / name).exists()
+
+
 @pytest.mark.parametrize(
     "model,payload",
     [

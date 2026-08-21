@@ -119,6 +119,10 @@ GEMINI_SHORTLIST_LIMIT = int(os.environ.get("GEMINI_SHORTLIST_LIMIT", "10"))
 GEMINI_LONG_VIDEO_SECONDS = float(os.environ.get("GEMINI_LONG_VIDEO_SECONDS", "7200"))
 GEMINI_LONG_SHORTLIST_LIMIT = int(os.environ.get("GEMINI_LONG_SHORTLIST_LIMIT", "15"))
 GEMINI_MAX_CLIPS = int(os.environ.get("GEMINI_MAX_CLIPS", "10"))
+GEMINI_MAX_SCORE_RESCUE_CALLS = max(
+    0,
+    int(os.environ.get("GEMINI_MAX_SCORE_RESCUE_CALLS", "16")),
+)
 GEMINI_WORKER_SCRIPT = os.path.join(os.path.dirname(os.path.abspath(__file__)), "gemini_worker.py")
 LONGFORM_TARGET_MIN_SECONDS = float(os.environ.get("LONGFORM_TARGET_MIN_SECONDS", "480"))
 LONGFORM_TARGET_MAX_SECONDS = float(os.environ.get("LONGFORM_TARGET_MAX_SECONDS", "600"))
@@ -1222,12 +1226,22 @@ def _normalize_shorts_payload(payload, video_duration, words=None, max_clips=Non
     return {"shorts": choose_distinct_clips(normalized_shorts, max_clips=clip_limit)}
 
 
-def _build_fallback_metadata(video_title, transcript, duration, output_filename, analysis_error, attempts, cost_analysis=None):
+def _build_fallback_metadata(
+    video_title,
+    transcript,
+    duration,
+    output_filename,
+    analysis_error,
+    attempts,
+    cost_analysis=None,
+    video_type="shorts",
+):
     title = video_title.replace("_", " ").strip() or "Fallback video"
 
     metadata = {
         "schema_version": 1,
         "processing_mode": "full_video_fallback",
+        "video_type": video_type,
         "analysis_status": "fallback",
         "analysis_error": analysis_error,
         "analysis_attempts": attempts,
@@ -1802,9 +1816,14 @@ def _make_ytdlp_progress_hooks():
     return download_progress_hook, download_postprocessor_hook
 
 
+_YOUTUBE_REFUSAL_PATTERNS = (
+    re.compile(r"\bhttp(?:\s+error)?\s*(?:403|429)\b", re.IGNORECASE),
+    re.compile(r"\bstatus(?:\s+code)?\s*[:=]?\s*(?:403|429)\b", re.IGNORECASE),
+    re.compile(r"\bfragment(?:\s+\d+)?\s+not\s+found\b", re.IGNORECASE),
+)
 _YOUTUBE_REFUSAL_MARKERS = (
-    "403", "forbidden", "429", "too many requests",
-    "unable to download video data", "fragment not found",
+    "sign in to confirm you're not a bot",
+    "sign in to confirm you’re not a bot",
 )
 
 
@@ -1812,8 +1831,12 @@ def _is_youtube_refusal(error):
     """True when YouTube blocked the transfer itself, rather than something on
     our side failing. Only these are worth retrying with a different format or
     session — a full disk or a dead URL would fail the same way every time."""
-    text = str(error).lower()
-    return any(marker in text for marker in _YOUTUBE_REFUSAL_MARKERS)
+    text = str(error)
+    lowered = text.lower()
+    return (
+        any(pattern.search(text) for pattern in _YOUTUBE_REFUSAL_PATTERNS)
+        or any(marker in lowered for marker in _YOUTUBE_REFUSAL_MARKERS)
+    )
 
 
 def download_youtube_video(url, output_dir=".", resume=False):
@@ -2618,13 +2641,32 @@ def _run_score_stage(windows, transcript_language, video_duration, output_dir, v
     scored_input_ids = set()
     skipped_score_ids = set()
     total_score_batches = max(1, math.ceil(len(windows) / GEMINI_SCORE_BATCH_SIZE))
+    score_rescue_calls_remaining = GEMINI_MAX_SCORE_RESCUE_CALLS
+    rescue_budget_warning_emitted = False
 
     def rescue_missing_scores(batch_index, missing_windows):
+        nonlocal score_rescue_calls_remaining, rescue_budget_warning_emitted
         if not missing_windows:
+            return
+        missing_windows = list(missing_windows)
+        rescue_windows = missing_windows[:score_rescue_calls_remaining]
+        unattempted_windows = missing_windows[len(rescue_windows):]
+        score_rescue_calls_remaining -= len(rescue_windows)
+        if unattempted_windows:
+            skipped_score_ids.update(str(window.get("id")) for window in unattempted_windows)
+            if not rescue_budget_warning_emitted:
+                rescue_budget_warning_emitted = True
+                JOB_REPORTER.warning(
+                    "Score recovery reached its per-job limit of "
+                    f"{GEMINI_MAX_SCORE_RESCUE_CALLS} individual request(s); "
+                    "remaining windows will be recorded as skipped.",
+                    category="gemini",
+                )
+        if not rescue_windows:
             return
         rescued, failed_ids, rescue_costs, rescue_attempts = _rescue_gemini_windows(
             "score",
-            missing_windows,
+            rescue_windows,
             video_duration=video_duration,
             language=transcript_language,
             output_dir=output_dir,
@@ -2741,13 +2783,14 @@ def _run_score_stage(windows, transcript_language, video_duration, output_dir, v
             if missing_windows:
                 JOB_REPORTER.warning(
                     f"Gemini omitted {len(missing_windows)} score window(s) in batch {batch_index + 1}; "
-                    "recovering them individually.",
+                    "attempting bounded individual recovery.",
                     category="gemini",
                 )
                 rescue_missing_scores(batch_index, missing_windows)
         elif last_error_type in RESCUABLE_GEMINI_ERROR_TYPES:
             JOB_REPORTER.warning(
-                f"Recovering score batch {batch_index + 1}/{total_score_batches} one window at a time.",
+                f"Attempting bounded one-window recovery for score batch "
+                f"{batch_index + 1}/{total_score_batches}.",
                 category="gemini",
             )
             rescue_missing_scores(batch_index, batch_windows)
@@ -3268,6 +3311,16 @@ def get_longform_plan(
     }
 
 
+def _score_fallback_selection_value(item, selected, video_duration):
+    """Prefer strong SCORE results while using normalized distance for continuity."""
+    distance = min(
+        min(abs(item["start"] - picked["end"]), abs(picked["start"] - item["end"]))
+        for picked in selected
+    )
+    normalized_distance = min(1.0, distance / max(1.0, float(video_duration)))
+    return float(item["score"]) - (normalized_distance * 25.0)
+
+
 def _score_based_longform_fallback(
     transcript_result,
     video_duration,
@@ -3312,14 +3365,12 @@ def _score_based_longform_fallback(
         if not selected:
             chosen = max(remaining, key=lambda item: (item["score"], item["end"] - item["start"]))
         else:
-            def _selection_value(item):
-                distance = min(
-                    min(abs(item["start"] - picked["end"]), abs(picked["start"] - item["end"]))
-                    for picked in selected
-                )
-                return (item["score"] * 10.0) - distance
-
-            chosen = max(remaining, key=_selection_value)
+            chosen = max(
+                remaining,
+                key=lambda item: _score_fallback_selection_value(
+                    item, selected, video_duration,
+                ),
+            )
         selected.append(chosen)
         remaining.remove(chosen)
         merged = longform.merge_plan_segments([
@@ -3731,6 +3782,80 @@ def _analyze_longform_with_fallback(
     return result
 
 
+def _render_full_video_fallback(
+    *,
+    transcript,
+    duration,
+    output_dir,
+    video_title,
+    input_video,
+    output_format,
+    layout_style,
+    metadata_file,
+    analysis_error,
+    attempts,
+    cost_analysis=None,
+    video_type="shorts",
+    long_video_skipped_reason=None,
+):
+    """Render the complete source when Shorts/Auto analysis yields no output."""
+    print("❌ Failed to identify a viable edit. Converting the whole video as fallback.")
+    JOB_REPORTER.set_phase(
+        "render",
+        "Rendering fallback video",
+        message="AI analysis produced no viable edit; rendering the full source.",
+    )
+    JOB_REPORTER.set_output_seconds(duration)
+    output_file = _full_render_filename(output_dir, video_title, output_format)
+    with JOB_REPORTER.operation(
+        "fallback render",
+        timeout_seconds=BLOCKING_OPERATION_STALL_SECONDS,
+        message="Fallback renderer started.",
+        category="render",
+    ):
+        success = _render_clip(
+            input_video,
+            output_file,
+            output_format=output_format,
+            layout_style=layout_style,
+            progress_callback=lambda percent, message: JOB_REPORTER.progress(
+                percent,
+                message=message,
+                category="render",
+            ),
+        )
+    if not success:
+        raise RuntimeError("Full-video fallback rendering failed.")
+
+    metadata = _build_fallback_metadata(
+        video_title=video_title,
+        transcript=transcript,
+        duration=duration,
+        output_filename=output_file,
+        analysis_error=analysis_error,
+        attempts=attempts,
+        cost_analysis=cost_analysis,
+        video_type=video_type,
+    )
+    if long_video_skipped_reason:
+        metadata["long_video_skipped_reason"] = long_video_skipped_reason
+    _save_json_file(metadata_file, metadata)
+    JOB_REPORTER.artifact(
+        "metadata",
+        metadata_file,
+        message=f"Saved fallback metadata to {metadata_file}",
+    )
+    JOB_REPORTER.emit(
+        "result_mode",
+        message="Output mode: full_video_fallback",
+        processing_mode="full_video_fallback",
+        analysis_status=metadata["analysis_status"],
+        analysis_error=metadata["analysis_error"],
+    )
+    JOB_REPORTER.warning("Fallback video rendered after AI analysis failed.")
+    return metadata
+
+
 def _run_video_type_pipeline(
     video_type,
     *,
@@ -3751,6 +3876,10 @@ def _run_video_type_pipeline(
     del source_url  # Source provenance already lives in analysis_input.json.
     JOB_REPORTER.stats_excluded_phases = {"analyze", "render"}
     _validate_longform_source_duration(video_type, duration)
+    if video_type == "long":
+        # Long-only runs never consume Shorts analysis. Discarding it also
+        # prevents stale resume metadata/costs from contaminating this result.
+        analysis_result = None
 
     shorts_data = None
     long_result = None
@@ -3807,10 +3936,34 @@ def _run_video_type_pipeline(
 
     has_shorts = bool(shorts_data and shorts_data.get("shorts"))
     has_long = bool(long_plan)
+    short_error = analysis_result.get("error") if isinstance(analysis_result, dict) else None
+    long_error = long_result.get("error") if isinstance(long_result, dict) else None
+    analysis_attempts = (
+        (analysis_result.get("attempts", []) if isinstance(analysis_result, dict) else [])
+        + (long_result.get("attempts", []) if isinstance(long_result, dict) else [])
+    )
+    cost_analysis = _merge_cost_analyses([
+        analysis_result.get("cost_analysis") if isinstance(analysis_result, dict) else None,
+        long_result.get("cost_analysis") if isinstance(long_result, dict) else None,
+    ])
     if not has_shorts and not has_long:
-        short_error = analysis_result.get("error") if isinstance(analysis_result, dict) else None
-        long_error = long_result.get("error") if isinstance(long_result, dict) else None
         details = "; ".join(part for part in (short_error, long_error, long_skipped_reason) if part)
+        if video_type == "auto":
+            return _render_full_video_fallback(
+                transcript=transcript,
+                duration=duration,
+                output_dir=output_dir,
+                video_title=video_title,
+                input_video=input_video,
+                output_format=output_format,
+                layout_style=layout_style,
+                metadata_file=metadata_file,
+                analysis_error=details or "No viable Auto output was produced.",
+                attempts=analysis_attempts,
+                cost_analysis=cost_analysis,
+                video_type=video_type,
+                long_video_skipped_reason=long_skipped_reason,
+            )
         raise RuntimeError(
             "No viable Shorts or bounded long-form video could be produced"
             + (f": {details}" if details else ".")
@@ -3828,8 +3981,6 @@ def _run_video_type_pipeline(
     else:
         processing_mode = "clips"
 
-    short_error = analysis_result.get("error") if isinstance(analysis_result, dict) else None
-    long_error = long_result.get("error") if isinstance(long_result, dict) else None
     analysis_errors = [item for item in (short_error, long_error) if item]
     metadata = {
         "schema_version": 1,
@@ -3837,19 +3988,13 @@ def _run_video_type_pipeline(
         "video_type": video_type,
         "analysis_status": "success" if not analysis_errors else "partial",
         "analysis_error": "; ".join(analysis_errors) or None,
-        "analysis_attempts": (
-            (analysis_result.get("attempts", []) if isinstance(analysis_result, dict) else [])
-            + (long_result.get("attempts", []) if isinstance(long_result, dict) else [])
-        ),
+        "analysis_attempts": analysis_attempts,
         "analysis_coverage": (
             analysis_result.get("analysis_coverage") if isinstance(analysis_result, dict)
             else long_result.get("analysis_coverage") if isinstance(long_result, dict) else None
         ),
         "longform_analysis_coverage": long_result.get("analysis_coverage") if isinstance(long_result, dict) else None,
-        "cost_analysis": _merge_cost_analyses([
-            analysis_result.get("cost_analysis") if isinstance(analysis_result, dict) else None,
-            long_result.get("cost_analysis") if isinstance(long_result, dict) else None,
-        ]),
+        "cost_analysis": cost_analysis,
         "transcript": transcript,
         "shorts": shorts_data.get("shorts", []) if has_shorts else [],
         "long_videos": long_entries,
@@ -4243,7 +4388,7 @@ if __name__ == '__main__':
                     or _analysis_result_has_reusable_scores(analysis_result)
                 )
                 if video_type == "auto"
-                else True
+                else False
             )
             if force_analyze or not reusable_analysis:
                 analysis_result = None
@@ -4398,37 +4543,20 @@ if __name__ == '__main__':
 
                 reporter.set_phase("render", "Rendering clips", message="Starting vertical render...")
                 if not clips_data or 'shorts' not in clips_data:
-                    print("❌ Failed to identify clips. Converting whole video as fallback.")
-                    reporter.set_output_seconds(duration)
-                    output_file = _full_render_filename(output_dir, video_title, output_format)
-                    with reporter.operation(
-                        "fallback render",
-                        timeout_seconds=BLOCKING_OPERATION_STALL_SECONDS,
-                        message="Fallback renderer started.",
-                        category="render",
-                    ):
-                        success = _render_clip(
-                            input_video,
-                            output_file,
-                            output_format=output_format,
-                            layout_style=layout_style,
-                            progress_callback=lambda percent, message: reporter.progress(percent, message=message, category="render"),
-                        )
-                    if not success:
-                        raise RuntimeError("Full-video fallback rendering failed.")
-
-                    fallback_metadata = _build_fallback_metadata(
-                        video_title=video_title,
+                    _render_full_video_fallback(
                         transcript=transcript,
                         duration=duration,
-                        output_filename=output_file,
+                        output_dir=output_dir,
+                        video_title=video_title,
+                        input_video=input_video,
+                        output_format=output_format,
+                        layout_style=layout_style,
+                        metadata_file=metadata_file,
                         analysis_error=analysis_result["error"],
                         attempts=analysis_result["attempts"],
                         cost_analysis=analysis_result["cost_analysis"],
+                        video_type="shorts",
                     )
-                    _save_json_file(metadata_file, fallback_metadata)
-                    reporter.artifact("metadata", metadata_file, message=f"Saved fallback metadata to {metadata_file}")
-                    reporter.warning("Fallback video rendered after AI analysis failed.")
                 else:
                     print(f"🔥 Found {len(clips_data['shorts'])} viral clips!")
                     clips_data['schema_version'] = 1

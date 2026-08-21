@@ -288,8 +288,11 @@ def fit_plan_to_target(
 
 
 def _cap_body_segments(body: list[dict], max_count: int) -> tuple[list[dict], bool]:
+    max_count = max(0, int(max_count))
     if len(body) <= max_count:
         return body, False
+    if max_count == 0:
+        return [], bool(body)
     protected = {
         index for index, item in enumerate(body)
         if _is_protected(item, index, len(body))
@@ -307,8 +310,21 @@ def _cap_body_segments(body: list[dict], max_count: int) -> tuple[list[dict], bo
     )
     keep = protected | {index for index, _item in optional[:remaining_slots]}
     # If the model marked more segments required than the hard cap, retain the
-    # strongest protected items but always preserve chronological endpoints.
+    # strongest protected items and preserve both endpoints whenever the cap
+    # has room for both.
     if len(keep) > max_count:
+        if max_count == 1:
+            strongest = max(
+                keep,
+                key=lambda index: (
+                    int(body[index].get("continuity_importance", 50)),
+                    int(body[index].get("priority", 50)),
+                    _duration(body[index]),
+                    -index,
+                ),
+            )
+            keep = {strongest}
+            return [body[strongest]], True
         endpoints = {0, len(body) - 1}
         ranked = sorted(
             (index for index in keep if index not in endpoints),
