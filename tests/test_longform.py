@@ -146,6 +146,22 @@ def test_fit_trims_at_sentence_when_whole_segment_drop_would_undershoot():
     assert "trimmed_at_sentence:Detail" in warnings
 
 
+def test_fit_ignores_sentence_boundary_outside_remaining_cut_budget():
+    segments = [_segment(0, 610, "Story", role="setup", required=True)]
+    words = [
+        {"w": "old sentence.", "s": 29, "e": 30},
+        {"w": "continuing", "s": 599, "e": 600},
+    ]
+
+    fitted, warnings = longform.fit_plan_to_target(
+        segments, 480, 600, words=words, min_segment_seconds=20,
+    )
+
+    assert sum(item["end"] - item["start"] for item in fitted) == 600
+    assert fitted[0]["end"] == 600
+    assert "short_result" not in warnings
+
+
 def test_chapters_fold_short_cold_open_marker_into_valid_timeline():
     chapters = longform.build_chapters([
         _segment(100, 108, "Cold open", role="cold_open"),

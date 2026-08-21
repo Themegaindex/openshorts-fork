@@ -103,14 +103,23 @@ def _trim_segment_end(
     *,
     words: Optional[list[dict]],
     min_segment_seconds: float,
+    max_cut_seconds: float,
 ) -> Optional[dict]:
-    desired_end = float(segment["start"]) + max(min_segment_seconds, new_duration)
-    snapped_end = _sentence_end_at_or_before(words, float(segment["start"]) + min_segment_seconds, desired_end)
+    segment_start = float(segment["start"])
+    segment_end = float(segment["end"])
+    desired_end = segment_start + max(min_segment_seconds, new_duration)
+    earliest_safe_end = max(
+        segment_start + min_segment_seconds,
+        segment_end - max(0.0, max_cut_seconds),
+    )
+    if desired_end + 0.001 < earliest_safe_end:
+        return None
+    snapped_end = _sentence_end_at_or_before(words, earliest_safe_end, desired_end)
     end = snapped_end if snapped_end is not None else desired_end
-    if end - float(segment["start"]) < min_segment_seconds:
+    if end - segment_start < min_segment_seconds:
         return None
     result = _copy_segment(segment)
-    result["end"] = round(min(float(segment["end"]), end), 3)
+    result["end"] = round(min(segment_end, end), 3)
     return result
 
 
@@ -252,11 +261,13 @@ def fit_plan_to_target(
             if available <= 0:
                 continue
             requested_cut = min(available, excess)
+            max_safe_cut = min(available, total - target_min_seconds)
             trimmed = _trim_segment_end(
                 segment,
                 _duration(segment) - requested_cut,
                 words=words,
                 min_segment_seconds=min_segment_seconds,
+                max_cut_seconds=max_safe_cut,
             )
             if not trimmed:
                 continue
