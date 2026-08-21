@@ -123,6 +123,10 @@ GEMINI_MAX_SCORE_RESCUE_CALLS = max(
     0,
     int(os.environ.get("GEMINI_MAX_SCORE_RESCUE_CALLS", "16")),
 )
+AUTO_FULL_VIDEO_FALLBACK_MAX_SECONDS = max(
+    0.0,
+    float(os.environ.get("AUTO_FULL_VIDEO_FALLBACK_MAX_SECONDS", "1800")),
+)
 GEMINI_WORKER_SCRIPT = os.path.join(os.path.dirname(os.path.abspath(__file__)), "gemini_worker.py")
 LONGFORM_TARGET_MIN_SECONDS = float(os.environ.get("LONGFORM_TARGET_MIN_SECONDS", "480"))
 LONGFORM_TARGET_MAX_SECONDS = float(os.environ.get("LONGFORM_TARGET_MAX_SECONDS", "600"))
@@ -1820,6 +1824,11 @@ _YOUTUBE_REFUSAL_PATTERNS = (
     re.compile(r"\bhttp(?:\s+error)?\s*(?:403|429)\b", re.IGNORECASE),
     re.compile(r"\bstatus(?:\s+code)?\s*[:=]?\s*(?:403|429)\b", re.IGNORECASE),
     re.compile(r"\bfragment(?:\s+\d+)?\s+not\s+found\b", re.IGNORECASE),
+    re.compile(
+        r"\bunable to download video data\b.*\b(?:connection reset(?: by peer)?|"
+        r"remote end closed connection|connection aborted|timed? out)\b",
+        re.IGNORECASE,
+    ),
 )
 _YOUTUBE_REFUSAL_MARKERS = (
     "sign in to confirm you're not a bot",
@@ -3948,7 +3957,11 @@ def _run_video_type_pipeline(
     ])
     if not has_shorts and not has_long:
         details = "; ".join(part for part in (short_error, long_error, long_skipped_reason) if part)
-        if video_type == "auto":
+        auto_fallback_allowed = (
+            AUTO_FULL_VIDEO_FALLBACK_MAX_SECONDS > 0
+            and duration <= AUTO_FULL_VIDEO_FALLBACK_MAX_SECONDS
+        )
+        if video_type == "auto" and auto_fallback_allowed:
             return _render_full_video_fallback(
                 transcript=transcript,
                 duration=duration,
@@ -3964,6 +3977,16 @@ def _run_video_type_pipeline(
                 video_type=video_type,
                 long_video_skipped_reason=long_skipped_reason,
             )
+        if video_type == "auto":
+            if AUTO_FULL_VIDEO_FALLBACK_MAX_SECONDS <= 0:
+                fallback_limit = "full-video fallback disabled by configuration"
+            else:
+                fallback_limit = (
+                    "full-video fallback disabled because source duration "
+                    f"{int(duration)}s exceeds the configured "
+                    f"{int(AUTO_FULL_VIDEO_FALLBACK_MAX_SECONDS)}s limit"
+                )
+            details = "; ".join(part for part in (details, fallback_limit) if part)
         raise RuntimeError(
             "No viable Shorts or bounded long-form video could be produced"
             + (f": {details}" if details else ".")

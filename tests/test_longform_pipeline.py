@@ -1,5 +1,5 @@
 from contextlib import contextmanager
-import importlib.util
+import importlib
 import json
 import os
 from pathlib import Path
@@ -17,32 +17,40 @@ def _stub_missing_pipeline_dependencies():
     so importing multi-gigabyte video/ML packages would add cost without adding
     coverage. Local video environments continue to use their real packages.
     """
-    def missing(name):
+    def unavailable(name):
         try:
-            return importlib.util.find_spec(name) is None
-        except (ImportError, ModuleNotFoundError, ValueError):
+            importlib.import_module(name)
+            return False
+        except Exception:
+            # A binary package can have discoverable metadata but still fail to
+            # load (for example cv2 without libGL). Clear partial imports before
+            # installing the test double that main.py will consume.
+            for module_name in tuple(sys.modules):
+                if module_name == name or module_name.startswith(f"{name}."):
+                    sys.modules.pop(module_name, None)
             return True
 
-    if missing("cv2"):
+    if unavailable("cv2"):
         sys.modules["cv2"] = MagicMock()
-    if missing("numpy"):
+    if unavailable("numpy"):
+        # Every numpy-using renderer boundary must stay mocked in this module.
         numpy_stub = ModuleType("numpy")
         numpy_stub._openshorts_test_stub = True
         sys.modules["numpy"] = numpy_stub
-    if missing("torch"):
+    if unavailable("torch"):
         torch_stub = ModuleType("torch")
         torch_stub.cuda = SimpleNamespace(is_available=lambda: False)
         sys.modules["torch"] = torch_stub
-    if missing("tqdm"):
+    if unavailable("tqdm"):
         tqdm_stub = ModuleType("tqdm")
         tqdm_stub.tqdm = lambda iterable, *_args, **_kwargs: iterable
         sys.modules["tqdm"] = tqdm_stub
-    if missing("yt_dlp"):
+    if unavailable("yt_dlp"):
         yt_dlp_stub = ModuleType("yt_dlp")
         yt_dlp_stub.YoutubeDL = MagicMock()
         yt_dlp_stub.version = SimpleNamespace(__version__="test-stub")
         sys.modules["yt_dlp"] = yt_dlp_stub
-    if missing("scenedetect"):
+    if unavailable("scenedetect"):
         scene_stub = ModuleType("scenedetect")
         scene_stub.__path__ = []
         scene_stub.SceneManager = MagicMock
@@ -52,11 +60,11 @@ def _stub_missing_pipeline_dependencies():
         detectors_stub.ContentDetector = MagicMock
         sys.modules["scenedetect"] = scene_stub
         sys.modules["scenedetect.detectors"] = detectors_stub
-    if missing("ultralytics"):
+    if unavailable("ultralytics"):
         ultralytics_stub = ModuleType("ultralytics")
         ultralytics_stub.YOLO = MagicMock
         sys.modules["ultralytics"] = ultralytics_stub
-    if missing("mediapipe"):
+    if unavailable("mediapipe"):
         mediapipe_stub = ModuleType("mediapipe")
         mediapipe_stub.__path__ = []
         mediapipe_stub.Image = MagicMock
@@ -79,8 +87,8 @@ def _stub_missing_pipeline_dependencies():
         sys.modules["mediapipe.tasks"] = tasks_stub
         sys.modules["mediapipe.tasks.python"] = python_stub
         sys.modules["mediapipe.tasks.python.vision"] = vision_stub
-    if missing("google.genai"):
-        if missing("google"):
+    if unavailable("google.genai"):
+        if unavailable("google"):
             google_stub = ModuleType("google")
             google_stub.__path__ = []
             sys.modules["google"] = google_stub
@@ -158,6 +166,8 @@ def _transcript(duration=900):
     "HTTP Error 429: Too Many Requests",
     "ERROR: fragment 3 not found",
     "Sign in to confirm you're not a bot",
+    "ERROR: unable to download video data: <urlopen error [Errno 104] Connection reset by peer>",
+    "ERROR: unable to download video data: Remote end closed connection without response",
 ])
 def test_youtube_refusal_detection_matches_transfer_blocks(message):
     assert main._is_youtube_refusal(RuntimeError(message)) is True
@@ -330,6 +340,56 @@ def test_auto_uses_full_video_fallback_when_no_edit_is_viable(monkeypatch, tmp_p
     assert callable(render_calls[0]["progress_callback"])
     assert json.loads(metadata_file.read_text(encoding="utf-8"))["video_type"] == "auto"
     assert not any(event[0] == "error" for event in reporter.events)
+
+
+def test_auto_does_not_render_unbounded_full_video_fallback(monkeypatch, tmp_path):
+    reporter = _Reporter()
+    monkeypatch.setattr(main, "JOB_REPORTER", reporter)
+    monkeypatch.setattr(main, "AUTO_FULL_VIDEO_FALLBACK_MAX_SECONDS", 600)
+    monkeypatch.setattr(
+        main,
+        "get_viral_clips",
+        lambda *_args, **_kwargs: {
+            "clips_data": None,
+            "error": "no valid Shorts",
+            "attempts": [],
+            "cost_analysis": None,
+            "windows": [],
+            "scored_windows": [],
+        },
+    )
+    monkeypatch.setattr(
+        main,
+        "_analyze_longform_with_fallback",
+        lambda *_args, **_kwargs: {
+            "plan_data": None,
+            "error": "no coherent long plan",
+            "attempts": [],
+        },
+    )
+    monkeypatch.setattr(
+        main,
+        "_render_clip",
+        lambda *_args, **_kwargs: pytest.fail("oversized Auto fallback must not render"),
+    )
+
+    with pytest.raises(RuntimeError, match=r"7200s exceeds the configured 600s limit"):
+        main._run_video_type_pipeline(
+            "auto",
+            transcript=_transcript(7200),
+            duration=7200,
+            analysis_result=None,
+            output_dir=str(tmp_path),
+            video_title="LongSource",
+            input_video="input.mp4",
+            output_format="vertical",
+            layout_style="smart",
+            resume_requested=False,
+            resume_phase=None,
+            metadata_file=str(tmp_path / "metadata.json"),
+            analysis_result_file=str(tmp_path / "analysis.json"),
+            source_url=None,
+        )
 
 
 def test_long_mode_ignores_stale_shorts_resume_analysis(monkeypatch, tmp_path):
