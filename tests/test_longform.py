@@ -1,5 +1,7 @@
 import math
 
+import pytest
+
 import longform
 
 
@@ -75,6 +77,35 @@ def test_merge_absorbs_small_gap_and_preserves_continuity_metadata():
     assert merged[0]["priority"] == 75
     assert merged[0]["continuity_importance"] == 80
     assert merged[0]["required"] is True
+
+
+@pytest.mark.parametrize("duration", [241, 250, 259, 481])
+def test_split_long_segment_rebalances_short_tails_within_duration_bounds(duration):
+    pieces = longform._split_long_segment(
+        _segment(0, duration, "Long section"),
+        240,
+        min_segment_seconds=20,
+        words=[],
+    )
+
+    assert pieces[0]["start"] == 0
+    assert pieces[-1]["end"] == duration
+    assert all(
+        current["end"] == following["start"]
+        for current, following in zip(pieces, pieces[1:])
+    )
+    assert all(20 <= item["end"] - item["start"] <= 240 for item in pieces)
+    assert math.isclose(sum(item["end"] - item["start"] for item in pieces), duration)
+
+
+def test_split_long_segment_rejects_impossible_duration_constraints():
+    with pytest.raises(ValueError, match="minimum and maximum"):
+        longform._split_long_segment(
+            _segment(0, 31, "Impossible section"),
+            30,
+            min_segment_seconds=20,
+            words=[],
+        )
 
 
 def test_fit_drops_optional_material_but_protects_story_roles():

@@ -121,28 +121,60 @@ def _split_long_segment(
     min_segment_seconds: float,
     words: Optional[list[dict]],
 ) -> list[dict]:
-    if _duration(segment) <= max_segment_seconds + 0.001:
+    segment_duration = _duration(segment)
+    if segment_duration <= max_segment_seconds + 0.001:
         return [segment]
+
+    piece_count = int(math.ceil(segment_duration / max_segment_seconds))
+    if segment_duration + 0.001 < piece_count * min_segment_seconds:
+        raise ValueError(
+            "Segment cannot satisfy both the configured minimum and maximum durations."
+        )
+
     pieces = []
     cursor = float(segment["start"])
     final_end = float(segment["end"])
-    while final_end - cursor > max_segment_seconds:
-        desired_end = cursor + max_segment_seconds
-        split_end = _sentence_end_at_or_before(words, cursor + min_segment_seconds, desired_end)
-        if split_end is None or split_end - cursor < min_segment_seconds:
+    pieces_remaining = piece_count
+    while pieces_remaining > 1:
+        remaining_duration = final_end - cursor
+        later_piece_count = pieces_remaining - 1
+        min_piece_duration = max(
+            min_segment_seconds,
+            remaining_duration - later_piece_count * max_segment_seconds,
+        )
+        max_piece_duration = min(
+            max_segment_seconds,
+            remaining_duration - later_piece_count * min_segment_seconds,
+        )
+        if max_piece_duration + 0.001 < min_piece_duration:
+            raise ValueError(
+                "Segment cannot satisfy both the configured minimum and maximum durations."
+            )
+
+        desired_end = cursor + max_piece_duration
+        split_end = _sentence_end_at_or_before(
+            words,
+            cursor + min_piece_duration,
+            desired_end,
+        )
+        if split_end is None:
             split_end = desired_end
+        split_end = _clamp(
+            split_end,
+            cursor + min_piece_duration,
+            desired_end,
+        )
         piece = _copy_segment(segment)
         piece["start"] = round(cursor, 3)
         piece["end"] = round(split_end, 3)
         pieces.append(piece)
         cursor = split_end
-    if final_end - cursor < min_segment_seconds and pieces:
-        pieces[-1]["end"] = round(final_end, 3)
-    else:
-        tail = _copy_segment(segment)
-        tail["start"] = round(cursor, 3)
-        tail["end"] = round(final_end, 3)
-        pieces.append(tail)
+        pieces_remaining -= 1
+
+    tail = _copy_segment(segment)
+    tail["start"] = round(cursor, 3)
+    tail["end"] = round(final_end, 3)
+    pieces.append(tail)
     return pieces
 
 
