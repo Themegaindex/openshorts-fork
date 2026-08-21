@@ -3659,12 +3659,13 @@ def _analyze_longform_with_fallback(
     *,
     output_dir,
     video_title,
+    resume_requested,
     resume_phase,
     windows=None,
     scored_windows=None,
 ):
     result_path = os.path.join(output_dir, f"{video_title}_longform_result.json")
-    if resume_phase != "analyze":
+    if resume_requested and resume_phase != "analyze":
         checkpoint = _load_json_file(result_path)
         if _longform_result_has_valid_plan(checkpoint):
             JOB_REPORTER.artifact("longform_result", result_path)
@@ -3710,6 +3711,7 @@ def _run_video_type_pipeline(
     input_video,
     output_format,
     layout_style,
+    resume_requested,
     resume_phase,
     metadata_file,
     analysis_result_file,
@@ -3747,6 +3749,7 @@ def _run_video_type_pipeline(
                 duration,
                 output_dir=output_dir,
                 video_title=video_title,
+                resume_requested=resume_requested,
                 resume_phase=resume_phase,
                 windows=analysis_result.get("windows"),
                 scored_windows=analysis_result.get("scored_windows"),
@@ -3764,6 +3767,7 @@ def _run_video_type_pipeline(
             duration,
             output_dir=output_dir,
             video_title=video_title,
+            resume_requested=resume_requested,
             resume_phase=resume_phase,
         )
         if _longform_result_has_valid_plan(long_result):
@@ -4334,6 +4338,7 @@ if __name__ == '__main__':
                     input_video=input_video,
                     output_format=output_format,
                     layout_style=layout_style,
+                    resume_requested=bool(args.resume_dir),
                     resume_phase=args.resume_phase,
                     metadata_file=metadata_file,
                     analysis_result_file=analysis_result_file,

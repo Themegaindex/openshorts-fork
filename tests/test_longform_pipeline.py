@@ -161,7 +161,8 @@ def test_score_stage_recovers_every_window_omitted_by_a_batch(monkeypatch):
     assert sum(item["name"] == "single-window-rescue" for item in attempts) == 5
 
 
-def test_longform_resume_reuses_valid_checkpoint_without_gemini(monkeypatch, tmp_path):
+@pytest.mark.parametrize("resume_phase", [None, "render"])
+def test_longform_resume_reuses_valid_checkpoint_without_gemini(monkeypatch, tmp_path, resume_phase):
     reporter = _Reporter()
     monkeypatch.setattr(main, "JOB_REPORTER", reporter)
     checkpoint = {
@@ -179,9 +180,40 @@ def test_longform_resume_reuses_valid_checkpoint_without_gemini(monkeypatch, tmp
     )
 
     result = main._analyze_longform_with_fallback(
-        _transcript(), 900, output_dir=str(tmp_path), video_title="Video", resume_phase="render",
+        _transcript(), 900, output_dir=str(tmp_path), video_title="Video",
+        resume_requested=True, resume_phase=resume_phase,
     )
     assert result == checkpoint
+
+
+def test_fresh_longform_run_ignores_checkpoint_from_reused_output_directory(monkeypatch, tmp_path):
+    reporter = _Reporter()
+    monkeypatch.setattr(main, "JOB_REPORTER", reporter)
+    stale = {
+        "plan_data": {
+            "viable": True,
+            "segments": [{"start": 0, "end": 500, "role": "body"}],
+            "total_duration": 500,
+        }
+    }
+    fresh = {
+        "plan_data": {
+            "viable": True,
+            "segments": [{"start": 120, "end": 620, "role": "body"}],
+            "total_duration": 500,
+        }
+    }
+    path = tmp_path / "Video_longform_result.json"
+    path.write_text(json.dumps(stale), encoding="utf-8")
+    monkeypatch.setattr(main, "get_longform_plan", lambda *_args, **_kwargs: fresh)
+
+    result = main._analyze_longform_with_fallback(
+        _transcript(), 900, output_dir=str(tmp_path), video_title="Video",
+        resume_requested=False, resume_phase=None,
+    )
+
+    assert result == fresh
+    assert json.loads(path.read_text(encoding="utf-8")) == fresh
 
 
 def test_long_mode_never_uses_full_source_passthrough_when_plan_is_impossible(monkeypatch, tmp_path):
@@ -207,6 +239,7 @@ def test_long_mode_never_uses_full_source_passthrough_when_plan_is_impossible(mo
             input_video="source.mp4",
             output_format="vertical",
             layout_style="smart",
+            resume_requested=False,
             resume_phase=None,
             metadata_file=str(tmp_path / "metadata.json"),
             analysis_result_file=str(tmp_path / "analysis.json"),
