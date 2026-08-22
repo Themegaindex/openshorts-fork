@@ -4121,6 +4121,11 @@ def _run_video_type_pipeline(
             long_weight_done_before = rendered_shorts_weight
             long_render_total = max(0.001, rendered_shorts_weight + long_weight)
             if render_errors:
+                JOB_REPORTER.set_phase(
+                    "render",
+                    "Rendering long video",
+                    message="Shorts render stopped; rendering the long video independently...",
+                )
                 JOB_REPORTER.set_output_seconds(long_render_total)
             _render_longform_video(
                 long_plan,

@@ -420,6 +420,12 @@ def test_auto_continues_with_long_video_when_shorts_render_fails(monkeypatch, tm
     assert reporter.output_seconds == pytest.approx(500.0)
     assert json.loads((tmp_path / "metadata.json").read_text(encoding="utf-8")) == metadata
     assert not any(event[0] == "error" for event in reporter.events)
+    render_phases = [
+        event for event in reporter.events
+        if event[0] == "phase" and event[1][0] == "render"
+    ]
+    assert len(render_phases) == 2
+    assert "independently" in render_phases[-1][2]["message"]
 
 
 def test_auto_keeps_shorts_when_long_video_render_fails(monkeypatch, tmp_path):
