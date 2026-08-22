@@ -3506,6 +3506,7 @@ def _render_shorts_clips(
     video_title,
     weight_done_before=0.0,
     total_weight=None,
+    completed_callback=None,
 ):
     """Render the legacy Shorts loop with optional combined-job weighting."""
     shorts = clips_data.get("shorts", [])
@@ -3600,9 +3601,21 @@ def _render_shorts_clips(
             f"clip_{i + 1}", clip_final_path,
             message=f"Clip {i + 1} ready: {clip_final_path}",
         )
+        if completed_callback:
+            completed_callback(i, clip)
         if os.path.exists(clip_temp_path):
             os.remove(clip_temp_path)
     return shorts_weight
+
+
+def _cleanup_render_temp_files(paths):
+    """Remove known renderer scratch files without masking the render result."""
+    for path in paths:
+        try:
+            if os.path.isfile(path):
+                os.remove(path)
+        except OSError:
+            pass
 
 
 def _run_checked_ffmpeg(command, *, label):
@@ -4075,26 +4088,125 @@ def _run_video_type_pipeline(
         "Rendering selected videos",
         message="Rendering Shorts first, then the long video..." if has_shorts and has_long else "Rendering selected video output...",
     )
+    render_errors = []
+    shorts_rendered = False
+    long_rendered = False
+    completed_shorts = []
+    rendered_shorts_weight = 0.0
     if has_shorts:
-        _render_shorts_clips(
-            shorts_data,
-            input_video,
-            output_dir,
-            output_format,
-            layout_style,
-            video_title=video_title,
-            weight_done_before=0.0,
-            total_weight=total_weight,
-        )
+        try:
+            _render_shorts_clips(
+                shorts_data,
+                input_video,
+                output_dir,
+                output_format,
+                layout_style,
+                video_title=video_title,
+                weight_done_before=0.0,
+                total_weight=total_weight,
+                completed_callback=lambda _index, clip: completed_shorts.append(dict(clip)),
+            )
+            shorts_rendered = True
+            rendered_shorts_weight = shorts_weight
+        except Exception as exc:
+            if not has_long:
+                raise
+            _cleanup_render_temp_files([
+                os.path.join(
+                    output_dir,
+                    f"temp_{os.path.basename(str(item.get('output_filename') or ''))}",
+                )
+                for item in shorts_data["shorts"]
+                if item.get("output_filename")
+            ])
+            if completed_shorts:
+                metadata["shorts"] = completed_shorts
+                shorts_rendered = True
+                rendered_shorts_weight = sum(
+                    max(0.001, float(item["end"]) - float(item["start"]))
+                    for item in completed_shorts
+                )
+                message = (
+                    f"Shorts render stopped after {len(completed_shorts)} completed clip(s); "
+                    f"keeping them and continuing with the long video: {exc}"
+                )
+            else:
+                message = f"Shorts render failed; continuing with the long video: {exc}"
+            render_errors.append(message)
+            JOB_REPORTER.warning(message, category="render", recoverable=True)
     if has_long:
-        _render_longform_video(
-            long_plan,
-            input_video,
-            output_dir,
-            video_title,
-            weight_done_before=shorts_weight,
-            total_weight=total_weight,
+        try:
+            long_weight_done_before = rendered_shorts_weight
+            long_render_total = max(0.001, rendered_shorts_weight + long_weight)
+            if render_errors:
+                JOB_REPORTER.set_phase(
+                    "render",
+                    "Rendering long video",
+                    message="Shorts render stopped; rendering the long video independently...",
+                )
+                JOB_REPORTER.set_output_seconds(long_render_total)
+            _render_longform_video(
+                long_plan,
+                input_video,
+                output_dir,
+                video_title,
+                weight_done_before=long_weight_done_before,
+                total_weight=long_render_total,
+            )
+            long_rendered = True
+        except Exception as exc:
+            if not has_shorts:
+                raise
+            _cleanup_render_temp_files(
+                [
+                    os.path.join(
+                        output_dir,
+                        f"temp_{video_title}_long_seg_{index:03d}.mp4",
+                    )
+                    for index in range(1, len(long_plan.get("segments") or []) + 1)
+                ]
+                + [
+                    os.path.join(output_dir, f"temp_{video_title}_long_concat.txt"),
+                    os.path.join(output_dir, f"temp_{video_title}_long_joined.mp4"),
+                ]
+            )
+            if shorts_rendered:
+                message = f"Long-video render failed; keeping the rendered Shorts: {exc}"
+            else:
+                message = f"Long-video render also failed: {exc}"
+            render_errors.append(message)
+            JOB_REPORTER.warning(message, category="render", recoverable=True)
+
+    if not shorts_rendered and not long_rendered:
+        raise RuntimeError("All planned Auto outputs failed to render: " + "; ".join(render_errors))
+
+    if render_errors:
+        metadata["shorts"] = metadata["shorts"] if shorts_rendered else []
+        metadata["long_videos"] = metadata["long_videos"] if long_rendered else []
+        if shorts_rendered and long_rendered:
+            processing_mode = "clips_and_long"
+        elif long_rendered:
+            processing_mode = "long_video"
+        else:
+            processing_mode = "clips"
+        metadata["processing_mode"] = processing_mode
+        metadata["analysis_status"] = "partial"
+        metadata["render_errors"] = render_errors
+        metadata["analysis_error"] = "; ".join(analysis_errors + render_errors)
+        _save_json_file(metadata_file, metadata)
+        JOB_REPORTER.artifact("metadata", metadata_file)
+        JOB_REPORTER.emit(
+            "result_mode",
+            message=f"Output mode after partial render: {processing_mode}",
+            processing_mode=processing_mode,
+            analysis_status=metadata["analysis_status"],
+            analysis_error=metadata["analysis_error"],
         )
+        actual_output_weight = (
+            rendered_shorts_weight
+            + (long_weight if long_rendered else 0.0)
+        )
+        JOB_REPORTER.set_output_seconds(actual_output_weight)
     return metadata
 
 
