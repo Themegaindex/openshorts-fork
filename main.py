@@ -3608,6 +3608,16 @@ def _render_shorts_clips(
     return shorts_weight
 
 
+def _cleanup_render_temp_files(paths):
+    """Remove known renderer scratch files without masking the render result."""
+    for path in paths:
+        try:
+            if os.path.isfile(path):
+                os.remove(path)
+        except OSError:
+            pass
+
+
 def _run_checked_ffmpeg(command, *, label):
     try:
         subprocess.run(
@@ -4101,6 +4111,14 @@ def _run_video_type_pipeline(
         except Exception as exc:
             if not has_long:
                 raise
+            _cleanup_render_temp_files([
+                os.path.join(
+                    output_dir,
+                    f"temp_{os.path.basename(str(item.get('output_filename') or ''))}",
+                )
+                for item in shorts_data["shorts"]
+                if item.get("output_filename")
+            ])
             if completed_shorts:
                 metadata["shorts"] = completed_shorts
                 shorts_rendered = True
@@ -4139,6 +4157,19 @@ def _run_video_type_pipeline(
         except Exception as exc:
             if not has_shorts:
                 raise
+            _cleanup_render_temp_files(
+                [
+                    os.path.join(
+                        output_dir,
+                        f"temp_{video_title}_long_seg_{index:03d}.mp4",
+                    )
+                    for index in range(1, len(long_plan.get("segments") or []) + 1)
+                ]
+                + [
+                    os.path.join(output_dir, f"temp_{video_title}_long_concat.txt"),
+                    os.path.join(output_dir, f"temp_{video_title}_long_joined.mp4"),
+                ]
+            )
             if shorts_rendered:
                 message = f"Long-video render failed; keeping the rendered Shorts: {exc}"
             else:

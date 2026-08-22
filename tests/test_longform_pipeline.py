@@ -399,6 +399,7 @@ def test_auto_continues_with_long_video_when_shorts_render_fails(monkeypatch, tm
 
     def fail_shorts(*_args, **_kwargs):
         render_order.append("shorts")
+        (tmp_path / "temp_Video_clip_1.mp4").write_bytes(b"temporary short")
         raise RuntimeError("shorts renderer unavailable")
 
     def render_long(*_args, **kwargs):
@@ -418,6 +419,7 @@ def test_auto_continues_with_long_video_when_shorts_render_fails(monkeypatch, tm
     assert len(metadata["long_videos"]) == 1
     assert "shorts renderer unavailable" in metadata["render_errors"][0]
     assert reporter.output_seconds == pytest.approx(500.0)
+    assert not (tmp_path / "temp_Video_clip_1.mp4").exists()
     assert json.loads((tmp_path / "metadata.json").read_text(encoding="utf-8")) == metadata
     assert not any(event[0] == "error" for event in reporter.events)
     render_phases = [
@@ -437,6 +439,9 @@ def test_auto_keeps_shorts_when_long_video_render_fails(monkeypatch, tmp_path):
 
     def fail_long(*_args, **_kwargs):
         render_order.append("long")
+        (tmp_path / "temp_Video_long_seg_001.mp4").write_bytes(b"temporary segment")
+        (tmp_path / "temp_Video_long_concat.txt").write_text("temporary manifest")
+        (tmp_path / "temp_Video_long_joined.mp4").write_bytes(b"temporary joined video")
         raise RuntimeError("long renderer unavailable")
 
     metadata, reporter = _run_auto_with_both_outputs(
@@ -450,6 +455,7 @@ def test_auto_keeps_shorts_when_long_video_render_fails(monkeypatch, tmp_path):
     assert metadata["long_videos"] == []
     assert "long renderer unavailable" in metadata["render_errors"][0]
     assert reporter.output_seconds == pytest.approx(30.0)
+    assert not list(tmp_path.glob("temp_Video_long_*"))
     assert json.loads((tmp_path / "metadata.json").read_text(encoding="utf-8")) == metadata
     assert not any(event[0] == "error" for event in reporter.events)
 
@@ -511,6 +517,12 @@ def test_auto_preserves_completed_shorts_when_later_renders_fail(monkeypatch, tm
     assert metadata["long_videos"] == []
     assert len(metadata["render_errors"]) == 2
     assert reporter.output_seconds == pytest.approx(30.0)
+    assert any(
+        event[0] == "warning"
+        and event[2].get("category") == "render"
+        and event[2].get("recoverable") is True
+        for event in reporter.events
+    )
 
 
 def test_auto_invalid_short_payload_reaches_bounded_fallback(monkeypatch, tmp_path):
