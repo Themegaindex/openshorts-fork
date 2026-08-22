@@ -1,4 +1,5 @@
 from contextlib import contextmanager
+import copy
 import importlib
 import json
 import os
@@ -743,7 +744,7 @@ def test_long_mode_ignores_stale_shorts_resume_analysis(monkeypatch, tmp_path):
             "warnings": [],
         },
         "error": None,
-        "attempts": [{"stage": "longform_plan", "status": "success"}],
+        "attempts": [{"stage": "longform_plan_v2", "status": "success"}],
         "cost_analysis": {"total_cost": 0.1},
     }
     monkeypatch.setattr(main, "_analyze_longform_with_fallback", lambda *_args, **_kwargs: long_result)
@@ -774,48 +775,6 @@ def test_long_mode_ignores_stale_shorts_resume_analysis(monkeypatch, tmp_path):
     assert metadata["analysis_error"] is None
     assert metadata["analysis_attempts"] == long_result["attempts"]
     assert "stale Shorts failure" not in json.dumps(metadata)
-
-
-def test_score_fallback_builds_bounded_chronological_story():
-    windows = [
-        {"id": f"window_{index:03d}", "start": index * 90, "end": (index + 1) * 90, "text": "text"}
-        for index in range(10)
-    ]
-    scores = [
-        {"id": item["id"], "start": item["start"], "end": item["end"], "score": 100 - index, "reason": ""}
-        for index, item in enumerate(windows)
-    ]
-
-    plan = main._score_based_longform_fallback(
-        _transcript(), 900, video_title="Example", windows=windows, scored_windows=scores,
-    )
-
-    assert plan["viable"] is True
-    assert 480 <= plan["total_duration"] <= 600
-    assert plan["segments"][0]["role"] == "cold_open"
-    body = plan["segments"][1:]
-    assert [item["start"] for item in body] == sorted(item["start"] for item in body)
-    assert all(item["end"] - item["start"] <= main.LONGFORM_MAX_SEGMENT_SECONDS + 0.001 for item in body)
-    assert [item["chapter_title"] for item in body] == [f"Teil {index}" for index in range(1, len(body) + 1)]
-    assert plan["youtube_description"] == ""
-    assert "score_based_fallback" in plan["warnings"]
-    assert "fewer_than_three_chapters" not in plan["warnings"]
-
-
-def test_score_fallback_does_not_pad_with_unscored_windows():
-    windows = [
-        {"id": f"window_{index:03d}", "start": index * 90, "end": (index + 1) * 90, "text": "text"}
-        for index in range(10)
-    ]
-    only_one_score = [{
-        "id": windows[0]["id"], "start": 0, "end": 90, "score": 100, "reason": "strong",
-    }]
-
-    plan = main._score_based_longform_fallback(
-        _transcript(), 900, video_title="Example", windows=windows, scored_windows=only_one_score,
-    )
-
-    assert plan is None
 
 
 def test_score_stage_recovers_every_window_omitted_by_a_batch(monkeypatch):
@@ -897,23 +856,21 @@ def test_score_stage_caps_individual_rescue_calls_per_job(monkeypatch):
     )
 
 
-def test_score_fallback_normalizes_distance_for_long_sources():
-    selected = [{"start": 0, "end": 90, "score": 100}]
-    far_strong = {"start": 3600, "end": 3690, "score": 95}
-    near_weak = {"start": 120, "end": 210, "score": 5}
-
-    assert main._score_fallback_selection_value(far_strong, selected, 7200) > (
-        main._score_fallback_selection_value(near_weak, selected, 7200)
-    )
-
-
 @pytest.mark.parametrize("resume_phase", [None, "render"])
 def test_longform_resume_reuses_valid_checkpoint_without_gemini(monkeypatch, tmp_path, resume_phase):
     reporter = _Reporter()
     monkeypatch.setattr(main, "JOB_REPORTER", reporter)
+    transcript = _transcript()
+    fingerprint = main.longform.transcript_fingerprint(
+        main.longform.build_editorial_units(transcript, 900),
+    )
     checkpoint = {
         "plan_data": {
             "viable": True,
+            "planner_version": 2,
+            "quality_gate_version": main.longform.QUALITY_GATE_VERSION,
+            "transcript_fingerprint": fingerprint,
+            "editorial_review": {"approved": True},
             "segments": [{"start": 0, "end": 500, "role": "body"}],
             "total_duration": 500,
         }
@@ -926,7 +883,7 @@ def test_longform_resume_reuses_valid_checkpoint_without_gemini(monkeypatch, tmp
     )
 
     result = main._analyze_longform_with_fallback(
-        _transcript(), 900, output_dir=str(tmp_path), video_title="Video",
+        transcript, 900, output_dir=str(tmp_path), video_title="Video",
         resume_requested=True, resume_phase=resume_phase,
     )
     assert result == checkpoint
@@ -1046,10 +1003,15 @@ def test_download_resume_cleanup_never_deletes_finished_long_output(monkeypatch,
     assert long_output.exists()
 
 
-def test_auto_threshold_considers_nine_minute_sources():
-    assert main.LONGFORM_MIN_SOURCE_SECONDS <= 9 * 60
+def test_auto_skips_nine_minute_sources_but_long_mode_still_scales():
+    """Auto needs headroom: a best-of from nine minutes is nearly the full clip.
+
+    Explicit Long mode keeps the lower physical bound and adapts its target.
+    """
+    assert main.LONGFORM_MIN_SOURCE_SECONDS > 9 * 60
+    assert main.LONGFORM_HARD_MIN_SOURCE_SECONDS <= 9 * 60
     target_min, target_max, _warnings = main._longform_target_range(9 * 60)
-    assert target_min == 480
+    assert target_min == 240
     assert target_max == 540
 
 
@@ -1115,3 +1077,753 @@ def test_explicit_long_source_is_rejected_before_transcription():
     )
     transcription = source.index("transcript = transcribe_video(input_video, duration)", cli_start)
     assert early_guard < transcription
+
+
+def _v2_word_transcript():
+    segments = []
+    for index in range(6):
+        start = index * 60.0
+        end = (index + 1) * 60.0
+        segments.append({
+            "start": start,
+            "end": end,
+            "text": f"Vollständiger Gedanke {index + 1}.",
+            "words": [{
+                "word": f" Vollständiger Gedanke {index + 1}.",
+                "start": start,
+                "end": end,
+            }],
+        })
+    return {
+        "language": "de",
+        "text": " ".join(item["text"] for item in segments),
+        "segments": segments,
+    }
+
+
+def _v2_raw_plan():
+    return {
+        "viable": True,
+        "video_title": "Geprüfter Schnitt",
+        "youtube_description": "Beschreibung",
+        "recommended_duration_seconds": 300,
+        "duration_reason": "Fünf starke Einheiten.",
+        "cold_open": None,
+        "chapters": [
+            {
+                "id": "chapter_01",
+                "title": "Erstes Thema",
+                "topic": "Erstes Thema",
+                "priority": 90,
+                "reason": "Wichtig",
+                "spans": [{
+                    "id": "span_01",
+                    "start_unit_id": "u000001",
+                    "end_unit_id": "u000003",
+                }],
+            },
+            {
+                "id": "chapter_02",
+                "title": "Zweites Thema",
+                "topic": "Zweites Thema",
+                "priority": 80,
+                "reason": "Ebenfalls stark",
+                "spans": [{
+                    "id": "span_02",
+                    "start_unit_id": "u000004",
+                    "end_unit_id": "u000005",
+                }],
+            },
+        ],
+    }
+
+
+def _v2_review(plan, *, approved, score, dropped_chapter_ids=None):
+    segment_ids = []
+    if isinstance(plan.get("cold_open"), dict):
+        segment_ids.append(str(plan["cold_open"].get("id") or "cold_open"))
+    segment_ids.extend(
+        str(span.get("id") or "")
+        for chapter in plan.get("chapters") or []
+        if isinstance(chapter, dict)
+        for span in chapter.get("spans") or []
+        if isinstance(span, dict)
+    )
+    return {
+        "approved": approved,
+        "overall_score": score,
+        "ending_complete": True,
+        "critical_issues": [],
+        "dropped_chapter_ids": list(dropped_chapter_ids or []),
+        "boundary_reviews": [{
+            "segment_id": segment_id,
+            "opening_complete": approved,
+            "ending_complete": approved,
+            "continuation_needed": False,
+            "issue": "" if approved else "Unvollständige Grenze",
+        } for segment_id in segment_ids],
+        "joins": [{
+            "id": f"{left}->{right}",
+            "score": score,
+            "context_complete": approved,
+            "issue": "" if approved else "Abrupter Übergang",
+        } for left, right in zip(segment_ids, segment_ids[1:])],
+        "plan": plan,
+    }
+
+
+def test_longform_quality_gate_runs_one_repair_before_accepting(monkeypatch, tmp_path):
+    reporter = _Reporter()
+    monkeypatch.setattr(main, "JOB_REPORTER", reporter)
+    monkeypatch.setenv("GEMINI_API_KEY", "test")
+    raw_plan = _v2_raw_plan()
+    calls = []
+
+    def fake_worker(mode, payload, **_kwargs):
+        calls.append((
+            mode,
+            bool(payload.get("repair_required")),
+            bool(payload.get("final_verification")),
+        ))
+        if mode == "longform_plan_v2":
+            return {"payload": raw_plan, "cost_analysis": None}
+        if payload.get("final_verification"):
+            return {"payload": _v2_review(raw_plan, approved=True, score=93), "cost_analysis": None}
+        if payload.get("repair_required"):
+            return {"payload": _v2_review(raw_plan, approved=True, score=92), "cost_analysis": None}
+        return {"payload": _v2_review(raw_plan, approved=False, score=70), "cost_analysis": None}
+
+    monkeypatch.setattr(main, "_call_gemini_worker", fake_worker)
+    result = main.get_longform_plan(
+        _v2_word_transcript(),
+        360,
+        output_dir=str(tmp_path),
+        video_title="Video",
+        windows=[{"id": "window_001", "start": 0, "end": 360, "text": "text"}],
+        scored_windows=[{"id": "window_001", "start": 0, "end": 360, "score": 90, "reason": "strong"}],
+    )
+
+    assert result["error"] is None
+    assert result["plan_data"]["viable"] is True
+    assert result["plan_data"]["editorial_review"]["repair_attempted"] is True
+    assert calls == [
+        ("longform_plan_v2", False, False),
+        ("longform_review", False, False),
+        ("longform_review", True, False),
+        ("longform_review", False, True),
+    ]
+    assert result["plan_data"]["editorial_review"]["final_verification_attempted"] is True
+
+
+def test_repair_rolls_back_both_plan_views_after_empty_review_plan(monkeypatch, tmp_path):
+    reporter = _Reporter()
+    monkeypatch.setattr(main, "JOB_REPORTER", reporter)
+    monkeypatch.setenv("GEMINI_API_KEY", "test")
+    raw_plan = _v2_raw_plan()
+    empty_plan = copy.deepcopy(raw_plan)
+    empty_plan["viable"] = False
+    empty_plan["chapters"] = []
+    repair_inputs = []
+
+    def fake_worker(mode, payload, **_kwargs):
+        if mode == "longform_plan_v2":
+            return {"payload": raw_plan, "cost_analysis": None}
+        if payload.get("final_verification"):
+            return {
+                "payload": _v2_review(raw_plan, approved=True, score=94),
+                "cost_analysis": None,
+            }
+        if payload.get("repair_required"):
+            repair_inputs.append({
+                "viable": payload["draft_plan"]["viable"],
+                "chapters": len(payload["draft_plan"]["chapters"]),
+                "context_segments": len(payload["review_context"]["assembled_segments"]),
+            })
+            return {
+                "payload": _v2_review(raw_plan, approved=True, score=93),
+                "cost_analysis": None,
+            }
+        return {
+            "payload": _v2_review(empty_plan, approved=False, score=60),
+            "cost_analysis": None,
+        }
+
+    monkeypatch.setattr(main, "_call_gemini_worker", fake_worker)
+    result = main.get_longform_plan(
+        _v2_word_transcript(),
+        360,
+        output_dir=str(tmp_path),
+        video_title="Video",
+        windows=[{"id": "window_001", "start": 0, "end": 360, "text": "text"}],
+        scored_windows=[{"id": "window_001", "start": 0, "end": 360, "score": 90, "reason": "strong"}],
+    )
+
+    assert result["error"] is None
+    assert repair_inputs == [{"viable": True, "chapters": 2, "context_segments": 2}]
+
+
+def test_repair_context_uses_current_boundaries_with_anchor_candidates(monkeypatch, tmp_path):
+    reporter = _Reporter()
+    monkeypatch.setattr(main, "JOB_REPORTER", reporter)
+    monkeypatch.setenv("GEMINI_API_KEY", "test")
+    raw_plan = _v2_raw_plan()
+    moved_plan = copy.deepcopy(raw_plan)
+    moved_plan["chapters"][0]["spans"][0]["end_unit_id"] = "u000002"
+    first_end_candidates = []
+    repair_observation = {}
+
+    def neighborhood_for(payload, segment_id):
+        return next(
+            item
+            for item in payload["review_context"]["boundary_neighborhoods"]
+            if item["segment_id"] == segment_id
+        )
+
+    def fake_worker(mode, payload, **_kwargs):
+        if mode == "longform_plan_v2":
+            return {"payload": raw_plan, "cost_analysis": None}
+        if payload.get("final_verification"):
+            return {
+                "payload": _v2_review(moved_plan, approved=True, score=94),
+                "cost_analysis": None,
+            }
+        span_neighborhood = neighborhood_for(payload, "span_01")
+        if payload.get("repair_required"):
+            repair_observation.update({
+                "draft_end": payload["draft_plan"]["chapters"][0]["spans"][0]["end_unit_id"],
+                "context_end": span_neighborhood["current_end_unit_id"],
+                "end_candidates": [
+                    item["id"] for item in span_neighborhood["end_candidate_units"]
+                ],
+            })
+            return {
+                "payload": _v2_review(moved_plan, approved=True, score=93),
+                "cost_analysis": None,
+            }
+        first_end_candidates.extend(
+            item["id"] for item in span_neighborhood["end_candidate_units"]
+        )
+        return {
+            "payload": _v2_review(moved_plan, approved=False, score=70),
+            "cost_analysis": None,
+        }
+
+    monkeypatch.setattr(main, "_call_gemini_worker", fake_worker)
+    result = main.get_longform_plan(
+        _v2_word_transcript(),
+        360,
+        output_dir=str(tmp_path),
+        video_title="Video",
+        windows=[{"id": "window_001", "start": 0, "end": 360, "text": "text"}],
+        scored_windows=[{"id": "window_001", "start": 0, "end": 360, "score": 90, "reason": "strong"}],
+    )
+
+    assert result["error"] is None
+    assert repair_observation == {
+        "draft_end": "u000002",
+        "context_end": "u000002",
+        "end_candidates": first_end_candidates,
+    }
+
+
+def test_out_of_order_model_chapters_are_normalized_before_review(monkeypatch, tmp_path):
+    reporter = _Reporter()
+    monkeypatch.setattr(main, "JOB_REPORTER", reporter)
+    monkeypatch.setenv("GEMINI_API_KEY", "test")
+    raw_plan = _v2_raw_plan()
+    raw_plan["chapters"] = list(reversed(raw_plan["chapters"]))
+    reviewed_order = []
+
+    def fake_worker(mode, payload, **_kwargs):
+        if mode == "longform_plan_v2":
+            return {"payload": raw_plan, "cost_analysis": None}
+        reviewed_order.extend(chapter["id"] for chapter in payload["draft_plan"]["chapters"])
+        return {"payload": _v2_review(payload["draft_plan"], approved=True, score=92), "cost_analysis": None}
+
+    monkeypatch.setattr(main, "_call_gemini_worker", fake_worker)
+    result = main.get_longform_plan(
+        _v2_word_transcript(),
+        360,
+        output_dir=str(tmp_path),
+        video_title="Video",
+        windows=[{"id": "window_001", "start": 0, "end": 360, "text": "text"}],
+        scored_windows=[{"id": "window_001", "start": 0, "end": 360, "score": 90, "reason": "strong"}],
+    )
+
+    assert result["error"] is None
+    assert reviewed_order == ["chapter_01", "chapter_02"]
+    assert result["plan_data"]["chronology_normalized"] is True
+    assert result["plan_data"]["dropped_topics"] == []
+    assert [
+        segment["chapter_id"]
+        for segment in result["plan_data"]["segments"]
+        if segment["role"] != "cold_open"
+    ] == ["chapter_01", "chapter_02"]
+
+
+def test_fresh_final_review_can_reject_a_self_approved_repair(monkeypatch, tmp_path):
+    reporter = _Reporter()
+    monkeypatch.setattr(main, "JOB_REPORTER", reporter)
+    monkeypatch.setenv("GEMINI_API_KEY", "test")
+    raw_plan = _v2_raw_plan()
+
+    def fake_worker(mode, payload, **_kwargs):
+        if mode == "longform_plan_v2":
+            return {"payload": raw_plan, "cost_analysis": None}
+        if payload.get("final_verification"):
+            final_review = _v2_review(raw_plan, approved=False, score=72)
+            final_review["ending_complete"] = False
+            final_review["boundary_reviews"][-1]["ending_complete"] = False
+            final_review["boundary_reviews"][-1]["continuation_needed"] = True
+            return {"payload": final_review, "cost_analysis": None}
+        if payload.get("repair_required"):
+            return {"payload": _v2_review(raw_plan, approved=True, score=92), "cost_analysis": None}
+        return {"payload": _v2_review(raw_plan, approved=False, score=70), "cost_analysis": None}
+
+    monkeypatch.setattr(main, "_call_gemini_worker", fake_worker)
+    result = main.get_longform_plan(
+        _v2_word_transcript(),
+        360,
+        output_dir=str(tmp_path),
+        video_title="Video",
+        windows=[{"id": "window_001", "start": 0, "end": 360, "text": "text"}],
+        scored_windows=[{"id": "window_001", "start": 0, "end": 360, "score": 90, "reason": "strong"}],
+    )
+
+    assert result["error"] is not None
+    assert result["plan_data"]["viable"] is False
+    assert result["plan_data"]["editorial_review"]["final_verification_attempted"] is True
+    assert "incomplete_ending" in result["plan_data"]["editorial_review"]["gate_issues"]
+    assert "incomplete_segment_ending:span_02" in result["plan_data"]["editorial_review"]["gate_issues"]
+
+
+def test_repair_cannot_delete_a_strong_chapter_that_sorting_preserved(monkeypatch, tmp_path):
+    reporter = _Reporter()
+    monkeypatch.setattr(main, "JOB_REPORTER", reporter)
+    monkeypatch.setenv("GEMINI_API_KEY", "test")
+    raw_plan = _v2_raw_plan()
+    raw_plan["chapters"].append({
+        "id": "chapter_03",
+        "title": "Drittes Thema",
+        "topic": "Drittes Thema",
+        "priority": 75,
+        "reason": "Ebenfalls stark",
+        "spans": [{
+            "id": "span_03",
+            "start_unit_id": "u000006",
+            "end_unit_id": "u000006",
+        }],
+    })
+    raw_plan["chapters"] = [
+        raw_plan["chapters"][1],
+        raw_plan["chapters"][0],
+        raw_plan["chapters"][2],
+    ]
+    repair_input_chapters = []
+
+    def fake_worker(mode, payload, **_kwargs):
+        if mode == "longform_plan_v2":
+            return {"payload": raw_plan, "cost_analysis": None}
+        if payload.get("final_verification"):
+            return {"payload": _v2_review(payload["draft_plan"], approved=True, score=94), "cost_analysis": None}
+        if payload.get("repair_required"):
+            repair_input_chapters.extend(chapter["id"] for chapter in payload["draft_plan"]["chapters"])
+            return {"payload": _v2_review(payload["draft_plan"], approved=True, score=93), "cost_analysis": None}
+        dropped = copy.deepcopy(payload["draft_plan"])
+        dropped["chapters"] = [
+            chapter for chapter in dropped["chapters"] if chapter["id"] != "chapter_02"
+        ]
+        return {
+            "payload": _v2_review(
+                dropped,
+                approved=True,
+                score=95,
+                dropped_chapter_ids=["chapter_02"],
+            ),
+            "cost_analysis": None,
+        }
+
+    monkeypatch.setattr(main, "_call_gemini_worker", fake_worker)
+    result = main.get_longform_plan(
+        _v2_word_transcript(),
+        360,
+        output_dir=str(tmp_path),
+        video_title="Video",
+        windows=[{"id": "window_001", "start": 0, "end": 360, "text": "text"}],
+        scored_windows=[{"id": "window_001", "start": 0, "end": 360, "score": 90, "reason": "strong"}],
+    )
+
+    assert result["error"] is None
+    assert repair_input_chapters == ["chapter_01", "chapter_02", "chapter_03"]
+    assert result["plan_data"]["dropped_topics"] == []
+    assert {
+        segment["chapter_id"]
+        for segment in result["plan_data"]["segments"]
+        if segment["role"] != "cold_open"
+    } == {"chapter_01", "chapter_02", "chapter_03"}
+
+
+def test_review_can_drop_an_unmoved_chapter_after_chronology_normalization(monkeypatch, tmp_path):
+    reporter = _Reporter()
+    monkeypatch.setattr(main, "JOB_REPORTER", reporter)
+    monkeypatch.setenv("GEMINI_API_KEY", "test")
+    raw_plan = _v2_raw_plan()
+    raw_plan["chapters"].append({
+        "id": "chapter_03",
+        "title": "Drittes Thema",
+        "topic": "Drittes Thema",
+        "priority": 60,
+        "reason": "Optional",
+        "spans": [{
+            "id": "span_03",
+            "start_unit_id": "u000006",
+            "end_unit_id": "u000006",
+        }],
+    })
+    raw_plan["chapters"] = [
+        raw_plan["chapters"][1],
+        raw_plan["chapters"][0],
+        raw_plan["chapters"][2],
+    ]
+
+    def fake_worker(mode, payload, **_kwargs):
+        if mode == "longform_plan_v2":
+            return {"payload": raw_plan, "cost_analysis": None}
+        reviewed = copy.deepcopy(payload["draft_plan"])
+        reviewed["chapters"] = [
+            chapter for chapter in reviewed["chapters"] if chapter["id"] != "chapter_03"
+        ]
+        return {
+            "payload": _v2_review(
+                reviewed,
+                approved=True,
+                score=95,
+                dropped_chapter_ids=["chapter_03"],
+            ),
+            "cost_analysis": None,
+        }
+
+    monkeypatch.setattr(main, "_call_gemini_worker", fake_worker)
+    result = main.get_longform_plan(
+        _v2_word_transcript(),
+        360,
+        output_dir=str(tmp_path),
+        video_title="Video",
+        windows=[{"id": "window_001", "start": 0, "end": 360, "text": "text"}],
+        scored_windows=[{"id": "window_001", "start": 0, "end": 360, "score": 90, "reason": "strong"}],
+    )
+
+    assert result["error"] is None
+    assert result["plan_data"]["chronology_normalized"] is True
+    assert result["plan_data"]["dropped_topics"] == ["chapter_03"]
+    assert {
+        segment["chapter_id"]
+        for segment in result["plan_data"]["segments"]
+        if segment["role"] != "cold_open"
+    } == {"chapter_01", "chapter_02"}
+
+
+@pytest.mark.parametrize("bad_payload", [[], "text", 42])
+def test_longform_planner_non_object_payload_fails_cleanly(monkeypatch, tmp_path, bad_payload):
+    reporter = _Reporter()
+    monkeypatch.setattr(main, "JOB_REPORTER", reporter)
+    monkeypatch.setenv("GEMINI_API_KEY", "test")
+    monkeypatch.setattr(
+        main,
+        "_call_gemini_worker",
+        lambda *_args, **_kwargs: {"payload": bad_payload, "cost_analysis": None},
+    )
+
+    result = main.get_longform_plan(
+        _v2_word_transcript(),
+        360,
+        output_dir=str(tmp_path),
+        video_title="Video",
+        windows=[{"id": "window_001", "start": 0, "end": 360, "text": "text"}],
+        scored_windows=[{"id": "window_001", "start": 0, "end": 360, "score": 90, "reason": "strong"}],
+    )
+
+    assert result["plan_data"] is None
+    assert "non-object JSON payload" in result["error"]
+    assert result["attempts"]
+    assert all(attempt["status"] == "failed" for attempt in result["attempts"])
+
+
+@pytest.mark.parametrize("malformed_cost_analysis", ["bad", {"input_tokens": "bad"}])
+def test_longform_ignores_malformed_worker_cost_analysis(
+    monkeypatch,
+    tmp_path,
+    malformed_cost_analysis,
+):
+    reporter = _Reporter()
+    monkeypatch.setattr(main, "JOB_REPORTER", reporter)
+    monkeypatch.setenv("GEMINI_API_KEY", "test")
+    raw_plan = _v2_raw_plan()
+
+    def fake_worker(mode, payload, **_kwargs):
+        worker_payload = (
+            raw_plan
+            if mode == "longform_plan_v2"
+            else _v2_review(payload["draft_plan"], approved=True, score=92)
+        )
+        return {"payload": worker_payload, "cost_analysis": malformed_cost_analysis}
+
+    monkeypatch.setattr(main, "_call_gemini_worker", fake_worker)
+    result = main.get_longform_plan(
+        _v2_word_transcript(),
+        360,
+        output_dir=str(tmp_path),
+        video_title="Video",
+        windows=[{"id": "window_001", "start": 0, "end": 360, "text": "text"}],
+        scored_windows=[{"id": "window_001", "start": 0, "end": 360, "score": 90, "reason": "strong"}],
+    )
+
+    assert result["error"] is None
+    assert result["cost_analysis"] is None
+
+
+def test_malformed_nested_review_payload_rejects_cleanly(monkeypatch, tmp_path):
+    reporter = _Reporter()
+    monkeypatch.setattr(main, "JOB_REPORTER", reporter)
+    monkeypatch.setenv("GEMINI_API_KEY", "test")
+    raw_plan = _v2_raw_plan()
+
+    def fake_worker(mode, _payload, **_kwargs):
+        if mode == "longform_plan_v2":
+            return {"payload": raw_plan, "cost_analysis": None}
+        malformed_review = _v2_review(raw_plan, approved=True, score=95)
+        malformed_review["joins"] = 42
+        return {"payload": malformed_review, "cost_analysis": None}
+
+    monkeypatch.setattr(main, "_call_gemini_worker", fake_worker)
+    result = main.get_longform_plan(
+        _v2_word_transcript(),
+        360,
+        output_dir=str(tmp_path),
+        video_title="Video",
+        windows=[{"id": "window_001", "start": 0, "end": 360, "text": "text"}],
+        scored_windows=[{"id": "window_001", "start": 0, "end": 360, "score": 90, "reason": "strong"}],
+    )
+
+    assert result["error"] is not None
+    assert result["plan_data"]["viable"] is False
+    assert "invalid_review_payload:joins" in (
+        result["plan_data"]["editorial_review"]["gate_issues"]
+    )
+
+
+def _v1_style_single_chapter_plan():
+    """A draft that put both spans into one chapter — a one-topic compilation."""
+    plan = _v2_raw_plan()
+    merged = dict(plan["chapters"][0])
+    merged["spans"] = [
+        plan["chapters"][0]["spans"][0],
+        plan["chapters"][1]["spans"][0],
+    ]
+    plan["chapters"] = [merged]
+    return plan
+
+
+def test_single_chapter_draft_triggers_repair_and_passes_once_regrouped(monkeypatch, tmp_path):
+    """The chapter minimum must be repairable, not an instant rejection.
+
+    The review keeps every span id and its unit boundaries and only splits the
+    spans across two chapters — exactly what the repair prompt asks for.
+    """
+    reporter = _Reporter()
+    monkeypatch.setattr(main, "JOB_REPORTER", reporter)
+    monkeypatch.setenv("GEMINI_API_KEY", "test")
+    single = _v1_style_single_chapter_plan()
+    regrouped = _v2_raw_plan()
+    calls = []
+
+    def fake_worker(mode, payload, **_kwargs):
+        calls.append((
+            mode,
+            bool(payload.get("repair_required")),
+            bool(payload.get("final_verification")),
+        ))
+        if mode == "longform_plan_v2":
+            return {"payload": single, "cost_analysis": None}
+        if payload.get("final_verification"):
+            return {"payload": _v2_review(regrouped, approved=True, score=93), "cost_analysis": None}
+        if payload.get("repair_required"):
+            return {"payload": _v2_review(regrouped, approved=True, score=92), "cost_analysis": None}
+        return {"payload": _v2_review(single, approved=True, score=95), "cost_analysis": None}
+
+    monkeypatch.setattr(main, "_call_gemini_worker", fake_worker)
+    result = main.get_longform_plan(
+        _v2_word_transcript(),
+        360,
+        output_dir=str(tmp_path),
+        video_title="Video",
+        windows=[{"id": "window_001", "start": 0, "end": 360, "text": "text"}],
+        scored_windows=[{"id": "window_001", "start": 0, "end": 360, "score": 90, "reason": "strong"}],
+    )
+
+    # A flawless self-review on a single-chapter plan must not pass the gate.
+    assert calls == [
+        ("longform_plan_v2", False, False),
+        ("longform_review", False, False),
+        ("longform_review", True, False),
+        ("longform_review", False, True),
+    ]
+    assert result["error"] is None
+    assert result["plan_data"]["viable"] is True
+    assert result["plan_data"]["editorial_review"]["repair_attempted"] is True
+    chapters = {segment["chapter_id"] for segment in result["plan_data"]["segments"]}
+    assert chapters == {"chapter_01", "chapter_02"}
+
+
+def test_single_chapter_draft_is_rejected_when_the_repair_keeps_one_topic(monkeypatch, tmp_path):
+    reporter = _Reporter()
+    monkeypatch.setattr(main, "JOB_REPORTER", reporter)
+    monkeypatch.setenv("GEMINI_API_KEY", "test")
+    single = _v1_style_single_chapter_plan()
+
+    def fake_worker(mode, _payload, **_kwargs):
+        if mode == "longform_plan_v2":
+            return {"payload": single, "cost_analysis": None}
+        return {"payload": _v2_review(single, approved=True, score=98), "cost_analysis": None}
+
+    monkeypatch.setattr(main, "_call_gemini_worker", fake_worker)
+    result = main.get_longform_plan(
+        _v2_word_transcript(),
+        360,
+        output_dir=str(tmp_path),
+        video_title="Video",
+        windows=[{"id": "window_001", "start": 0, "end": 360, "text": "text"}],
+        scored_windows=[{"id": "window_001", "start": 0, "end": 360, "score": 90, "reason": "strong"}],
+    )
+
+    assert result["error"] is not None
+    assert result["plan_data"]["viable"] is False
+    assert "too_few_chapters" in result["plan_data"]["editorial_review"]["gate_issues"]
+
+
+def test_longform_rejects_only_after_failed_repair_retry(monkeypatch, tmp_path):
+    reporter = _Reporter()
+    monkeypatch.setattr(main, "JOB_REPORTER", reporter)
+    monkeypatch.setenv("GEMINI_API_KEY", "test")
+    raw_plan = _v2_raw_plan()
+    review_calls = 0
+
+    def fake_worker(mode, _payload, **_kwargs):
+        nonlocal review_calls
+        if mode == "longform_plan_v2":
+            return {"payload": raw_plan, "cost_analysis": None}
+        review_calls += 1
+        return {"payload": _v2_review(raw_plan, approved=False, score=70), "cost_analysis": None}
+
+    monkeypatch.setattr(main, "_call_gemini_worker", fake_worker)
+    result = main.get_longform_plan(
+        _v2_word_transcript(),
+        360,
+        output_dir=str(tmp_path),
+        video_title="Video",
+        windows=[{"id": "window_001", "start": 0, "end": 360, "text": "text"}],
+        scored_windows=[{"id": "window_001", "start": 0, "end": 360, "score": 90, "reason": "strong"}],
+    )
+
+    assert review_calls == 2
+    assert result["plan_data"]["viable"] is False
+    assert "after repair" in result["error"]
+
+
+def test_local_scene_detection_never_decodes_more_than_its_bounded_window(monkeypatch):
+    class Frame:
+        size = 1
+        shape = (10, 10)
+
+    class Capture:
+        def __init__(self):
+            self.reads = 0
+            self.start_ms = 0.0
+            self.released = False
+
+        def isOpened(self):
+            return True
+
+        def set(self, prop, value):
+            if prop == main.cv2.CAP_PROP_POS_MSEC:
+                self.start_ms = value
+
+        def get(self, prop):
+            if prop == main.cv2.CAP_PROP_FPS:
+                return 30.0
+            if prop == main.cv2.CAP_PROP_POS_MSEC:
+                return self.start_ms + (self.reads * 1000.0 / 30.0)
+            return 0.0
+
+        def read(self):
+            self.reads += 1
+            return True, Frame()
+
+        def release(self):
+            self.released = True
+
+    capture = Capture()
+    monkeypatch.setattr(main.cv2, "VideoCapture", lambda _path: capture)
+    monkeypatch.setattr(main.cv2, "cvtColor", lambda frame, _mode: frame)
+    monkeypatch.setattr(main.cv2, "absdiff", lambda _left, _right: 0)
+    monkeypatch.setattr(main.np, "mean", lambda _value: 0.0)
+    monkeypatch.setattr(main, "LONGFORM_SCENE_SCAN_MAX_SECONDS", 1.5)
+    monkeypatch.setattr(main, "LONGFORM_SCENE_CUT_THRESHOLD", 0.0)
+
+    cut = main._find_local_scene_cut("source.mp4", 0.0, 100.0, 50.0)
+
+    assert cut is not None
+    assert capture.reads <= 49
+    assert capture.start_ms >= 49_000
+    assert capture.released is True
+
+
+def test_scene_alignment_reverts_when_it_would_break_adaptive_duration(monkeypatch):
+    plan = {
+        "planner_version": 2,
+        "target_min_seconds": 40.0,
+        "target_max_seconds": 40.0,
+        "total_duration": 40.0,
+        "segments": [{
+            "segment_id": "span_01",
+            "start": 10.0,
+            "end": 50.0,
+            "start_cut_window": [9.0, 11.0],
+            "end_cut_window": [49.0, 51.0],
+        }],
+    }
+    scene_cuts = iter([9.0, 51.0])
+    monkeypatch.setattr(main, "_find_local_scene_cut", lambda *_args: next(scene_cuts))
+
+    refined = main._refine_longform_cut_plan(plan, "source.mp4")
+
+    assert refined["total_duration"] == 40.0
+    assert refined["segments"][0]["start"] == 10.0
+    assert refined["segments"][0]["end"] == 50.0
+    assert refined["local_scene_alignment"]["reverted_for_duration"] is True
+    assert refined["local_scene_alignment"]["attempted_aligned_edges"] == 2
+
+
+def test_scene_alignment_reverts_when_a_segment_would_become_too_short(monkeypatch):
+    plan = {
+        "planner_version": 2,
+        "target_min_seconds": 0.0,
+        "target_max_seconds": 100.0,
+        "total_duration": 20.0,
+        "segments": [{
+            "segment_id": "span_01",
+            "role": "setup",
+            "start": 10.0,
+            "end": 30.0,
+            "start_cut_window": [10.0, 12.0],
+            "end_cut_window": [28.0, 30.0],
+        }],
+    }
+    scene_cuts = iter([12.0, 28.0])
+    monkeypatch.setattr(main, "_find_local_scene_cut", lambda *_args: next(scene_cuts))
+
+    refined = main._refine_longform_cut_plan(plan, "source.mp4")
+
+    assert refined["segments"][0]["start"] == 10.0
+    assert refined["segments"][0]["end"] == 30.0
+    assert "segment_duration:span_01" in refined["local_scene_alignment"]["revert_reasons"]

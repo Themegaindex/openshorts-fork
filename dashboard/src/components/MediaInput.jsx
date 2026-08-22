@@ -9,7 +9,7 @@ const FORMAT_OPTIONS = [
 
 const VIDEO_TYPE_OPTIONS = [
     { id: 'shorts', label: 'Viral Clips', hint: '15–60 s · multiple', Icon: Smartphone },
-    { id: 'long', label: 'Long Video', hint: '~8–10 min · 16:9', Icon: Monitor },
+    { id: 'long', label: 'Long Video', hint: '4–10 min · AI-selected', Icon: Monitor },
     { id: 'auto', label: 'Smart / Auto', hint: 'AI chooses the mix', Icon: Sparkles },
 ];
 

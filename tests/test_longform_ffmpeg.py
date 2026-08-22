@@ -30,9 +30,11 @@ def test_four_by_three_segments_become_synced_16_9_h264_aac_video(tmp_path):
     filter_graph = longform.blurred_16_9_filter(320, 180)
     segment_paths = [tmp_path / "part_1.mp4", tmp_path / "part_2.mp4"]
     for (start, end), output in zip(((0.5, 2.5), (3.0, 5.0)), segment_paths):
-        _run(longform.segment_cut_command(
-            source, start, end, output, fade_seconds=0.04, filter_complex=filter_graph,
-        ))
+        command = longform.segment_cut_command(
+            source, start, end, output, filter_complex=filter_graph,
+        )
+        assert "d=0.010" in command[command.index("-af") + 1]
+        _run(command)
 
     manifest = tmp_path / "manifest.txt"
     manifest.write_text(longform.concat_manifest_text(segment_paths), encoding="utf-8")

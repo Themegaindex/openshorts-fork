@@ -166,6 +166,13 @@ Im Browser **`http://localhost:5175`** aufrufen
 8. **Effekte** — Karaoke-Untertitel, Hooks, Auto-Edit v2
 9. **Publishing** — S3-Backup + Upload-Post-Distribution
 
+### Long Video / Smart-Auto V2
+1. **Unit-Planung** — Whisper-Wörter werden an Satzenden und Sprechpausen in stabile IDs zerlegt; Gemini wählt keine frei geschätzten Sekunden mehr.
+2. **Smarter Rohschnitt** — Gemini wählt die stärksten unterschiedlichen Themen chronologisch und bestimmt ohne Füllmaterial eine Dauer von 4–10 Minuten.
+3. **Final-Cut-Review** — Ein separater Gemini-Pass prüft Einstieg, Kontext, Übergänge, Wiederholungen und Schluss; ein fehlgeschlagenes Gate erhält genau einen Repair-Versuch.
+4. **Natürliche Grenzen** — Schnitte liegen in Sprechpausen; Scene-Snapping dekodiert nur ein kleines lokales Fenster pro Schnitt. Sichtbare Übergangseffekte werden nicht verwendet.
+5. **Sicherer Auto-Modus** — Besteht kein Long Video das Gate, bleiben vorhandene Shorts erhalten. Ein explizit angefordertes Long Video liefert keinen künstlich aufgefüllten Ersatz.
+
 ### AI Shorts
 1. **Analyse** — Website-Scraping + Gemini-Web-Recherche (oder manuelle Beschreibung)
 2. **Skript** — Gemini generiert virale Skripte mit Segmenten
@@ -200,6 +207,13 @@ Im Browser **`http://localhost:5175`** aufrufen
 | `MAX_CONCURRENT_JOBS` | Limit paralleler Jobs (Standard: 5) |
 | `GEMINI_MODEL` / `GEMINI_MODEL_ANALYSIS` / `GEMINI_MODEL_EDITOR` / … | Gemini-Modell pro Aufgabe |
 | `GEMINI_THINKING_SCORE` | Optionales Thinking-Budget fürs Clip-Scoring |
+| `GEMINI_THINKING_LONGFORM` | Thinking-Level für Longform-Planung und -Review (Standard: `low`) |
+| `LONGFORM_MIN_OUTPUT_SECONDS` / `LONGFORM_MAX_OUTPUT_SECONDS` | Adaptive Longform-Grenzen (Standard: 240 / 600 s) |
+| `LONGFORM_MIN_SOURCE_SECONDS` / `LONGFORM_HARD_MIN_SOURCE_SECONDS` | Ab welcher Quelllänge Auto ein Long Video versucht (720 s) bzw. der explizite Long-Modus (240 s) |
+| `LONGFORM_MIN_CHAPTERS` / `LONGFORM_MAX_CHAPTERS` | Anzahl unterschiedlicher Themen im Longform-Schnitt (Standard: 2 / 6); 1 erlaubt einthemige Quellen |
+| `LONGFORM_REVIEW_MIN_OVERALL_SCORE` / `LONGFORM_REVIEW_MIN_JOIN_SCORE` | Qualitäts-Gates vor dem Longform-Render |
+| `LONGFORM_REVIEW_BOUNDARY_WINDOW_SECONDS` / `LONGFORM_REVIEW_BOUNDARY_MAX_UNITS` | Lokaler Transkript-Kontext vor/nach jedem Schnitt für vollständige Fragen und Antworten (Standard: 75 s / 24 Units) |
+| `LONGFORM_STRONG_PAUSE_SECONDS` / `LONGFORM_PAUSE_FALLBACK_WINDOW_SECONDS` | Starke Sprechpause und lokaler Fast-Speaker-Fallback (Standard: 0,55 / 24 s) |
 | `WHISPER_MODEL` / `WHISPER_DEVICE` / `WHISPER_COMPUTE` | Transkriptionsqualität/-geschwindigkeit |
 | `QUALITY_GATE_MIN_HEIGHT` | Rückfrage unterhalb dieser Auflösung (Standard: 720) |
 | `WATERMARK_ENABLED` / `WATERMARK_TEXT` / `WATERMARK_IMAGE` / `WATERMARK_OPACITY` | Wasserzeichen-Konfiguration |
