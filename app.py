@@ -2229,7 +2229,13 @@ async def resume_job(job_id: str, request: Request, body: Optional[ResumeRequest
     )
 
 from editor import VideoEditor
-from subtitles import generate_srt, generate_ass, burn_layers, generate_srt_from_video
+from subtitles import (
+    burn_layers,
+    generate_ass,
+    generate_srt,
+    generate_srt_from_video,
+    remap_transcript_segments,
+)
 from hooks import prepare_hook_overlay
 from translate import translate_video, get_supported_languages
 from thumbnail import analyze_video_for_titles, refine_titles, generate_thumbnail, generate_youtube_description
@@ -2779,11 +2785,14 @@ async def _add_subtitles_locked(req: SubtitleRequest):
         raise HTTPException(status_code=400, detail="Transcript not found in metadata. Please process a new video.")
     data['transcript'] = transcript
         
-    clips = data.get('shorts', [])
-    if req.clip_index >= len(clips):
+    result_clips = job.get("result", {}).get("clips", []) if isinstance(job.get("result"), dict) else []
+    if req.clip_index >= len(result_clips):
         raise HTTPException(status_code=404, detail="Clip not found")
-        
-    clip_data = clips[req.clip_index]
+
+    metadata_clips, metadata_index, video_type = _lookup_metadata_clip(
+        data, req.clip_index, result_clips[req.clip_index],
+    )
+    clip_data = metadata_clips[metadata_index]
     
     requested_filename = os.path.basename(req.input_filename) if req.input_filename else None
     if not requested_filename and not _filename_from_clip(clip_data):
@@ -2822,6 +2831,21 @@ async def _add_subtitles_locked(req: SubtitleRequest):
             or "translated_" in clean_filename
         )
 
+        subtitle_transcript = transcript
+        subtitle_start = clip_data.get("start", 0)
+        subtitle_end = clip_data.get("end", 0)
+        if video_type == "long" and not is_dubbed:
+            subtitle_transcript, assembled_duration = remap_transcript_segments(
+                transcript, clip_data.get("segments") or [],
+            )
+            if assembled_duration <= 0:
+                raise HTTPException(
+                    status_code=400,
+                    detail="Long-video segment timeline is missing. Please process a new video.",
+                )
+            subtitle_start = 0
+            subtitle_end = assembled_duration
+
         if is_dubbed:
             print(f"🎙️ Dubbed video detected, transcribing audio for subtitles...")
             def run_transcribe_srt():
@@ -2832,9 +2856,11 @@ async def _add_subtitles_locked(req: SubtitleRequest):
             loop = asyncio.get_event_loop()
             success = await loop.run_in_executor(None, run_transcribe_srt)
         elif is_karaoke:
-            success = generate_ass(transcript, clip_data['start'], clip_data['end'], srt_path, **karaoke_opts)
+            success = generate_ass(
+                subtitle_transcript, subtitle_start, subtitle_end, srt_path, **karaoke_opts,
+            )
         else:
-            success = generate_srt(transcript, clip_data['start'], clip_data['end'], srt_path)
+            success = generate_srt(subtitle_transcript, subtitle_start, subtitle_end, srt_path)
 
         if not success:
              raise HTTPException(status_code=400, detail="No words found for this clip range.")
@@ -2921,10 +2947,14 @@ async def _remove_clip_layer_locked(req: RemoveLayerRequest):
     with open(json_files[0], 'r', encoding='utf-8') as f:
         data = json.load(f)
 
-    clips = data.get('shorts', [])
-    if req.clip_index >= len(clips):
+    job = jobs[req.job_id]
+    result_clips = job.get("result", {}).get("clips", []) if isinstance(job.get("result"), dict) else []
+    if req.clip_index >= len(result_clips):
         raise HTTPException(status_code=404, detail="Clip not found")
-    clip_data = clips[req.clip_index]
+    metadata_clips, metadata_index, _video_type = _lookup_metadata_clip(
+        data, req.clip_index, result_clips[req.clip_index],
+    )
+    clip_data = metadata_clips[metadata_index]
 
     layer_entry = await _resolve_clip_layer_entry(
         req.job_id, output_dir, req.clip_index, clip_data,

@@ -1,10 +1,13 @@
 """Tests for subtitle word merging, SRT generation and style sanitizing."""
+import pytest
+
 from subtitles import (
     _ass_time,
     _collect_word_blocks,
     merge_continuation_words,
     generate_srt,
     hex_to_ass_color,
+    remap_transcript_segments,
     _sanitize_font_name,
     _clamp_number,
 )
@@ -84,6 +87,32 @@ class TestGenerateSrt:
         assert [word["word"] for word in words] == ["frueh", "mitte", "spaet"]
         assert words[0]["start"] == 0.0
         assert all(a["start"] <= b["start"] for a, b in zip(words, words[1:]))
+
+
+def test_remap_transcript_segments_builds_discontinuous_output_timeline():
+    transcript = {
+        "language": "de",
+        "segments": [{
+            "words": [
+                _w(" Anfang", 0.2, 0.4),
+                _w(" Mitte", 5.2, 5.4),
+                _w(" Ende", 9.2, 9.4),
+            ],
+        }],
+    }
+
+    remapped, duration = remap_transcript_segments(transcript, [
+        {"start": 5.0, "end": 6.0},
+        {"start": 0.0, "end": 1.0},
+        # Repeated source material (for example a cold open) must appear twice.
+        {"start": 5.0, "end": 5.5},
+    ])
+
+    words = [word for segment in remapped["segments"] for word in segment["words"]]
+    assert duration == 2.5
+    assert remapped["language"] == "de"
+    assert [word["word"] for word in words] == [" Mitte", " Anfang", " Mitte"]
+    assert [word["start"] for word in words] == pytest.approx([0.2, 1.2, 2.2])
 
 
 class TestAssTiming:

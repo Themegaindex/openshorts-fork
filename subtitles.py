@@ -35,6 +35,86 @@ WHISPER_TRANSCRIBE_PARAMS = {
 }
 
 
+def remap_transcript_segments(transcript, selected_segments):
+    """Map source transcript words onto a concatenated long-form timeline.
+
+    Long-form renders stitch several discontinuous source ranges together. A
+    normal clip subtitle call can subtract one ``clip_start`` value, but that
+    would put every range after the first at the wrong time. This helper copies
+    the words contained in each selected source range and shifts them by that
+    range's position in the assembled output. Overlapping source ranges are
+    deliberately preserved: a cold open may repeat material used later.
+
+    Returns ``(transcript, duration)`` where the transcript uses output-relative
+    timestamps and duration is the expected assembled timeline length.
+    """
+    remapped = {
+        key: value
+        for key, value in (transcript.items() if isinstance(transcript, dict) else [])
+        if key != "segments"
+    }
+    remapped["segments"] = []
+
+    source_words = []
+    if isinstance(transcript, dict):
+        for transcript_segment in transcript.get("segments", []):
+            if not isinstance(transcript_segment, dict):
+                continue
+            words = transcript_segment.get("words", [])
+            if isinstance(words, list):
+                source_words.extend(word for word in words if isinstance(word, dict))
+
+    output_offset = 0.0
+    for selected in selected_segments if isinstance(selected_segments, list) else []:
+        if not isinstance(selected, dict):
+            continue
+        try:
+            source_start = float(selected.get("start"))
+            source_end = float(selected.get("end"))
+        except (TypeError, ValueError):
+            continue
+        if (
+            not math.isfinite(source_start)
+            or not math.isfinite(source_end)
+            or source_end <= source_start
+        ):
+            continue
+
+        duration = source_end - source_start
+        mapped_words = []
+        for source_word in source_words:
+            try:
+                word_start = float(source_word.get("start"))
+                word_end = float(source_word.get("end"))
+            except (TypeError, ValueError):
+                continue
+            if not math.isfinite(word_start) or not math.isfinite(word_end):
+                continue
+            if word_end <= source_start or word_start >= source_end:
+                continue
+
+            clipped_start = min(source_end, max(source_start, word_start))
+            clipped_end = min(source_end, max(clipped_start, word_end))
+            mapped_word = dict(source_word)
+            mapped_word["start"] = output_offset + clipped_start - source_start
+            mapped_word["end"] = output_offset + clipped_end - source_start
+            mapped_words.append(mapped_word)
+
+        remapped["segments"].append({
+            "start": output_offset,
+            "end": output_offset + duration,
+            "text": " ".join(
+                str(word.get("word", "")).strip()
+                for word in mapped_words
+                if str(word.get("word", "")).strip()
+            ),
+            "words": mapped_words,
+        })
+        output_offset += duration
+
+    return remapped, output_offset
+
+
 def merge_continuation_words(words):
     """Merge faster-whisper continuation fragments into their base word.
 

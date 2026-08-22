@@ -246,3 +246,88 @@ def test_translate_can_resolve_and_commit_a_long_video(monkeypatch, tmp_path):
     assert response["success"] is True
     saved = json.loads(metadata_path.read_text(encoding="utf-8"))
     assert saved["long_videos"][0]["video_url"].startswith(f"/videos/{job_id}/translated_de_")
+
+
+def test_subtitle_can_remap_and_remove_a_long_video_layer(monkeypatch, tmp_path):
+    job_id = "subtitle-long"
+    output_dir = tmp_path / job_id
+    output_dir.mkdir()
+    (output_dir / "long.mp4").write_bytes(b"video")
+    metadata_path = output_dir / "show_metadata.json"
+    _write_metadata(metadata_path, {
+        "transcript": {"segments": [{"words": [
+            {"word": " First", "start": 10.2, "end": 10.4},
+            {"word": " Second", "start": 20.3, "end": 20.5},
+        ]}]},
+        "shorts": [],
+        "long_videos": [{
+            "output_filename": "long.mp4",
+            "video_type": "long",
+            "start": 0,
+            "end": 2,
+            "segments": [
+                {"start": 10, "end": 11},
+                {"start": 20, "end": 21},
+            ],
+        }],
+    })
+    monkeypatch.setattr(app, "OUTPUT_DIR", str(tmp_path))
+    monkeypatch.setattr(app, "jobs", {
+        job_id: {
+            "job_id": job_id,
+            "status": "completed",
+            "output_dir": str(output_dir),
+            "result": {"clips": [{
+                "output_filename": "long.mp4",
+                "video_url": f"/videos/{job_id}/long.mp4",
+                "video_type": "long",
+            }]},
+            "raw_logs": [],
+            "important_logs": [],
+        },
+    })
+    captured = {}
+
+    def fake_generate_srt(transcript, start, end, output_path):
+        captured["transcript"] = transcript
+        captured["range"] = (start, end)
+        Path(output_path).write_text("subtitle", encoding="utf-8")
+        return True
+
+    def fake_render(_output_dir, _entry, output_path):
+        Path(output_path).write_bytes(b"subtitled video")
+
+    monkeypatch.setattr(app, "generate_srt", fake_generate_srt)
+    monkeypatch.setattr(app, "_render_stored_layers", fake_render)
+
+    response = asyncio.run(app._add_subtitles_locked(
+        app.SubtitleRequest(job_id=job_id, clip_index=0),
+    ))
+
+    words = [
+        word
+        for segment in captured["transcript"]["segments"]
+        for word in segment["words"]
+    ]
+    assert response["success"] is True
+    assert captured["range"] == (0, 2.0)
+    assert [word["start"] for word in words] == pytest.approx([0.2, 1.3])
+
+    removed = asyncio.run(app._remove_clip_layer_locked(
+        app.RemoveLayerRequest(job_id=job_id, clip_index=0, layer="subtitle"),
+    ))
+    assert removed["new_video_url"] == f"/videos/{job_id}/long.mp4"
+    assert removed["layers"] == {"subtitle": False, "hook": False}
+
+    saved = json.loads(metadata_path.read_text(encoding="utf-8"))
+    assert saved["long_videos"][0]["video_url"] == f"/videos/{job_id}/long.mp4"
+
+
+def test_long_result_card_offers_subtitles_instead_of_dubbing():
+    result_card = (
+        Path(__file__).parents[1] / "dashboard" / "src" / "components" / "ResultCard.jsx"
+    ).read_text(encoding="utf-8")
+    actions = result_card.split("{/* Actions Footer */}", 1)[1]
+    long_actions = actions.split("{isLong ? (", 1)[1].split(") : (", 1)[0]
+    assert "setShowSubtitleModal(true)" in long_actions
+    assert "Dub Voice" not in long_actions

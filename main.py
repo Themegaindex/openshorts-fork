@@ -8,6 +8,7 @@ import re
 import sys
 import math
 import threading
+import os
 from contextlib import contextmanager
 from scenedetect import SceneManager
 from scenedetect.detectors import ContentDetector
@@ -23,9 +24,13 @@ except ImportError:
     VideoManager = None
 from ultralytics import YOLO
 import torch
-import os
 import numpy as np
 from tqdm import tqdm
+# OpenShorts does not require third-party yt-dlp plugins. Disable globally
+# installed providers by default so a stale bgutil installation cannot make
+# every YouTube request probe a nonexistent localhost service on port 4416.
+# An advanced user can explicitly opt back in with YTDLP_NO_PLUGINS="".
+os.environ.setdefault("YTDLP_NO_PLUGINS", "1")
 import yt_dlp
 import mediapipe as mp
 from mediapipe.tasks import python as mp_python
