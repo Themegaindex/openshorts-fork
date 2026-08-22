@@ -10,6 +10,26 @@ from unittest.mock import MagicMock, patch
 import pytest
 
 
+_PIPELINE_DEPENDENCY_PREFIXES = (
+    "cv2",
+    "google",
+    "mediapipe",
+    "numpy",
+    "scenedetect",
+    "torch",
+    "tqdm",
+    "ultralytics",
+    "yt_dlp",
+)
+
+
+def _is_pipeline_dependency_module(module_name):
+    return any(
+        module_name == prefix or module_name.startswith(f"{prefix}.")
+        for prefix in _PIPELINE_DEPENDENCY_PREFIXES
+    )
+
+
 def _stub_missing_pipeline_dependencies():
     """Let dependency-free pipeline tests collect in lightweight CI.
 
@@ -104,18 +124,47 @@ def _stub_missing_pipeline_dependencies():
         sys.modules["google.genai.types"] = genai_types_stub
 
 
-_stub_missing_pipeline_dependencies()
+@contextmanager
+def _isolated_pipeline_dependencies():
+    original_modules = {
+        name: module
+        for name, module in tuple(sys.modules.items())
+        if _is_pipeline_dependency_module(name)
+    }
+    missing_attribute = object()
+    original_google = sys.modules.get("google")
+    original_google_genai = (
+        getattr(original_google, "genai", missing_attribute)
+        if original_google is not None
+        else missing_attribute
+    )
 
-# A fresh checkout intentionally has no ignored model files. Keep collection
-# network-free while main initializes the already-stubbed MediaPipe boundary.
-with patch("urllib.request.urlretrieve", return_value=(None, None)):
+    _stub_missing_pipeline_dependencies()
+    try:
+        # A fresh checkout intentionally has no ignored model files. Keep
+        # collection network-free while main initializes the stub boundaries.
+        with patch("urllib.request.urlretrieve", return_value=(None, None)):
+            yield
+    finally:
+        # main keeps direct references to the test doubles it imported. Restore
+        # the interpreter's module registry so later test modules see their real
+        # dependencies (or skip them) instead of silently running against mocks.
+        for module_name in tuple(sys.modules):
+            if _is_pipeline_dependency_module(module_name) and module_name not in original_modules:
+                sys.modules.pop(module_name, None)
+        sys.modules.update(original_modules)
+        if original_google is not None:
+            if original_google_genai is missing_attribute:
+                try:
+                    delattr(original_google, "genai")
+                except AttributeError:
+                    pass
+            else:
+                original_google.genai = original_google_genai
+
+
+with _isolated_pipeline_dependencies():
     import main
-
-# pytest itself probes an imported numpy module when evaluating approx(). The
-# pipeline keeps its direct module reference, while removing only our stub here
-# prevents that optional-dependency probe from mistaking a test double for numpy.
-if getattr(sys.modules.get("numpy"), "_openshorts_test_stub", False):
-    sys.modules.pop("numpy", None)
 
 
 class _Reporter:
