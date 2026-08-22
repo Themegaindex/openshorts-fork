@@ -212,6 +212,64 @@ def _transcript(duration=900):
     }
 
 
+def _run_auto_with_both_outputs(monkeypatch, tmp_path, shorts_renderer, long_renderer):
+    reporter = _Reporter()
+    monkeypatch.setattr(main, "JOB_REPORTER", reporter)
+    monkeypatch.setattr(main, "_render_shorts_clips", shorts_renderer)
+    monkeypatch.setattr(main, "_render_longform_video", long_renderer)
+    monkeypatch.setattr(
+        main,
+        "_analyze_longform_with_fallback",
+        lambda *_args, **_kwargs: {
+            "plan_data": {
+                "viable": True,
+                "video_title": "Long result",
+                "youtube_description": "",
+                "segments": [{
+                    "start": 0,
+                    "end": 500,
+                    "chapter_title": "Story",
+                    "role": "body",
+                }],
+                "total_duration": 500,
+                "warnings": [],
+            },
+            "error": None,
+            "attempts": [],
+        },
+    )
+    metadata = main._run_video_type_pipeline(
+        "auto",
+        transcript=_transcript(),
+        duration=900,
+        analysis_result={
+            "clips_data": {
+                "shorts": [{
+                    "start": 10,
+                    "end": 40,
+                    "video_title_for_youtube_short": "Short result",
+                }],
+            },
+            "error": None,
+            "attempts": [],
+            "cost_analysis": None,
+            "windows": [],
+            "scored_windows": [],
+        },
+        output_dir=str(tmp_path),
+        video_title="Video",
+        input_video="source.mp4",
+        output_format="vertical",
+        layout_style="smart",
+        resume_requested=False,
+        resume_phase=None,
+        metadata_file=str(tmp_path / "metadata.json"),
+        analysis_result_file=str(tmp_path / "analysis.json"),
+        source_url=None,
+    )
+    return metadata, reporter
+
+
 @pytest.mark.parametrize("message", [
     "ERROR: unable to download video data: HTTP Error 403: Forbidden",
     "HTTP Error 429: Too Many Requests",
@@ -332,6 +390,77 @@ def test_auto_detail_failure_stays_nonterminal_when_longform_succeeds(monkeypatc
         event[0] == "warning" and event[2].get("recoverable") is True
         for event in reporter.events
     )
+
+
+def test_auto_continues_with_long_video_when_shorts_render_fails(monkeypatch, tmp_path):
+    render_order = []
+
+    def fail_shorts(*_args, **_kwargs):
+        render_order.append("shorts")
+        raise RuntimeError("shorts renderer unavailable")
+
+    def render_long(*_args, **kwargs):
+        render_order.append("long")
+        assert kwargs["weight_done_before"] == 0.0
+        assert kwargs["total_weight"] == pytest.approx(500.0)
+        return str(tmp_path / "Video_long_1.mp4")
+
+    metadata, reporter = _run_auto_with_both_outputs(
+        monkeypatch, tmp_path, fail_shorts, render_long,
+    )
+
+    assert render_order == ["shorts", "long"]
+    assert metadata["processing_mode"] == "long_video"
+    assert metadata["analysis_status"] == "partial"
+    assert metadata["shorts"] == []
+    assert len(metadata["long_videos"]) == 1
+    assert "shorts renderer unavailable" in metadata["render_errors"][0]
+    assert reporter.output_seconds == pytest.approx(500.0)
+    assert json.loads((tmp_path / "metadata.json").read_text(encoding="utf-8")) == metadata
+    assert not any(event[0] == "error" for event in reporter.events)
+
+
+def test_auto_keeps_shorts_when_long_video_render_fails(monkeypatch, tmp_path):
+    render_order = []
+
+    def render_shorts(*_args, **_kwargs):
+        render_order.append("shorts")
+        return 30.0
+
+    def fail_long(*_args, **_kwargs):
+        render_order.append("long")
+        raise RuntimeError("long renderer unavailable")
+
+    metadata, reporter = _run_auto_with_both_outputs(
+        monkeypatch, tmp_path, render_shorts, fail_long,
+    )
+
+    assert render_order == ["shorts", "long"]
+    assert metadata["processing_mode"] == "clips"
+    assert metadata["analysis_status"] == "partial"
+    assert len(metadata["shorts"]) == 1
+    assert metadata["long_videos"] == []
+    assert "long renderer unavailable" in metadata["render_errors"][0]
+    assert reporter.output_seconds == pytest.approx(30.0)
+    assert json.loads((tmp_path / "metadata.json").read_text(encoding="utf-8")) == metadata
+    assert not any(event[0] == "error" for event in reporter.events)
+
+
+def test_auto_fails_only_after_both_planned_render_groups_fail(monkeypatch, tmp_path):
+    render_order = []
+
+    def fail_shorts(*_args, **_kwargs):
+        render_order.append("shorts")
+        raise RuntimeError("shorts renderer unavailable")
+
+    def fail_long(*_args, **_kwargs):
+        render_order.append("long")
+        raise RuntimeError("long renderer unavailable")
+
+    with pytest.raises(RuntimeError, match="All planned Auto outputs failed to render"):
+        _run_auto_with_both_outputs(monkeypatch, tmp_path, fail_shorts, fail_long)
+
+    assert render_order == ["shorts", "long"]
 
 
 def test_auto_invalid_short_payload_reaches_bounded_fallback(monkeypatch, tmp_path):
