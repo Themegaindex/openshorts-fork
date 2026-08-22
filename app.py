@@ -848,7 +848,12 @@ def _mark_job_status(job_id: str, status: str, *, error_summary: Optional[str] =
         job["auto_resume_pending"] = False
         job["operation_name"] = None
         job["operation_deadline_at"] = None
-    if error_summary is not None:
+    if status == "completed":
+        # A validated output can still carry recoverable analysis diagnostics
+        # (for example full_video_fallback). Keep those in analysis_error and
+        # never expose a successful job as a dashboard-level failure.
+        job["error_summary"] = None
+    elif error_summary is not None:
         job["error_summary"] = error_summary
     if resumable is not None:
         job["is_resumable"] = resumable
@@ -949,7 +954,6 @@ def _apply_job_event(job_id: str, event: dict) -> None:
         job["analysis_status"] = event["analysis_status"]
     if event.get("analysis_error") is not None:
         job["analysis_error"] = event["analysis_error"]
-        job["error_summary"] = event["analysis_error"]
     if isinstance(event.get("analysis_coverage"), dict):
         job["analysis_coverage"] = event["analysis_coverage"]
 

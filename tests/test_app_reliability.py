@@ -217,6 +217,41 @@ def test_mark_completed_persists_exact_duration_and_live_eta_state(monkeypatch, 
     assert job["eta_state"] == "done"
 
 
+def test_successful_fallback_diagnostic_never_becomes_job_error(monkeypatch, tmp_path):
+    job_id = "successful-fallback"
+    monkeypatch.setattr(app, "_persist_job_state", lambda _job_id: None)
+    monkeypatch.setattr(app, "jobs", {
+        job_id: {
+            "job_id": job_id,
+            "status": "processing",
+            "output_dir": str(tmp_path),
+            "error_summary": None,
+            "raw_logs": [],
+            "important_logs": [],
+        }
+    })
+
+    app._apply_job_event(job_id, {
+        "type": "result_mode",
+        "message": "Output mode: full_video_fallback",
+        "processing_mode": "full_video_fallback",
+        "analysis_status": "fallback",
+        "analysis_error": "Gemini returned no viable edit.",
+    })
+
+    job = app.jobs[job_id]
+    assert job["analysis_error"] == "Gemini returned no viable edit."
+    assert job["error_summary"] is None
+
+    # Completion also clears a stale recoverable error from earlier worker
+    # events once the supervisor has validated the output artifacts.
+    job["error_summary"] = "recoverable worker diagnostic"
+    app._mark_job_status(job_id, "completed", resumable=False)
+    assert job["status"] == "completed"
+    assert job["error_summary"] is None
+    assert job["analysis_error"] == "Gemini returned no viable edit."
+
+
 def test_job_event_persists_phase_timing_fields(monkeypatch, tmp_path):
     job_id = "phase-timing"
     monkeypatch.setattr(app, "_persist_job_state", lambda _job_id: None)
