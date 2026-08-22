@@ -1,0 +1,248 @@
+import asyncio
+import json
+import os
+from pathlib import Path
+import zipfile
+
+import pytest
+
+pytest.importorskip("fastapi", reason="FastAPI contract tests run in the server environment")
+
+from fastapi import HTTPException
+from starlette.requests import Request
+
+import app
+
+
+def _write_metadata(path, payload):
+    path.write_text(json.dumps(payload), encoding="utf-8")
+
+
+def test_result_builder_appends_ready_long_video_after_shorts(tmp_path):
+    (tmp_path / "clip.mp4").write_bytes(b"short")
+    (tmp_path / "long.mp4").write_bytes(b"long")
+    metadata_path = tmp_path / "show_metadata.json"
+    _write_metadata(metadata_path, {
+        "video_type": "auto",
+        "processing_mode": "clips_and_long",
+        "shorts": [{"output_filename": "clip.mp4", "start": 10, "end": 40}],
+        "long_videos": [{
+            "output_filename": "long.mp4", "start": 0, "end": 540,
+            "title": "Long title", "chapters": [],
+        }],
+    })
+
+    result = app._build_result_from_metadata("job", str(metadata_path), str(tmp_path))
+
+    assert [item["output_filename"] for item in result["clips"]] == ["clip.mp4", "long.mp4"]
+    assert result["clips"][1]["video_type"] == "long"
+    assert result["video_type"] == "auto"
+    assert result["processing_mode"] == "clips_and_long"
+
+
+def test_combined_index_updates_long_metadata_and_survives_a_filtered_short(monkeypatch, tmp_path):
+    job_id = "combined-job"
+    output_dir = tmp_path / job_id
+    output_dir.mkdir()
+    metadata_path = output_dir / "show_metadata.json"
+    _write_metadata(metadata_path, {
+        "shorts": [
+            {"output_filename": "missing.mp4"},
+            {"output_filename": "ready.mp4"},
+        ],
+        "long_videos": [{"output_filename": "long.mp4", "video_type": "long"}],
+    })
+    monkeypatch.setattr(app, "jobs", {
+        job_id: {
+            "job_id": job_id,
+            "status": "completed",
+            "output_dir": str(output_dir),
+            "result": {"clips": [
+                {"output_filename": "ready.mp4", "video_url": f"/videos/{job_id}/ready.mp4"},
+                {"output_filename": "long.mp4", "video_url": f"/videos/{job_id}/long.mp4", "video_type": "long"},
+            ]},
+            "raw_logs": [],
+            "important_logs": [],
+        },
+    })
+
+    app._update_clip_version(
+        job_id, 1, f"/videos/{job_id}/translated_long.mp4", metadata_path=str(metadata_path),
+    )
+
+    saved = json.loads(metadata_path.read_text(encoding="utf-8"))
+    assert "video_url" not in saved["shorts"][0]
+    assert "video_url" not in saved["shorts"][1]
+    assert saved["long_videos"][0]["video_url"].endswith("translated_long.mp4")
+
+
+def test_video_type_is_in_persisted_job_state():
+    serialized = app._serialize_job({
+        "job_id": "job", "status": "queued", "video_type": "auto",
+    })
+    assert serialized["video_type"] == "auto"
+
+
+def test_download_all_uses_output_filename_for_untouched_short_and_long(monkeypatch, tmp_path):
+    job_id = "zip-job"
+    output_dir = tmp_path / job_id
+    output_dir.mkdir()
+    (output_dir / "short.mp4").write_bytes(b"short")
+    (output_dir / "long.mp4").write_bytes(b"long")
+    _write_metadata(output_dir / "show_metadata.json", {
+        "shorts": [{"output_filename": "short.mp4"}],
+        "long_videos": [{"output_filename": "long.mp4"}],
+    })
+    monkeypatch.setattr(app, "OUTPUT_DIR", str(tmp_path))
+
+    response = asyncio.run(app.download_all_clips(job_id))
+
+    with zipfile.ZipFile(response.path) as archive:
+        assert archive.namelist() == ["clip_01_short.mp4", "long_01_long.mp4"]
+
+
+def test_single_clip_download_streams_the_current_long_file(monkeypatch, tmp_path):
+    job_id = "download-long"
+    output_dir = tmp_path / job_id
+    output_dir.mkdir()
+    video_path = output_dir / "long.mp4"
+    video_path.write_bytes(b"long video")
+    monkeypatch.setattr(app, "jobs", {
+        job_id: {
+            "output_dir": str(output_dir),
+            "result": {"clips": [{
+                "video_url": f"/videos/{job_id}/long.mp4",
+                "video_type": "long",
+            }]},
+        },
+    })
+
+    response = asyncio.run(app.download_clip(job_id, 0))
+
+    assert response.path == str(video_path)
+    assert response.headers["content-disposition"].startswith("attachment;")
+    result_card = (
+        Path(__file__).parents[1] / "dashboard" / "src" / "components" / "ResultCard.jsx"
+    ).read_text(encoding="utf-8")
+    assert "response.blob()" not in result_card
+    assert "/clips/${index}/download" in result_card
+
+
+def test_social_post_rejects_long_before_vendor_request(monkeypatch):
+    job_id = "long-social"
+    monkeypatch.setattr(app, "jobs", {
+        job_id: {"result": {"clips": [{"video_type": "long", "video_url": "/videos/x/long.mp4"}]}}
+    })
+    request = app.SocialPostRequest(
+        job_id=job_id,
+        clip_index=0,
+        api_key="key",
+        user_id="user",
+        platforms=["youtube"],
+    )
+
+    with pytest.raises(HTTPException) as exc_info:
+        asyncio.run(app.post_to_socials(request))
+    assert exc_info.value.status_code == 400
+    assert "long videos" in exc_info.value.detail
+
+
+class _Queue:
+    def __init__(self):
+        self.items = []
+
+    async def put(self, item):
+        self.items.append(item)
+
+
+def _json_request(payload, api_key="gemini-key"):
+    body = json.dumps(payload).encode("utf-8")
+    delivered = False
+
+    async def receive():
+        nonlocal delivered
+        if delivered:
+            return {"type": "http.request", "body": b"", "more_body": False}
+        delivered = True
+        return {"type": "http.request", "body": body, "more_body": False}
+
+    return Request({
+        "type": "http",
+        "method": "POST",
+        "path": "/api/process",
+        "headers": [
+            (b"content-type", b"application/json"),
+            (b"x-gemini-key", api_key.encode("utf-8")),
+        ],
+    }, receive)
+
+
+@pytest.mark.parametrize("video_type,expected_arg", [("auto", True), ("shorts", False), ("invalid", False)])
+def test_process_endpoint_forwards_only_nonlegacy_video_type(
+    monkeypatch, tmp_path, video_type, expected_arg,
+):
+    queue = _Queue()
+    monkeypatch.setattr(app, "OUTPUT_DIR", str(tmp_path))
+    monkeypatch.setattr(app, "QUALITY_GATE_MIN_HEIGHT", 0)
+    monkeypatch.setattr(app, "jobs", {})
+    monkeypatch.setattr(app, "job_queue", queue)
+    request = _json_request({
+        "url": "https://example.com/video",
+        "output_format": "vertical",
+        "layout_style": "smart",
+        "video_type": video_type,
+    })
+
+    response = asyncio.run(app.process_endpoint(
+        request, file=None, url=None, output_format=None, layout_style=None, video_type=None,
+    ))
+    command = app.jobs[response["job_id"]]["cmd"]
+
+    assert ("--video-type" in command) is expected_arg
+    if expected_arg:
+        assert command[command.index("--video-type") + 1] == video_type
+    else:
+        assert app.jobs[response["job_id"]]["video_type"] == "shorts"
+
+
+def test_translate_can_resolve_and_commit_a_long_video(monkeypatch, tmp_path):
+    job_id = "translate-long"
+    output_dir = tmp_path / job_id
+    output_dir.mkdir()
+    source = output_dir / "long.mp4"
+    source.write_bytes(b"video")
+    metadata_path = output_dir / "show_metadata.json"
+    _write_metadata(metadata_path, {
+        "shorts": [],
+        "long_videos": [{"output_filename": "long.mp4", "video_type": "long"}],
+    })
+    monkeypatch.setattr(app, "OUTPUT_DIR", str(tmp_path))
+    monkeypatch.setattr(app, "jobs", {
+        job_id: {
+            "job_id": job_id,
+            "status": "completed",
+            "output_dir": str(output_dir),
+            "result": {"clips": [{
+                "output_filename": "long.mp4",
+                "video_url": f"/videos/{job_id}/long.mp4",
+                "video_type": "long",
+            }]},
+            "raw_logs": [],
+            "important_logs": [],
+        },
+    })
+
+    def fake_translate(*, video_path, output_path, **_kwargs):
+        assert os.path.basename(video_path) == "long.mp4"
+        with open(output_path, "wb") as output:
+            output.write(b"translated")
+
+    monkeypatch.setattr(app, "translate_video", fake_translate)
+    response = asyncio.run(app._translate_clip_locked(
+        app.TranslateRequest(job_id=job_id, clip_index=0, target_language="de"),
+        "elevenlabs-key",
+    ))
+
+    assert response["success"] is True
+    saved = json.loads(metadata_path.read_text(encoding="utf-8"))
+    assert saved["long_videos"][0]["video_url"].startswith(f"/videos/{job_id}/translated_de_")
