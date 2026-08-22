@@ -3506,6 +3506,7 @@ def _render_shorts_clips(
     video_title,
     weight_done_before=0.0,
     total_weight=None,
+    completed_callback=None,
 ):
     """Render the legacy Shorts loop with optional combined-job weighting."""
     shorts = clips_data.get("shorts", [])
@@ -3600,6 +3601,8 @@ def _render_shorts_clips(
             f"clip_{i + 1}", clip_final_path,
             message=f"Clip {i + 1} ready: {clip_final_path}",
         )
+        if completed_callback:
+            completed_callback(i, clip)
         if os.path.exists(clip_temp_path):
             os.remove(clip_temp_path)
     return shorts_weight
@@ -4078,6 +4081,8 @@ def _run_video_type_pipeline(
     render_errors = []
     shorts_rendered = False
     long_rendered = False
+    completed_shorts = []
+    rendered_shorts_weight = 0.0
     if has_shorts:
         try:
             _render_shorts_clips(
@@ -4089,19 +4094,33 @@ def _run_video_type_pipeline(
                 video_title=video_title,
                 weight_done_before=0.0,
                 total_weight=total_weight,
+                completed_callback=lambda _index, clip: completed_shorts.append(dict(clip)),
             )
             shorts_rendered = True
+            rendered_shorts_weight = shorts_weight
         except Exception as exc:
             if not has_long:
                 raise
-            message = f"Shorts render failed; continuing with the long video: {exc}"
+            if completed_shorts:
+                metadata["shorts"] = completed_shorts
+                shorts_rendered = True
+                rendered_shorts_weight = sum(
+                    max(0.001, float(item["end"]) - float(item["start"]))
+                    for item in completed_shorts
+                )
+                message = (
+                    f"Shorts render stopped after {len(completed_shorts)} completed clip(s); "
+                    f"keeping them and continuing with the long video: {exc}"
+                )
+            else:
+                message = f"Shorts render failed; continuing with the long video: {exc}"
             render_errors.append(message)
             JOB_REPORTER.warning(message, category="render", recoverable=True)
     if has_long:
         try:
-            long_weight_done_before = shorts_weight if shorts_rendered else 0.0
-            long_render_total = total_weight if shorts_rendered else max(0.001, long_weight)
-            if has_shorts and not shorts_rendered:
+            long_weight_done_before = rendered_shorts_weight
+            long_render_total = max(0.001, rendered_shorts_weight + long_weight)
+            if render_errors:
                 JOB_REPORTER.set_output_seconds(long_render_total)
             _render_longform_video(
                 long_plan,
@@ -4148,7 +4167,7 @@ def _run_video_type_pipeline(
             analysis_error=metadata["analysis_error"],
         )
         actual_output_weight = (
-            (shorts_weight if shorts_rendered else 0.0)
+            rendered_shorts_weight
             + (long_weight if long_rendered else 0.0)
         )
         JOB_REPORTER.set_output_seconds(actual_output_weight)

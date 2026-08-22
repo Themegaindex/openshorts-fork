@@ -212,7 +212,9 @@ def _transcript(duration=900):
     }
 
 
-def _run_auto_with_both_outputs(monkeypatch, tmp_path, shorts_renderer, long_renderer):
+def _run_auto_with_both_outputs(
+    monkeypatch, tmp_path, shorts_renderer, long_renderer, *, shorts=None,
+):
     reporter = _Reporter()
     monkeypatch.setattr(main, "JOB_REPORTER", reporter)
     monkeypatch.setattr(main, "_render_shorts_clips", shorts_renderer)
@@ -244,7 +246,7 @@ def _run_auto_with_both_outputs(monkeypatch, tmp_path, shorts_renderer, long_ren
         duration=900,
         analysis_result={
             "clips_data": {
-                "shorts": [{
+                "shorts": shorts or [{
                     "start": 10,
                     "end": 40,
                     "video_title_for_youtube_short": "Short result",
@@ -461,6 +463,48 @@ def test_auto_fails_only_after_both_planned_render_groups_fail(monkeypatch, tmp_
         _run_auto_with_both_outputs(monkeypatch, tmp_path, fail_shorts, fail_long)
 
     assert render_order == ["shorts", "long"]
+
+
+def test_auto_preserves_completed_shorts_when_later_renders_fail(monkeypatch, tmp_path):
+    render_order = []
+
+    def partially_render_shorts(clips_data, *_args, **kwargs):
+        render_order.append("shorts")
+        kwargs["completed_callback"](0, clips_data["shorts"][0])
+        raise RuntimeError("second short failed")
+
+    def fail_long(*_args, **_kwargs):
+        render_order.append("long")
+        raise RuntimeError("long renderer unavailable")
+
+    metadata, reporter = _run_auto_with_both_outputs(
+        monkeypatch,
+        tmp_path,
+        partially_render_shorts,
+        fail_long,
+        shorts=[
+            {
+                "start": 10,
+                "end": 40,
+                "video_title_for_youtube_short": "Completed short",
+            },
+            {
+                "start": 50,
+                "end": 80,
+                "video_title_for_youtube_short": "Failed short",
+            },
+        ],
+    )
+
+    assert render_order == ["shorts", "long"]
+    assert metadata["processing_mode"] == "clips"
+    assert metadata["analysis_status"] == "partial"
+    assert [item["video_title_for_youtube_short"] for item in metadata["shorts"]] == [
+        "Completed short",
+    ]
+    assert metadata["long_videos"] == []
+    assert len(metadata["render_errors"]) == 2
+    assert reporter.output_seconds == pytest.approx(30.0)
 
 
 def test_auto_invalid_short_payload_reaches_bounded_fallback(monkeypatch, tmp_path):
