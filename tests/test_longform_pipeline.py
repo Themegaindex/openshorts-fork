@@ -862,6 +862,54 @@ def test_auto_threshold_considers_nine_minute_sources():
     assert target_max == 540
 
 
+def test_video_duration_falls_back_to_ffprobe_when_opencv_is_unknown(monkeypatch):
+    class UnknownDurationCapture:
+        released = False
+
+        def get(self, _property):
+            return 0
+
+        def release(self):
+            self.released = True
+
+    capture = UnknownDurationCapture()
+    commands = []
+    monkeypatch.setattr(main.cv2, "VideoCapture", lambda _path: capture)
+
+    def probe(command, **kwargs):
+        commands.append((command, kwargs))
+        return SimpleNamespace(returncode=0, stdout=b"725.500000\n")
+
+    monkeypatch.setattr(main.subprocess, "run", probe)
+
+    duration = main._get_video_duration("source.mp4")
+
+    assert duration == pytest.approx(725.5)
+    assert capture.released is True
+    assert commands[0][0][0] == "ffprobe"
+    assert commands[0][1]["timeout"] == 60
+    main._validate_longform_source_duration("long", duration)
+
+
+def test_unknown_long_duration_has_distinct_error_when_all_probes_fail(monkeypatch):
+    capture = SimpleNamespace(
+        get=lambda _property: 0,
+        release=lambda: None,
+    )
+    monkeypatch.setattr(main.cv2, "VideoCapture", lambda _path: capture)
+
+    def missing_probe(*_args, **_kwargs):
+        raise FileNotFoundError("ffprobe missing")
+
+    monkeypatch.setattr(main.subprocess, "run", missing_probe)
+
+    duration = main._get_video_duration("source.mp4")
+
+    assert duration == 0.0
+    with pytest.raises(RuntimeError, match="could not determine the source duration"):
+        main._validate_longform_source_duration("long", duration)
+
+
 def test_explicit_long_source_is_rejected_before_transcription():
     with pytest.raises(RuntimeError, match="needs at least"):
         main._validate_longform_source_duration(

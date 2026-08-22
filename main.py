@@ -3136,6 +3136,10 @@ def _longform_target_range(video_duration):
 
 
 def _validate_longform_source_duration(video_type, duration):
+    if video_type == "long" and float(duration) <= 0:
+        raise RuntimeError(
+            "Long Video could not determine the source duration with OpenCV or ffprobe."
+        )
     if video_type == "long" and float(duration) < LONGFORM_HARD_MIN_SOURCE_SECONDS:
         raise RuntimeError(
             f"Long Video needs at least {int(LONGFORM_HARD_MIN_SOURCE_SECONDS)} seconds of source material "
@@ -4100,14 +4104,46 @@ def _ensure_dir(path: str) -> str:
     return path
 
 
-def _get_video_duration(video_path):
-    cap = cv2.VideoCapture(video_path)
-    fps = cap.get(cv2.CAP_PROP_FPS) or 0
-    frame_count = int(cap.get(cv2.CAP_PROP_FRAME_COUNT) or 0)
-    cap.release()
-    if fps <= 0:
+def _ffprobe_video_duration(video_path):
+    """Return a positive media duration, or 0 when ffprobe cannot provide one."""
+    try:
+        result = subprocess.run(
+            [
+                "ffprobe",
+                "-v", "error",
+                "-show_entries", "format=duration",
+                "-of", "default=noprint_wrappers=1:nokey=1",
+                video_path,
+            ],
+            capture_output=True,
+            timeout=60,
+        )
+        if result.returncode != 0:
+            return 0.0
+        duration = float((result.stdout or b"").strip() or 0)
+    except (OSError, subprocess.SubprocessError, TypeError, ValueError, OverflowError):
         return 0.0
-    return frame_count / fps
+    return duration if math.isfinite(duration) and duration > 0 else 0.0
+
+
+def _get_video_duration(video_path):
+    cap = None
+    try:
+        cap = cv2.VideoCapture(video_path)
+        fps = float(cap.get(cv2.CAP_PROP_FPS) or 0)
+        frame_count = float(cap.get(cv2.CAP_PROP_FRAME_COUNT) or 0)
+        duration = frame_count / fps if fps > 0 and frame_count > 0 else 0.0
+        if math.isfinite(duration) and duration > 0:
+            return duration
+    except Exception:
+        pass
+    finally:
+        if cap is not None:
+            try:
+                cap.release()
+            except Exception:
+                pass
+    return _ffprobe_video_duration(video_path)
 
 
 def _find_source_video(resume_dir: str, *, require_audio: bool = False):
