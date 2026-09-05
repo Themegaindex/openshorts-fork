@@ -16,6 +16,7 @@ import zipfile
 import hashlib
 from datetime import datetime, timezone
 from dotenv import load_dotenv
+from collections import OrderedDict
 from typing import Dict, Optional, List, Literal
 from contextlib import asynccontextmanager
 from fastapi import FastAPI, UploadFile, File, Form, HTTPException, Request, Header, BackgroundTasks
@@ -1226,6 +1227,9 @@ def _build_result_from_video_artifacts(job_id: str, output_dir: str) -> Optional
             path
             for output_format in CANONICAL_OUTPUT_FORMATS
             for path in glob.glob(os.path.join(output_dir, f"*_{output_format}.mp4"))
+            # temp_* / temp_partial_* are renderer scratch files; after a crash
+            # mid-render they are the newest match and must not be served.
+            if not os.path.basename(path).startswith("temp_")
         },
         key=lambda p: os.path.getmtime(p),
         reverse=True,
@@ -1897,14 +1901,22 @@ async def _probe_youtube_quality(url: str) -> dict:
 # enqueued.
 PROCESS_REQUEST_ID_RE = re.compile(r"^[A-Za-z0-9_-]{8,64}$")
 PROCESS_REQUEST_TTL_SECONDS = 6 * 3600
-# The cancel endpoint is unauthenticated (like /api/jobs/{id}/cancel), so
-# job-less entries must be capped or arbitrary ids could grow the registry.
+# Entries in _process_requests are created only by /api/process itself. The
+# unauthenticated cancel endpoint never adds to it; a cancel for an id that
+# has not arrived yet is remembered in a separate, small bounded store so it
+# cannot evict the entry of a request that is still uploading.
 PROCESS_REQUEST_MAX_PENDING = 2000
-_process_requests: Dict[str, dict] = {}  # request_id -> {"job_id", "cancelled", "ts"}
+PROCESS_PRECANCEL_MAX = 1000
+_process_requests: Dict[str, dict] = {}  # request_id -> {"id", "job_id", "cancelled", "in_flight", "ts"}
+_precancelled_requests: "OrderedDict[str, float]" = OrderedDict()  # request_id -> ts
 
 
 def _prune_process_requests(now: float) -> None:
     for request_id, entry in list(_process_requests.items()):
+        if entry.get("in_flight"):
+            # /api/process is still handling this request (upload / quality
+            # probe). Its entry is the only handle a cancel can reach.
+            continue
         job = jobs.get(entry.get("job_id")) if entry.get("job_id") else None
         if job is not None and job.get("status") in ACTIVE_JOB_STATUSES:
             # A queued/running job must stay cancellable by request id no
@@ -1916,28 +1928,75 @@ def _prune_process_requests(now: float) -> None:
     pending = sorted(
         (entry.get("ts", now), request_id)
         for request_id, entry in _process_requests.items()
-        if not entry.get("job_id")
+        if not entry.get("job_id") and not entry.get("in_flight")
     )
     for _ts, request_id in pending[:max(0, len(pending) - PROCESS_REQUEST_MAX_PENDING)]:
         _process_requests.pop(request_id, None)
+    while _precancelled_requests:
+        oldest_id, oldest_ts = next(iter(_precancelled_requests.items()))
+        if (
+            len(_precancelled_requests) > PROCESS_PRECANCEL_MAX
+            or now - oldest_ts > PROCESS_REQUEST_TTL_SECONDS
+        ):
+            _precancelled_requests.pop(oldest_id, None)
+        else:
+            break
 
 
-def _process_request_entry(request_id: Optional[str]) -> Optional[dict]:
-    if not request_id or not PROCESS_REQUEST_ID_RE.match(request_id):
+def _valid_process_request_id(request_id: Optional[str]) -> Optional[str]:
+    if request_id and PROCESS_REQUEST_ID_RE.match(request_id):
+        return request_id
+    return None
+
+
+def _register_process_request(request_id: Optional[str]) -> Optional[dict]:
+    """Create (or re-attach to) the registry entry for one /api/process call."""
+    request_id = _valid_process_request_id(request_id)
+    if request_id is None:
         return None
     now = _now_ts()
     _prune_process_requests(now)
-    return _process_requests.setdefault(request_id, {"job_id": None, "cancelled": False, "ts": now})
+    entry = _process_requests.setdefault(
+        request_id, {"id": request_id, "job_id": None, "cancelled": False, "in_flight": False, "ts": now},
+    )
+    if _precancelled_requests.pop(request_id, None) is not None:
+        entry["cancelled"] = True
+    return entry
+
+
+def _process_request_cancelled(entry: dict) -> bool:
+    """Read the live registry state right before enqueueing: the entry the
+    handler holds could in theory have been replaced, and a pre-cancel may
+    have arrived meanwhile."""
+    request_id = entry.get("id")
+    live = _process_requests.get(request_id)
+    if live is not entry:
+        if live is not None:
+            entry["cancelled"] = entry["cancelled"] or bool(live.get("cancelled"))
+        # Re-attach so a cancel arriving after enqueue still finds the job.
+        _process_requests[request_id] = entry
+    if _precancelled_requests.pop(request_id, None) is not None:
+        entry["cancelled"] = True
+    return bool(entry["cancelled"])
 
 
 @app.post("/api/process/requests/{request_id}/cancel")
 async def cancel_process_request(request_id: str):
     """Cancel a /api/process call that may or may not have created a job yet."""
-    entry = _process_request_entry(request_id)
-    if entry is None:
+    if _valid_process_request_id(request_id) is None:
         raise HTTPException(status_code=400, detail="Invalid request id")
+    now = _now_ts()
+    entry = _process_requests.get(request_id)
+    if entry is None:
+        # The matching /api/process call has not reached the server yet (for
+        # example a proxy still buffering the upload). Remember the cancel
+        # without touching the main registry.
+        _precancelled_requests[request_id] = now
+        _precancelled_requests.move_to_end(request_id)
+        _prune_process_requests(now)
+        return {"job_id": None, "success": True, "detail": "request marked cancelled"}
     entry["cancelled"] = True
-    entry["ts"] = _now_ts()
+    entry["ts"] = now
     if entry["job_id"]:
         try:
             result = await cancel_job(entry["job_id"])
@@ -1956,10 +2015,31 @@ async def process_endpoint(
     layout_style: Optional[str] = Form(None),
     video_type: Optional[str] = Form(None),
 ):
+    process_request = _register_process_request(request.headers.get("X-Process-Request-Id"))
+    if process_request is not None:
+        process_request["in_flight"] = True
+    try:
+        return await _process_endpoint_body(
+            request, file, url, output_format, layout_style, video_type, process_request,
+        )
+    finally:
+        if process_request is not None:
+            process_request["in_flight"] = False
+            process_request["ts"] = _now_ts()
+
+
+async def _process_endpoint_body(
+    request: Request,
+    file: Optional[UploadFile],
+    url: Optional[str],
+    output_format: Optional[str],
+    layout_style: Optional[str],
+    video_type: Optional[str],
+    process_request: Optional[dict],
+):
     api_key = request.headers.get("X-Gemini-Key")
     if not api_key:
         raise HTTPException(status_code=400, detail="Missing X-Gemini-Key header")
-    process_request = _process_request_entry(request.headers.get("X-Process-Request-Id"))
 
     # Handle JSON body manually for URL payload
     force_low_quality = False
@@ -2037,7 +2117,7 @@ async def process_endpoint(
         {"output_format": output_format, "layout_style": layout_style, "video_type": video_type},
     )
 
-    if process_request is not None and process_request["cancelled"]:
+    if process_request is not None and _process_request_cancelled(process_request):
         # The user pressed "Stop & New" while the upload/quality check was
         # still running. Never enqueue a paid job nobody is waiting for.
         shutil.rmtree(job_output_dir, ignore_errors=True)

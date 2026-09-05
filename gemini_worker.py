@@ -7,7 +7,7 @@ from typing import List, Optional
 from dotenv import load_dotenv
 from google import genai
 from google.genai import types as genai_types
-from pydantic import BaseModel
+from pydantic import BaseModel, Field
 
 from clip_selection import lookup_model_prices
 
@@ -72,7 +72,9 @@ class LongformPlanV2Response(BaseModel):
     youtube_description: str
     recommended_duration_seconds: int
     duration_reason: str
-    cold_open: Optional[LongformColdOpenModel]
+    # Optional without a default is a required key in pydantic v2; Gemini may
+    # simply omit cold_open, which must not burn every attempt.
+    cold_open: Optional[LongformColdOpenModel] = None
     chapters: List[LongformChapterModel]
 
 
@@ -95,10 +97,10 @@ class LongformReviewResponse(BaseModel):
     approved: bool
     overall_score: int
     ending_complete: bool
-    critical_issues: List[str]
-    dropped_chapter_ids: List[str]
-    boundary_reviews: List[LongformBoundaryReviewModel]
-    joins: List[LongformJoinReviewModel]
+    critical_issues: List[str] = Field(default_factory=list)
+    dropped_chapter_ids: List[str] = Field(default_factory=list)
+    boundary_reviews: List[LongformBoundaryReviewModel] = Field(default_factory=list)
+    joins: List[LongformJoinReviewModel] = Field(default_factory=list)
     plan: LongformPlanV2Response
 
 

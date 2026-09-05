@@ -48,10 +48,13 @@ def remap_transcript_segments(transcript, selected_segments):
     Returns ``(transcript, duration)`` where the transcript uses output-relative
     timestamps and duration is the expected assembled timeline length.
     """
+    # "text" is the full transcript of the whole source; it must be rebuilt
+    # from the mapped words, otherwise callers that serialize the transcript
+    # (Auto Edit's prompt) ship the entire source text with every clip.
     remapped = {
         key: value
         for key, value in (transcript.items() if isinstance(transcript, dict) else [])
-        if key != "segments"
+        if key not in ("segments", "text")
     }
     remapped["segments"] = []
 
@@ -112,6 +115,9 @@ def remap_transcript_segments(transcript, selected_segments):
         })
         output_offset += duration
 
+    remapped["text"] = " ".join(
+        segment["text"] for segment in remapped["segments"] if segment["text"]
+    ).strip()
     return remapped, output_offset
 
 

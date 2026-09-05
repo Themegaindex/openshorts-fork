@@ -225,3 +225,16 @@ def test_review_prompt_makes_post_repair_verification_read_only():
     assert "FINAL_VERIFICATION_ONLY: true" in prompt
     assert "do not alter IDs, boundaries, order, chapters" in prompt
     assert "continuation_needed:true" in prompt
+
+
+def test_longform_plan_accepts_missing_cold_open_and_review_lists():
+    plan = gemini_worker.LongformPlanV2Response.model_validate({
+        "viable": True, "video_title": "t", "youtube_description": "d",
+        "recommended_duration_seconds": 300, "duration_reason": "r", "chapters": [],
+    })
+    assert plan.cold_open is None
+    review = gemini_worker.LongformReviewResponse.model_validate({
+        "approved": True, "overall_score": 90, "ending_complete": True,
+        "plan": plan.model_dump(),
+    })
+    assert review.critical_issues == [] and review.joins == []

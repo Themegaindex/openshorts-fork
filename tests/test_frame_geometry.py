@@ -650,3 +650,16 @@ def test_detail_clips_outside_their_window_are_dropped(monkeypatch):
     assert len(warnings) == 1 and "0.0, 30.0" in warnings[0]
     # No usable windows: nothing is filtered.
     assert main._drop_clips_outside_windows(clips, [{"id": "x"}], label="t") == clips
+
+
+def test_detail_clip_spanning_two_overlapping_windows_is_kept(monkeypatch):
+    warnings = []
+    monkeypatch.setattr(main.JOB_REPORTER, "warning", lambda message, **extra: warnings.append(message))
+    windows = [
+        {"id": "w1", "start": 100.0, "end": 200.0},
+        {"id": "w2", "start": 180.0, "end": 280.0},  # overlaps w1 through padding
+    ]
+    clips = [{"start": 170.0, "end": 215.0}, {"start": 0.0, "end": 45.0}]
+    kept = main._drop_clips_outside_windows(clips, windows, label="test")
+    assert kept == [clips[0]]
+    assert len(warnings) == 1

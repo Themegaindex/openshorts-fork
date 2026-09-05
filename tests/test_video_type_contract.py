@@ -354,10 +354,13 @@ def test_stop_before_process_answers_never_enqueues_the_job(monkeypatch, tmp_pat
     queue = _Queue()
     monkeypatch.setattr(app, "jobs", {})
     monkeypatch.setattr(app, "_process_requests", {})
+    monkeypatch.setattr(app, "_precancelled_requests", app.OrderedDict())
     request_id = "req_" + "a" * 12
 
     cancelled = asyncio.run(app.cancel_process_request(request_id))
     assert cancelled["job_id"] is None and cancelled["success"] is True
+    # The cancel path never grows the main registry.
+    assert app._process_requests == {}
 
     response = _process_with_request_id(monkeypatch, tmp_path, queue, request_id)
 
@@ -370,6 +373,7 @@ def test_stop_after_process_answered_cancels_the_created_job(monkeypatch, tmp_pa
     queue = _Queue()
     monkeypatch.setattr(app, "jobs", {})
     monkeypatch.setattr(app, "_process_requests", {})
+    monkeypatch.setattr(app, "_precancelled_requests", app.OrderedDict())
     monkeypatch.setattr(app, "_terminate_job_processes", lambda job_id: None)
     request_id = "req_" + "b" * 12
 
@@ -407,6 +411,7 @@ def test_request_registry_keeps_active_jobs_and_caps_pending_entries(monkeypatch
         "pending3" + "f" * 8: {"job_id": None, "cancelled": False, "ts": now - 1},
     }
     monkeypatch.setattr(app, "_process_requests", registry)
+    monkeypatch.setattr(app, "_precancelled_requests", app.OrderedDict())
 
     app._prune_process_requests(now)
 
@@ -422,3 +427,48 @@ def test_request_registry_keeps_active_jobs_and_caps_pending_entries(monkeypatch
     result = asyncio.run(app.cancel_process_request("active_" + "a" * 8))
     assert result == {"job_id": "queued-job", "success": True}
     assert app.jobs["queued-job"]["status"] == "failed"
+
+
+def test_in_flight_upload_entry_survives_registry_pressure(monkeypatch):
+    """Thousands of foreign cancels must not evict the entry of a request
+    that is still uploading, and its later cancel must still be honoured."""
+    now = app._now_ts()
+    registry = {}
+    monkeypatch.setattr(app, "_process_requests", registry)
+    monkeypatch.setattr(app, "_precancelled_requests", app.OrderedDict())
+    monkeypatch.setattr(app, "PROCESS_REQUEST_MAX_PENDING", 2)
+    monkeypatch.setattr(app, "PROCESS_PRECANCEL_MAX", 3)
+
+    upload = app._register_process_request("upload__" + "a" * 8)
+    upload["in_flight"] = True
+    upload["ts"] = now - 3600
+
+    for index in range(10):
+        asyncio.run(app.cancel_process_request(f"foreign{index:02d}" + "b" * 8))
+
+    assert registry == {upload["id"]: upload}
+    assert len(app._precancelled_requests) <= 3
+
+    result = asyncio.run(app.cancel_process_request(upload["id"]))
+    assert result["success"] is True
+    assert app._process_request_cancelled(upload) is True
+
+
+def test_precancel_marks_the_request_even_if_registry_entry_was_replaced(monkeypatch):
+    registry = {}
+    monkeypatch.setattr(app, "_process_requests", registry)
+    monkeypatch.setattr(app, "_precancelled_requests", app.OrderedDict())
+    entry = app._register_process_request("replaced" + "c" * 8)
+    # Simulate the handler's copy being detached from the registry.
+    registry.clear()
+    asyncio.run(app.cancel_process_request(entry["id"]))
+    assert app._process_request_cancelled(entry) is True
+    assert registry[entry["id"]] is entry
+
+
+def test_artifact_fallback_ignores_partial_render_files(tmp_path):
+    (tmp_path / "temp_partial_Title_vertical.mp4").write_bytes(b"half")
+    assert app._build_result_from_video_artifacts("job", str(tmp_path)) is None
+    (tmp_path / "Title_vertical.mp4").write_bytes(b"done")
+    result = app._build_result_from_video_artifacts("job", str(tmp_path))
+    assert result["clips"][0]["output_filename"] == "Title_vertical.mp4"

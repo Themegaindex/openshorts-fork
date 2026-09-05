@@ -159,10 +159,13 @@ LONGFORM_MIN_CHAPTERS = min(
     max(1, int(os.environ.get("LONGFORM_MIN_CHAPTERS", "2"))),
 )
 LONGFORM_COLD_OPEN = os.environ.get("LONGFORM_COLD_OPEN", "1").strip().lower() not in ("0", "false", "off", "no")
-LONGFORM_COLD_OPEN_MAX_SECONDS = min(
-    15.0,
-    max(5.0, float(os.environ.get("LONGFORM_COLD_OPEN_MAX_SECONDS", "15"))),
-)
+_cold_open_max_requested = float(os.environ.get("LONGFORM_COLD_OPEN_MAX_SECONDS", "15"))
+LONGFORM_COLD_OPEN_MAX_SECONDS = min(15.0, max(5.0, _cold_open_max_requested))
+if LONGFORM_COLD_OPEN_MAX_SECONDS != _cold_open_max_requested:
+    print(
+        f"⚠️ LONGFORM_COLD_OPEN_MAX_SECONDS={_cold_open_max_requested:g} is outside the "
+        f"supported 5-15s range; using {LONGFORM_COLD_OPEN_MAX_SECONDS:g}s."
+    )
 LONGFORM_STRONG_PAUSE_SECONDS = float(os.environ.get("LONGFORM_STRONG_PAUSE_SECONDS", "0.55"))
 LONGFORM_PAUSE_FALLBACK_WINDOW_SECONDS = float(
     os.environ.get("LONGFORM_PAUSE_FALLBACK_WINDOW_SECONDS", "24")
@@ -2248,8 +2251,7 @@ def _render_clip(input_video, final_output_video, output_format="vertical", layo
     # runs; a half-written MP4 under the final name shows up as a "ready" clip
     # that then fails to play until a manual reload.
     partial_output = _partial_render_path(final_output_video)
-    if os.path.exists(partial_output):
-        os.remove(partial_output)
+    _remove_quietly(partial_output)
     if output_format == "original":
         success = _finalize_clip_passthrough(input_video, partial_output, progress_callback)
     else:
@@ -2257,8 +2259,7 @@ def _render_clip(input_video, final_output_video, output_format="vertical", layo
         success = process_video_to_vertical(input_video, partial_output, progress_callback,
                                             aspect_ratio=aspect, layout_style=layout_style)
     if not success:
-        if os.path.exists(partial_output):
-            os.remove(partial_output)
+        _remove_quietly(partial_output)
         return False
     os.replace(partial_output, final_output_video)
     return True
@@ -2267,6 +2268,16 @@ def _render_clip(input_video, final_output_video, output_format="vertical", layo
 def _partial_render_path(final_output_video):
     directory, filename = os.path.split(final_output_video)
     return os.path.join(directory, f"temp_partial_{filename}")
+
+
+def _remove_quietly(path):
+    """A stale scratch file that cannot be removed (Windows lock, permissions)
+    must not turn into a crash of the whole render."""
+    try:
+        if os.path.exists(path):
+            os.remove(path)
+    except OSError as exc:
+        print(f"⚠️ Could not remove scratch file {path}: {exc}")
 
 
 def _full_render_filename(output_dir, video_title, output_format):
@@ -2932,6 +2943,16 @@ def _drop_clips_outside_windows(clips, windows, *, label):
             continue
     if not ranges:
         return list(clips)
+    # Neighbouring detail windows overlap through their padding; a clip that
+    # spans such a boundary is still inside the analyzed material.
+    ranges.sort()
+    merged = []
+    for window_start, window_end in ranges:
+        if merged and window_start <= merged[-1][1] + DETAIL_WINDOW_TOLERANCE_SECONDS:
+            merged[-1] = (merged[-1][0], max(merged[-1][1], window_end))
+        else:
+            merged.append((window_start, window_end))
+    ranges = merged
     kept, dropped = [], []
     for clip in clips:
         try:
@@ -4281,8 +4302,8 @@ def _render_longform_video(
         success = _finalize_clip_passthrough(joined_path, partial_path, _finalize_progress)
         if success:
             os.replace(partial_path, final_path)
-        elif os.path.exists(partial_path):
-            os.remove(partial_path)
+        else:
+            _remove_quietly(partial_path)
     if not success:
         raise RuntimeError("Long-form finalization failed.")
 

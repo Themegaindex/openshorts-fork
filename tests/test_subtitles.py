@@ -481,3 +481,20 @@ class TestBuildSubtitleFilterAlignment:
     def test_unknown_alignment_defaults_to_bottom(self):
         from subtitles import build_subtitle_filter
         assert "Alignment=2" in build_subtitle_filter("subs.srt", alignment="diagonal")
+
+
+def test_remapped_transcript_rebuilds_text_from_the_clip_only():
+    from subtitles import remap_transcript_segments
+    transcript = {
+        "language": "en",
+        "text": "whole source text that must not leak into a clip prompt",
+        "segments": [{"start": 0, "end": 100, "text": "x", "words": [
+            {"word": "one", "start": 10.0, "end": 10.5},
+            {"word": "two", "start": 11.0, "end": 11.5},
+            {"word": "far", "start": 90.0, "end": 90.5},
+        ]}],
+    }
+    remapped, duration = remap_transcript_segments(transcript, [{"start": 9.0, "end": 12.0}])
+    assert duration == 3.0
+    assert remapped["text"] == "one two"
+    assert remapped["language"] == "en"

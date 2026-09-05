@@ -146,13 +146,13 @@ class TestHookEntrance:
 
 
 @pytest.mark.skipif(
-    not shutil.which("ffmpeg"),
-    reason="ffmpeg is required for the pixel-level hook render test",
+    not (shutil.which("ffmpeg") and shutil.which("ffprobe")),
+    reason="ffmpeg and ffprobe are required for the pixel-level hook render test",
 )
 def test_animated_hook_is_visible_in_rendered_pixels(tmp_path):
     """Regression: the entrance fade used to leave the hook fully transparent.
     Render a black clip with a solid white hook and sample real pixels."""
-    from PIL import Image
+    Image = pytest.importorskip("PIL.Image")
     from subtitles import burn_layers
 
     video = tmp_path / "in.mp4"
