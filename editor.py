@@ -148,7 +148,9 @@ class VideoEditor:
 
         raw_edits = self._extract_edits(response)
         if raw_edits is None:
-            return None
+            # Returning None here would be reported as a successful "edit
+            # without effects" (a paid analysis and a plain copy of the clip).
+            raise RuntimeError("Gemini returned an unparseable edit plan.")
 
         filter_string, applied = build_filter_string(
             raw_edits, duration=duration, fps=fps, width=width, height=height,
@@ -310,9 +312,17 @@ class VideoEditor:
         if not filter_data or not filter_data.get("filter_string"):
             print("⚠️ No filter string found. Copying original.")
             try:
-                subprocess.run(['ffmpeg', '-y', '-i', input_path, '-c', 'copy', output_path], timeout=1800)
+                subprocess.run(
+                    ['ffmpeg', '-y', '-i', input_path, '-c', 'copy', output_path],
+                    check=True, stdout=subprocess.DEVNULL, stderr=subprocess.PIPE, timeout=1800,
+                )
             except subprocess.TimeoutExpired:
                 raise RuntimeError("FFmpeg copy timed out after 1800s.")
+            except subprocess.CalledProcessError as e:
+                stderr = (e.stderr or b"").decode(errors="replace").strip()
+                raise RuntimeError(f"FFmpeg copy failed: {stderr[-500:]}")
+            if not os.path.exists(output_path) or os.path.getsize(output_path) <= 0:
+                raise RuntimeError("FFmpeg copy produced no output file.")
             return
 
         filter_string = filter_data["filter_string"]

@@ -597,3 +597,17 @@ def test_reviewed_span_cannot_jump_into_another_segments_neighborhood():
     )
 
     assert "unit_outside_own_review_context:chapter_01_span_01" in checked["validation_issues"]
+
+
+def test_quality_gate_accepts_questions_and_terminated_connector_endings():
+    # "When did you start?" is a legal chapter opening and "...proud of that."
+    # is a finished sentence. The old word lists rejected both.
+    assert not longform._obviously_incomplete_start("When did you start?")
+    assert not longform._obviously_incomplete_start("Wenn du willst, erzähl ich es.")
+    assert not longform._obviously_incomplete_end("I am proud of that.")
+    assert not longform._obviously_incomplete_end("Es war so wie damals.")
+    # Genuinely unfinished material is still caught.
+    assert longform._obviously_incomplete_start("Damit sie da?")
+    assert longform._obviously_incomplete_start("dass den Marsch in Berlin.")
+    assert longform._obviously_incomplete_end("Weißt du, wo das aufgefallen ist, dass")
+    assert longform._obviously_incomplete_end("Das war die Zeit,")

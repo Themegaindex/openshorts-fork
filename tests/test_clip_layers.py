@@ -423,3 +423,41 @@ class TestRemoveLayerState:
         candidate.pop("transcript_source", None)
         assert candidate["clean_source"] == "clip.mp4"
         assert "transcript_source" not in candidate
+
+
+def test_derivative_filenames_do_not_stack_prefixes():
+    first = app._derivative_filename("edited", "a" * 12, "Mein Clip_clip_1.mp4")
+    assert first == "edited_aaaaaaaaaaaa_Mein Clip_clip_1.mp4"
+    second = app._derivative_filename("edited", "b" * 12, first)
+    assert second == "edited_bbbbbbbbbbbb_Mein Clip_clip_1.mp4"
+    translated = app._derivative_filename("translated_de", "c" * 12, second)
+    assert translated == "translated_de_cccccccccccc_Mein Clip_clip_1.mp4"
+    # Layered names on top of a derivative also collapse back to the original.
+    assert app._derivative_filename("edited", "d" * 12, f"subtitled_{'e' * 12}_{translated}") \
+        == "edited_dddddddddddd_Mein Clip_clip_1.mp4"
+
+
+def test_derivative_filenames_stay_below_the_filesystem_limit():
+    long_title = "ü" * 150 + "_clip_1.mp4"  # 300+ bytes in UTF-8
+    name = app._derivative_filename("edited", "f" * 12, long_title)
+    assert name.startswith("edited_ffffffffffff_") and name.endswith(".mp4")
+    assert len(name.encode("utf-8")) <= app._MAX_DERIVATIVE_FILENAME_BYTES
+
+
+def test_auto_edit_transcript_is_shifted_to_the_clip_timeline():
+    transcript = {"language": "en", "segments": [{
+        "start": 3600.0, "end": 3606.0, "text": "one two three",
+        "words": [
+            {"word": "one", "start": 3600.5, "end": 3601.0},
+            {"word": "two", "start": 3603.0, "end": 3603.5},
+            {"word": "three", "start": 3620.0, "end": 3620.5},  # outside the clip
+        ],
+    }]}
+    clip = {"start": 3600.0, "end": 3610.0}
+    shifted = app._clip_relative_transcript(transcript, clip, {}, "short")
+    words = shifted["segments"][0]["words"]
+    assert [(w["word"], w["start"], w["end"]) for w in words] == [("one", 0.5, 1.0), ("two", 3.0, 3.5)]
+    assert shifted["language"] == "en"
+    # Dubbed media no longer matches the source transcript at all.
+    assert app._clip_relative_transcript(transcript, clip, {"transcript_source": "media"}, "short") is None
+    assert app._clip_relative_transcript(None, clip, {}, "short") is None

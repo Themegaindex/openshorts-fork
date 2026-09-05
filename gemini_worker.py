@@ -240,10 +240,7 @@ NON-NEGOTIABLE CONTRACT:
 - Include every genuinely strong distinct topic that fits, but quality beats
   topic count. Use {min_chapters}-{max_chapters} chapters, at most 2 spans per
   chapter and at most {max_segments} body spans in total.
-- {min_chapters} distinct chapters are MANDATORY. A single-chapter plan is a
-  one-topic compilation, not a best-of edit, and is rejected. If the source
-  truly carries one subject, split it into its distinct parts (for example
-  question/setup, development, conclusion) and give each its own chapter.
+{chapter_rule}
 - Every body span must be {min_segment_seconds}-{max_segment_seconds} seconds.
   Use a second chronological span for a topic only when its useful material is
   separated; do not create one oversized passage.
@@ -262,12 +259,7 @@ NON-NEGOTIABLE CONTRACT:
   than {min_chapters} distinct chapters can be filled, return `viable:false`,
   `cold_open:null`, and `chapters:[]`.
 
-COLD OPEN:
-- Prefer one self-contained 5-15 second highlight with a complete beginning and
-  ending. Never end on a comma, conjunction, or unfinished question.
-- Set `replay_in_body:true` only if removing those same units from the later
-  chronological passage would damage its context. Otherwise choose a highlight
-  outside the body spans so it is not duplicated.
+{cold_open_rules}
 
 COPY:
 - All generated copy must use TRANSCRIPT_LANGUAGE ({language}).
@@ -309,6 +301,49 @@ Return only an object shaped like:
   }}]
 }}
 """
+
+
+def longform_plan_rules(payload):
+    """Prompt rules that must agree with the deterministic quality gate.
+    LONGFORM_MIN_CHAPTERS=1 and LONGFORM_COLD_OPEN=0 are honoured here so the
+    prompt does not demand what the validator will then reject."""
+    try:
+        min_chapters = max(1, int(payload.get("min_chapters", 2) or 1))
+    except (TypeError, ValueError):
+        min_chapters = 2
+    if min_chapters > 1:
+        chapter_rule = (
+            f"- {min_chapters} distinct chapters are MANDATORY. A single-chapter plan is a\n"
+            "  one-topic compilation, not a best-of edit, and is rejected. If the source\n"
+            "  truly carries one subject, split it into its distinct parts (for example\n"
+            "  question/setup, development, conclusion) and give each its own chapter."
+        )
+    else:
+        chapter_rule = (
+            "- A single strong chapter is acceptable when the source truly carries one\n"
+            "  subject. Do not invent artificial splits only to raise the chapter count."
+        )
+    if payload.get("cold_open_enabled", True):
+        try:
+            cold_open_max = max(5, int(float(payload.get("cold_open_max_seconds", 15) or 15)))
+        except (TypeError, ValueError):
+            cold_open_max = 15
+        cold_open_rules = (
+            "COLD OPEN:\n"
+            f"- Prefer one self-contained 5-{cold_open_max} second highlight with a complete\n"
+            "  beginning and ending. Never end on a comma, conjunction, or unfinished\n"
+            "  question.\n"
+            "- Set `replay_in_body:true` only if removing those same units from the later\n"
+            "  chronological passage would damage its context. Otherwise choose a highlight\n"
+            "  outside the body spans so it is not duplicated."
+        )
+    else:
+        cold_open_rules = (
+            "COLD OPEN:\n"
+            "- Cold opens are disabled for this job. Return `cold_open:null` and start\n"
+            "  the video directly with the first chapter."
+        )
+    return {"chapter_rule": chapter_rule, "cold_open_rules": cold_open_rules}
 
 
 LONGFORM_REVIEW_PROMPT_TEMPLATE = """
@@ -692,6 +727,7 @@ def main() -> int:
         max_segments=payload.get("max_segments", 12),
         max_chapters=payload.get("max_chapters", 6),
         min_chapters=payload.get("min_chapters", 2),
+        **longform_plan_rules(payload),
     )
 
     item_count = len(payload.get("windows") or payload.get("blocks") or [])

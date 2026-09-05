@@ -76,6 +76,7 @@ def test_longform_v2_prompt_forbids_free_timestamps_and_padding():
         max_chapters=6,
         min_chapters=2,
         blocks_json='[{"id":"block_001","units":[{"id":"u000001"}]}]',
+        **gemini_worker.longform_plan_rules({"min_chapters": 2}),
     )
 
     assert "Never invent\n  timestamps" in prompt
@@ -87,6 +88,21 @@ def test_longform_v2_prompt_forbids_free_timestamps_and_padding():
     # by the validator.
     assert "2-6 chapters" in prompt
     assert "2 distinct chapters are MANDATORY" in prompt
+    assert "5-15 second highlight" in prompt
+
+
+def test_longform_v2_prompt_honours_single_chapter_and_disabled_cold_open():
+    # The prompt must not demand what the quality gate then accepts/rejects.
+    rules = gemini_worker.longform_plan_rules({
+        "min_chapters": 1, "cold_open_enabled": False, "cold_open_max_seconds": 10,
+    })
+    assert "MANDATORY" not in rules["chapter_rule"]
+    assert "single strong chapter is acceptable" in rules["chapter_rule"]
+    assert "Cold opens are disabled" in rules["cold_open_rules"]
+    assert "cold_open:null" in rules["cold_open_rules"]
+
+    rules = gemini_worker.longform_plan_rules({"cold_open_max_seconds": 10})
+    assert "5-10 second highlight" in rules["cold_open_rules"]
 
 def test_longform_review_schema_can_return_repaired_final_plan():
     response = gemini_worker.LongformReviewResponse(

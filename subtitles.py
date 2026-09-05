@@ -1165,7 +1165,14 @@ def build_layer_command(video_path, output_path, subtitle_filter=None,
         raise ValueError("At least one layer (subtitles or hook) is required")
 
     cmd = ['ffmpeg', '-y', '-i', video_path]
-    if hook_png:
+    if hook_png and hook_entrance:
+        # A PNG is a single frame at t=0. fade=alpha would set that one frame
+        # to fully transparent and overlay would then repeat it forever, so
+        # the hook never becomes visible. Loop the image into a real stream
+        # so the fade has frames to progress on; shortest=1 on the overlay
+        # ends the infinite loop with the main video.
+        cmd.extend(['-loop', '1', '-i', hook_png])
+    elif hook_png:
         cmd.extend(['-i', hook_png])
 
     # Compose subtitle colours in 4:4:4 so saturated cyan/green/red edges are
@@ -1182,8 +1189,10 @@ def build_layer_command(video_path, output_path, subtitle_filter=None,
 
     hook_src = "[1:v]"
     hook_pre = ""
+    overlay_opts = ""
     y_value = str(int(hook_y))
     if hook_png and hook_entrance:
+        overlay_opts = ":shortest=1"
         # Fade the PNG's alpha in, and ease the y position up into place:
         # y(t) = target + slide * (1 - t/D)^2  -> starts slide px lower,
         # decelerates into the final position (ease-out), then stays put.
@@ -1197,14 +1206,14 @@ def build_layer_command(video_path, output_path, subtitle_filter=None,
         cmd.extend([
             '-filter_complex',
             f"{hook_pre}[0:v]{subtitle_prefix}{subtitle_filter}[v0];"
-            f"[v0]{hook_src}overlay={int(hook_x)}:{y_value}[v1];"
+            f"[v0]{hook_src}overlay={int(hook_x)}:{y_value}{overlay_opts}[v1];"
             f"[v1]{EVEN_PAD_FILTER}{subtitle_suffix}[vout]",
             '-map', '[vout]', '-map', '0:a?',
         ])
     elif hook_png:
         cmd.extend([
             '-filter_complex',
-            f"{hook_pre}[0:v]{hook_src}overlay={int(hook_x)}:{y_value}[v1];"
+            f"{hook_pre}[0:v]{hook_src}overlay={int(hook_x)}:{y_value}{overlay_opts}[v1];"
             f"[v1]{EVEN_PAD_FILTER}[vout]",
             '-map', '[vout]', '-map', '0:a?',
         ])

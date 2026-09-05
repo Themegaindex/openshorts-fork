@@ -1950,10 +1950,9 @@ def download_youtube_video(url, output_dir=".", resume=False):
             with open(cookies_path, 'w') as f:
                 f.write(cookies_env)
             if os.path.exists(cookies_path):
-                 print(f"   Debug: Cookies file created. Size: {os.path.getsize(cookies_path)} bytes")
-                 with open(cookies_path, 'r') as f:
-                     content = f.read(100)
-                     print(f"   Debug: First 100 chars of cookie file: {content}")
+                # Never echo cookie contents: stdout lands in the job log,
+                # the dashboard and persisted support logs.
+                print(f"   Cookies file created. Size: {os.path.getsize(cookies_path)} bytes")
         except Exception as e:
             print(f"⚠️ Failed to write cookies file: {e}")
             cookies_path = None
@@ -2244,11 +2243,30 @@ def _render_clip(input_video, final_output_video, output_format="vertical", layo
     Legacy ``auto``/``horizontal`` values are accepted for saved jobs and map
     to the explicit ``vertical``/``original`` choices."""
     output_format = normalize_output_format(output_format)
+    # Render into a sibling file and move it into place only when complete.
+    # The dashboard polls the job directory for finished clips while rendering
+    # runs; a half-written MP4 under the final name shows up as a "ready" clip
+    # that then fails to play until a manual reload.
+    partial_output = _partial_render_path(final_output_video)
+    if os.path.exists(partial_output):
+        os.remove(partial_output)
     if output_format == "original":
-        return _finalize_clip_passthrough(input_video, final_output_video, progress_callback)
-    aspect = output_aspect_ratio(output_format)
-    return process_video_to_vertical(input_video, final_output_video, progress_callback,
-                                     aspect_ratio=aspect, layout_style=layout_style)
+        success = _finalize_clip_passthrough(input_video, partial_output, progress_callback)
+    else:
+        aspect = output_aspect_ratio(output_format)
+        success = process_video_to_vertical(input_video, partial_output, progress_callback,
+                                            aspect_ratio=aspect, layout_style=layout_style)
+    if not success:
+        if os.path.exists(partial_output):
+            os.remove(partial_output)
+        return False
+    os.replace(partial_output, final_output_video)
+    return True
+
+
+def _partial_render_path(final_output_video):
+    directory, filename = os.path.split(final_output_video)
+    return os.path.join(directory, f"temp_partial_{filename}")
 
 
 def _full_render_filename(output_dir, video_title, output_format):
@@ -2375,7 +2393,8 @@ def process_video_to_vertical(input_video, final_output_video, progress_callback
         progress_callback(20.0, "Processing video frames...")
     
     command = [
-        'ffmpeg', '-y', '-f', 'rawvideo', '-vcodec', 'rawvideo',
+        'ffmpeg', '-y', '-nostats', '-loglevel', 'error',
+        '-f', 'rawvideo', '-vcodec', 'rawvideo',
         '-s', f'{OUTPUT_WIDTH}x{OUTPUT_HEIGHT}', '-pix_fmt', 'bgr24',
         '-r', str(fps), '-i', '-', '-c:v', 'libx264',
         '-preset', 'fast', '-crf', '23', '-pix_fmt', 'yuv420p',
@@ -2383,6 +2402,21 @@ def process_video_to_vertical(input_video, final_output_video, progress_callback
     ]
 
     ffmpeg_process = subprocess.Popen(command, stdin=subprocess.PIPE, stdout=subprocess.DEVNULL, stderr=subprocess.PIPE)
+
+    # Drain stderr while frames are being written. Reading it only after the
+    # frame loop lets the pipe fill up on long clips: ffmpeg then blocks on
+    # its write, we block on stdin.write, and the job hangs until the watchdog
+    # kills it.
+    stderr_chunks = []
+
+    def _drain_stderr():
+        try:
+            stderr_chunks.append(ffmpeg_process.stderr.read())
+        except Exception:
+            pass
+
+    stderr_thread = threading.Thread(target=_drain_stderr, daemon=True, name="ffmpeg-stderr")
+    stderr_thread.start()
 
     cap = cv2.VideoCapture(input_video)
     total_frames = int(cap.get(cv2.CAP_PROP_FRAME_COUNT))
@@ -2501,7 +2535,6 @@ def process_video_to_vertical(input_video, final_output_video, progress_callback
                 last_progress_emit = time.time()
 
         ffmpeg_process.stdin.close()
-        stderr_output = ffmpeg_process.stderr.read().decode()
         ffmpeg_process.wait()
     finally:
         cap.release()
@@ -2512,6 +2545,8 @@ def process_video_to_vertical(input_video, final_output_video, progress_callback
                 ffmpeg_process.wait(timeout=5)
             except subprocess.TimeoutExpired:
                 ffmpeg_process.kill()
+        stderr_thread.join(timeout=5)
+        stderr_output = b"".join(stderr_chunks).decode(errors="replace")
 
     print(f"   🎥 Artificial camera switches: {artificial_switches}")
 
@@ -2879,6 +2914,48 @@ def _run_score_stage(windows, transcript_language, video_duration, output_dir, v
     return scored_windows, scored_input_ids, skipped_score_ids, attempts, all_costs
 
 
+# Detail windows already include 20s of padding; anything further out is not
+# a boundary tweak but a clip from a different timeline.
+DETAIL_WINDOW_TOLERANCE_SECONDS = 5.0
+
+
+def _drop_clips_outside_windows(clips, windows, *, label):
+    """Gemini sometimes answers with window-relative timestamps (0-30 instead
+    of 3600-3630). Such clips would silently cut the wrong part of the source,
+    so keep only clips that lie inside one of the windows they were asked
+    about. Entries without parseable times are left for normalization."""
+    ranges = []
+    for window in windows:
+        try:
+            ranges.append((float(window["start"]), float(window["end"])))
+        except (KeyError, TypeError, ValueError):
+            continue
+    if not ranges:
+        return list(clips)
+    kept, dropped = [], []
+    for clip in clips:
+        try:
+            start = float(clip.get("start"))
+            end = float(clip.get("end"))
+        except (AttributeError, TypeError, ValueError):
+            kept.append(clip)
+            continue
+        inside = any(
+            window_start - DETAIL_WINDOW_TOLERANCE_SECONDS <= start
+            and end <= window_end + DETAIL_WINDOW_TOLERANCE_SECONDS
+            for window_start, window_end in ranges
+        )
+        (kept if inside else dropped).append(clip)
+    if dropped:
+        JOB_REPORTER.warning(
+            f"Dropped {len(dropped)} clip(s) from {label}: timestamps "
+            f"{[(c.get('start'), c.get('end')) for c in dropped]} lie outside the analyzed window(s) "
+            f"{[(round(s, 1), round(e, 1)) for s, e in ranges]}.",
+            category="gemini",
+        )
+    return kept
+
+
 def _report_shorts_analysis_failure(error_message, *, defer_terminal_error=False):
     """Report a Shorts failure without prematurely failing an Auto job."""
     if defer_terminal_error:
@@ -3068,7 +3145,10 @@ def get_viral_clips(
                     time.sleep(min(10.0, float(2 ** attempt_number)))
         if batch_result is not None and isinstance(batch_result.get("shorts"), list):
             detailed_input_ids.update(str(window.get("id")) for window in batch_windows)
-            collected_clips.extend(batch_result["shorts"])
+            collected_clips.extend(_drop_clips_outside_windows(
+                batch_result["shorts"], batch_windows,
+                label=f"detail batch {batch_index + 1}/{total_detail_batches}",
+            ))
         elif last_error_type in RESCUABLE_GEMINI_ERROR_TYPES:
             JOB_REPORTER.warning(
                 f"Recovering detail batch {batch_index + 1}/{total_detail_batches} one window at a time.",
@@ -3089,7 +3169,10 @@ def get_viral_clips(
             for window, worker_result in rescued:
                 payload = worker_result.get("payload") or {}
                 if isinstance(payload.get("shorts"), list):
-                    collected_clips.extend(payload["shorts"])
+                    collected_clips.extend(_drop_clips_outside_windows(
+                        payload["shorts"], [window],
+                        label=f"rescued window {window.get('id')}",
+                    ))
                     detailed_input_ids.add(str(window.get("id")))
                 else:
                     failed_ids.append(str(window.get("id")))
@@ -3333,6 +3416,8 @@ def get_longform_plan(
         "max_segments": LONGFORM_MAX_SEGMENTS,
         "max_chapters": LONGFORM_MAX_CHAPTERS,
         "min_chapters": LONGFORM_MIN_CHAPTERS,
+        "cold_open_enabled": LONGFORM_COLD_OPEN,
+        "cold_open_max_seconds": LONGFORM_COLD_OPEN_MAX_SECONDS,
     }
     plan_progress = 96.0 if reused_scoring else 55.0
     JOB_REPORTER.progress(
@@ -4190,7 +4275,14 @@ def _render_longform_video(
         message="Finalizing the long video.",
         category="render",
     ):
-        success = _finalize_clip_passthrough(joined_path, final_path, _finalize_progress)
+        # Same atomic hand-over as _render_clip: the dashboard must never
+        # list a half-written long video as ready.
+        partial_path = _partial_render_path(final_path)
+        success = _finalize_clip_passthrough(joined_path, partial_path, _finalize_progress)
+        if success:
+            os.replace(partial_path, final_path)
+        elif os.path.exists(partial_path):
+            os.remove(partial_path)
     if not success:
         raise RuntimeError("Long-form finalization failed.")
 
@@ -4604,12 +4696,10 @@ def _run_video_type_pipeline(
             if not has_long:
                 raise
             _cleanup_render_temp_files([
-                os.path.join(
-                    output_dir,
-                    f"temp_{os.path.basename(str(item.get('output_filename') or ''))}",
-                )
+                os.path.join(output_dir, f"{prefix}{os.path.basename(str(item.get('output_filename') or ''))}")
                 for item in shorts_data["shorts"]
                 if item.get("output_filename")
+                for prefix in ("temp_", "temp_partial_")
             ])
             if completed_shorts:
                 metadata["shorts"] = completed_shorts
@@ -5218,11 +5308,16 @@ if __name__ == '__main__':
                         message="Gemini analysis worker started.",
                         category="analyze",
                     ):
+                        # A failed analysis is followed by the full-video
+                        # fallback below, so it must not mark the job failed
+                        # (the dashboard would stop polling and hide the
+                        # fallback result).
                         analysis_result = get_viral_clips(
                             transcript,
                             duration,
                             output_dir=output_dir,
                             video_title=video_title,
+                            defer_terminal_error=True,
                         )
                     _save_json_file(analysis_result_file, analysis_result)
                     reporter.artifact("analysis_result", analysis_result_file)

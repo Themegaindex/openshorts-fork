@@ -1890,6 +1890,63 @@ async def _probe_youtube_quality(url: str) -> dict:
     return await loop.run_in_executor(None, _run)
 
 
+# "Stop & New" can hit before /api/process has answered (the upload or the
+# quality check is still running), so the client has no job id to cancel.
+# The client therefore tags the request with X-Process-Request-Id and cancels
+# by that id; whichever side wins the race, the job is stopped or never
+# enqueued.
+PROCESS_REQUEST_ID_RE = re.compile(r"^[A-Za-z0-9_-]{8,64}$")
+PROCESS_REQUEST_TTL_SECONDS = 6 * 3600
+# The cancel endpoint is unauthenticated (like /api/jobs/{id}/cancel), so
+# job-less entries must be capped or arbitrary ids could grow the registry.
+PROCESS_REQUEST_MAX_PENDING = 2000
+_process_requests: Dict[str, dict] = {}  # request_id -> {"job_id", "cancelled", "ts"}
+
+
+def _prune_process_requests(now: float) -> None:
+    for request_id, entry in list(_process_requests.items()):
+        job = jobs.get(entry.get("job_id")) if entry.get("job_id") else None
+        if job is not None and job.get("status") in ACTIVE_JOB_STATUSES:
+            # A queued/running job must stay cancellable by request id no
+            # matter how long it waits; evicting it would let a later cancel
+            # "succeed" against a fresh, job-less entry.
+            continue
+        if now - entry.get("ts", now) > PROCESS_REQUEST_TTL_SECONDS:
+            _process_requests.pop(request_id, None)
+    pending = sorted(
+        (entry.get("ts", now), request_id)
+        for request_id, entry in _process_requests.items()
+        if not entry.get("job_id")
+    )
+    for _ts, request_id in pending[:max(0, len(pending) - PROCESS_REQUEST_MAX_PENDING)]:
+        _process_requests.pop(request_id, None)
+
+
+def _process_request_entry(request_id: Optional[str]) -> Optional[dict]:
+    if not request_id or not PROCESS_REQUEST_ID_RE.match(request_id):
+        return None
+    now = _now_ts()
+    _prune_process_requests(now)
+    return _process_requests.setdefault(request_id, {"job_id": None, "cancelled": False, "ts": now})
+
+
+@app.post("/api/process/requests/{request_id}/cancel")
+async def cancel_process_request(request_id: str):
+    """Cancel a /api/process call that may or may not have created a job yet."""
+    entry = _process_request_entry(request_id)
+    if entry is None:
+        raise HTTPException(status_code=400, detail="Invalid request id")
+    entry["cancelled"] = True
+    entry["ts"] = _now_ts()
+    if entry["job_id"]:
+        try:
+            result = await cancel_job(entry["job_id"])
+        except HTTPException:
+            result = {"success": False, "detail": "job not found"}
+        return {"job_id": entry["job_id"], **result}
+    return {"job_id": None, "success": True, "detail": "request marked cancelled"}
+
+
 @app.post("/api/process")
 async def process_endpoint(
     request: Request,
@@ -1902,6 +1959,7 @@ async def process_endpoint(
     api_key = request.headers.get("X-Gemini-Key")
     if not api_key:
         raise HTTPException(status_code=400, detail="Missing X-Gemini-Key header")
+    process_request = _process_request_entry(request.headers.get("X-Process-Request-Id"))
 
     # Handle JSON body manually for URL payload
     force_low_quality = False
@@ -1970,6 +2028,26 @@ async def process_endpoint(
     if video_type != "shorts":
         cmd.extend(["--video-type", video_type])
 
+    # The worker writes render_config.json only once it starts. A server
+    # restart with the job still queued resumes via --resume-dir, which reads
+    # exactly this file; without it "long/original" silently became
+    # "shorts/vertical".
+    _safe_write_json(
+        os.path.join(job_output_dir, "render_config.json"),
+        {"output_format": output_format, "layout_style": layout_style, "video_type": video_type},
+    )
+
+    if process_request is not None and process_request["cancelled"]:
+        # The user pressed "Stop & New" while the upload/quality check was
+        # still running. Never enqueue a paid job nobody is waiting for.
+        shutil.rmtree(job_output_dir, ignore_errors=True)
+        if input_path and os.path.exists(input_path):
+            try:
+                os.remove(input_path)
+            except OSError:
+                pass
+        return {"job_id": None, "status": "cancelled"}
+
     # Enqueue Job
     jobs[job_id] = _build_job_state(
         job_id,
@@ -1987,6 +2065,8 @@ async def process_endpoint(
         'video_type': video_type,
     })
     _append_log(job_id, f"Job {job_id} queued.", category="queue", important=True)
+    if process_request is not None:
+        process_request["job_id"] = job_id
 
     await job_queue.put(job_id)
 
@@ -2277,10 +2357,12 @@ async def _edit_clip_locked(req: EditRequest, x_gemini_key: Optional[str]):
         raise HTTPException(status_code=404, detail="Metadata not found")
     with open(json_files[0], 'r', encoding='utf-8') as f:
         metadata = json.load(f)
-    metadata_clips = metadata.get('shorts', [])
-    if req.clip_index >= len(metadata_clips):
-        raise HTTPException(status_code=404, detail="Clip metadata not found")
-    clip_data = metadata_clips[req.clip_index]
+    # Result indices can have holes (e.g. after a partial render clean-up),
+    # so resolve the metadata entry by identity instead of raw index.
+    metadata_clips, metadata_index, video_type = _lookup_metadata_clip(
+        metadata, req.clip_index, job['result']['clips'][req.clip_index],
+    )
+    clip_data = metadata_clips[metadata_index]
         
     try:
         requested_filename = os.path.basename(req.input_filename) if req.input_filename else None
@@ -2293,7 +2375,7 @@ async def _edit_clip_locked(req: EditRequest, x_gemini_key: Optional[str]):
         # Auto Edit works on pixels without presentation layers. Stored
         # subtitles/hooks are composed once onto the edited clean source later.
         operation_id = uuid.uuid4().hex[:12]
-        edited_filename = f"edited_{operation_id}_{filename}"
+        edited_filename = _derivative_filename("edited", operation_id, filename)
         edited_clean_path = os.path.join(output_dir, edited_filename)
         
         # Run editing in a thread to avoid blocking main loop
@@ -2327,7 +2409,10 @@ async def _edit_clip_locked(req: EditRequest, x_gemini_key: Optional[str]):
                 # Load transcript from metadata
                 transcript = None
                 try:
-                    transcript = _load_transcript_for_job(output_dir, metadata=metadata)
+                    transcript = _clip_relative_transcript(
+                        _load_transcript_for_job(output_dir, metadata=metadata),
+                        clip_data, layer_entry, video_type,
+                    )
                 except Exception as e:
                     print(f"⚠️ Could not load transcript for editing context: {e}")
 
@@ -2705,6 +2790,53 @@ def _layered_filename(entry: dict, generation_id: str) -> str:
     return f"{prefix}_{generation_id}_{clean_source}"
 
 
+_DERIVATIVE_PREFIX_RE = re.compile(
+    r"^(?:edited|subtitled|hook|translated_[A-Za-z-]+)_[0-9a-f]{12}_"
+)
+# Leaves room for one layered prefix (subtitled_/hook_) on top while staying
+# under the 255-byte filename limit of common filesystems.
+_MAX_DERIVATIVE_FILENAME_BYTES = 200
+
+
+def _base_clip_filename(filename: str) -> str:
+    base = os.path.basename(filename)
+    while True:
+        stripped = _DERIVATIVE_PREFIX_RE.sub("", base, count=1)
+        if not stripped or stripped == base:
+            return base
+        base = stripped
+
+
+def _derivative_filename(prefix: str, generation_id: str, filename: str) -> str:
+    """Name a new clean-source derivative (edited_/translated_) after the
+    original clip, not after the previous derivative. Otherwise every edit
+    stacks another prefix until the filesystem rejects the name."""
+    stem, ext = os.path.splitext(_base_clip_filename(filename))
+    head = f"{prefix}_{generation_id}_"
+    budget = _MAX_DERIVATIVE_FILENAME_BYTES - len(head.encode("utf-8")) - len(ext.encode("utf-8"))
+    while stem and len(stem.encode("utf-8")) > budget:
+        stem = stem[:-1]
+    return f"{head}{stem}{ext}"
+
+
+def _clip_relative_transcript(transcript, clip_data: dict, layer_entry: dict, video_type: str):
+    """Auto Edit uploads the cut clip, so Gemini must see timestamps on the
+    clip's own timeline. The stored transcript covers the whole source with
+    absolute times; for any clip not starting at 0:00 those land outside the
+    clip and every suggested effect would be dropped."""
+    if not isinstance(transcript, dict):
+        return None
+    if layer_entry.get("transcript_source") == "media":
+        # Dubbed audio no longer matches the source transcript at all.
+        return None
+    if video_type == "long":
+        ranges = clip_data.get("segments") or []
+    else:
+        ranges = [{"start": clip_data.get("start", 0), "end": clip_data.get("end", 0)}]
+    remapped, assembled_duration = remap_transcript_segments(transcript, ranges)
+    return remapped if assembled_duration > 0 else None
+
+
 def _entry_with_clean_source(
     entry: dict,
     clean_source: str,
@@ -3043,7 +3175,9 @@ async def download_all_clips(job_id: str):
     if not files:
         raise HTTPException(status_code=404, detail="No clip files found for this job")
 
-    zip_path = os.path.join(output_dir, f"clips_{int(time.time())}.zip")
+    # Unique per request: two downloads in the same second must not share
+    # (and delete) the same temporary archive.
+    zip_path = os.path.join(output_dir, f"clips_{uuid.uuid4().hex}.zip")
 
     def build_zip():
         # Videos are already compressed; store instead of deflate for speed.
@@ -3121,11 +3255,12 @@ async def _add_hook_locked(req: HookRequest):
     with open(json_files[0], 'r', encoding='utf-8') as f:
         data = json.load(f)
         
-    clips = data.get('shorts', [])
-    if req.clip_index >= len(clips):
-        raise HTTPException(status_code=404, detail="Clip not found")
-        
-    clip_data = clips[req.clip_index]
+    result_clips = job.get("result", {}).get("clips", []) if isinstance(job.get("result"), dict) else []
+    result_clip = result_clips[req.clip_index] if req.clip_index < len(result_clips) else None
+    metadata_clips, metadata_index, _video_type = _lookup_metadata_clip(
+        data, req.clip_index, result_clip,
+    )
+    clip_data = metadata_clips[metadata_index]
     
     requested_filename = os.path.basename(req.input_filename) if req.input_filename else None
     if not requested_filename and not _filename_from_clip(clip_data):
@@ -3229,9 +3364,10 @@ async def _translate_clip_locked(req: TranslateRequest, x_elevenlabs_key: Option
     filename = os.path.basename(input_path)
 
     # Output video with language suffix
-    base, ext = os.path.splitext(filename)
     generation_id = uuid.uuid4().hex[:12]
-    translated_filename = f"translated_{req.target_language}_{generation_id}_{base}{ext}"
+    translated_filename = _derivative_filename(
+        f"translated_{req.target_language}", generation_id, filename,
+    )
     translated_path = os.path.join(output_dir, translated_filename)
 
     try:

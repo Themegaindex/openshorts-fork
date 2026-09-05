@@ -135,6 +135,13 @@ const UserProfileSelector = ({ profiles, selectedUserId, onSelect }) => {
 const SESSION_KEY = 'openshorts_session';
 const SESSION_MAX_AGE = 24 * 3600000; // 24 hours
 
+// Client-side id for one /api/process call, so it can be cancelled before
+// the server has answered with a job id.
+const newProcessRequestId = () => {
+  if (typeof crypto !== 'undefined' && crypto.randomUUID) return crypto.randomUUID().replace(/-/g, '');
+  return `${Date.now().toString(36)}${Math.random().toString(36).slice(2, 12)}`;
+};
+
 // Poll job status; signal aborts the request when the effect is cleaned up
 const pollJob = async (jobId, signal) => {
   const res = await fetch(getApiUrl(`/api/status/${jobId}`), { signal });
@@ -298,6 +305,13 @@ function App() {
   const [jobMeta, setJobMeta] = useState(null);
   const [supportCopied, setSupportCopied] = useState(false);
   const [connectionIssue, setConnectionIssue] = useState(null);
+  // Identifies the /api/process request the UI is currently waiting for.
+  // "Stop & New" during the upload/quality check happens before a job id
+  // exists. The request is deliberately NOT aborted: the server may already
+  // have created the job, and only its response carries the id we need to
+  // cancel it. A stale response is therefore awaited, its job cancelled, and
+  // the result ignored instead of reviving the session.
+  const processRequestRef = useRef({ generation: 0, requestId: null });
   const [processingMedia, setProcessingMedia] = useState(null);
   const [activeTab, setActiveTab] = useState('dashboard'); // dashboard, settings
 
@@ -577,6 +591,12 @@ function App() {
     pollJob(jobId, controller.signal)
       .then((data) => {
         setJobMeta(data);
+        if (data.archived || data.status === 'archived') {
+          // The job files were cleaned up on the server; the persisted
+          // download buttons would all be dead links.
+          setStatus('archived');
+          return;
+        }
         if (data.result) setResults(data.result);
       })
       .catch((error) => {
@@ -629,9 +649,14 @@ function App() {
     setJobMeta(null);
     setProcessingMedia(data);
 
+    const generation = processRequestRef.current.generation + 1;
+    const requestId = newProcessRequestId();
+    processRequestRef.current = { generation, requestId };
+    const isStale = () => processRequestRef.current.generation !== generation;
+
     try {
       let body;
-      const headers = { 'X-Gemini-Key': apiKey };
+      const headers = { 'X-Gemini-Key': apiKey, 'X-Process-Request-Id': requestId };
 
       if (data.type === 'url') {
         headers['Content-Type'] = 'application/json';
@@ -653,12 +678,21 @@ function App() {
 
       const res = await fetch(getApiUrl('/api/process'), {
         method: 'POST',
-        headers: data.type === 'url' ? headers : { 'X-Gemini-Key': apiKey },
-        body
+        headers: data.type === 'url'
+          ? headers
+          : { 'X-Gemini-Key': apiKey, 'X-Process-Request-Id': requestId },
+        body,
       });
 
       if (!res.ok) throw new Error(await res.text());
       const resData = await res.json();
+
+      if (isStale() || resData.status === 'cancelled') {
+        // The user already pressed "Stop & New". The server was told via the
+        // request id; cancelling by job id as well covers a lost request.
+        if (resData.job_id) cancelJobOnServer(resData.job_id);
+        return;
+      }
 
       // Quality gate: server did NOT start the job — ask the user first.
       if (resData.needs_confirmation) {
@@ -676,6 +710,7 @@ function App() {
       setJobId(resData.job_id);
 
     } catch (e) {
+      if (isStale()) return;
       setStatus('error');
       setLogs(l => [...l, `Error starting job: ${e.message}`]);
     }
@@ -691,6 +726,15 @@ function App() {
     // Don't leave an orphaned job burning CPU on the server.
     if (jobId && ['queued', 'processing', 'stalled'].includes(status)) {
       cancelJobOnServer(jobId);
+    }
+    // Invalidate an in-flight /api/process request (upload or quality
+    // check). The server cancels by request id whether or not the job
+    // exists yet, so the job cannot survive even if this tab never sees
+    // the response; a late answer is additionally ignored here.
+    const pending = processRequestRef.current;
+    processRequestRef.current = { generation: pending.generation + 1, requestId: null };
+    if (pending.requestId) {
+      fetch(getApiUrl(`/api/process/requests/${pending.requestId}/cancel`), { method: 'POST' }).catch(() => {});
     }
     setStatus('idle');
     setJobId(null);

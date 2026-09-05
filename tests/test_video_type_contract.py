@@ -155,7 +155,7 @@ class _Queue:
         self.items.append(item)
 
 
-def _json_request(payload, api_key="gemini-key"):
+def _json_request(payload, api_key="gemini-key", extra_headers=()):
     body = json.dumps(payload).encode("utf-8")
     delivered = False
 
@@ -173,6 +173,7 @@ def _json_request(payload, api_key="gemini-key"):
         "headers": [
             (b"content-type", b"application/json"),
             (b"x-gemini-key", api_key.encode("utf-8")),
+            *extra_headers,
         ],
     }, receive)
 
@@ -331,3 +332,93 @@ def test_long_result_card_offers_subtitles_instead_of_dubbing():
     long_actions = actions.split("{isLong ? (", 1)[1].split(") : (", 1)[0]
     assert "setShowSubtitleModal(true)" in long_actions
     assert "Dub Voice" not in long_actions
+
+
+def _process_with_request_id(monkeypatch, tmp_path, queue, request_id):
+    monkeypatch.setattr(app, "OUTPUT_DIR", str(tmp_path))
+    monkeypatch.setattr(app, "QUALITY_GATE_MIN_HEIGHT", 0)
+    monkeypatch.setattr(app, "job_queue", queue)
+    request = _json_request(
+        {"url": "https://example.com/video", "output_format": "vertical",
+         "layout_style": "smart", "video_type": "shorts"},
+        extra_headers=[(b"x-process-request-id", request_id.encode())],
+    )
+    return asyncio.run(app.process_endpoint(
+        request, file=None, url=None, output_format=None, layout_style=None, video_type=None,
+    ))
+
+
+def test_stop_before_process_answers_never_enqueues_the_job(monkeypatch, tmp_path):
+    """"Stop & New" during the upload/quality check: the cancel arrives before
+    the job exists, so the job must never be created."""
+    queue = _Queue()
+    monkeypatch.setattr(app, "jobs", {})
+    monkeypatch.setattr(app, "_process_requests", {})
+    request_id = "req_" + "a" * 12
+
+    cancelled = asyncio.run(app.cancel_process_request(request_id))
+    assert cancelled["job_id"] is None and cancelled["success"] is True
+
+    response = _process_with_request_id(monkeypatch, tmp_path, queue, request_id)
+
+    assert response == {"job_id": None, "status": "cancelled"}
+    assert queue.items == [] and app.jobs == {}
+    assert list(tmp_path.iterdir()) == []  # job directory cleaned up
+
+
+def test_stop_after_process_answered_cancels_the_created_job(monkeypatch, tmp_path):
+    queue = _Queue()
+    monkeypatch.setattr(app, "jobs", {})
+    monkeypatch.setattr(app, "_process_requests", {})
+    monkeypatch.setattr(app, "_terminate_job_processes", lambda job_id: None)
+    request_id = "req_" + "b" * 12
+
+    response = _process_with_request_id(monkeypatch, tmp_path, queue, request_id)
+    job_id = response["job_id"]
+    assert queue.items == [job_id]
+
+    cancelled = asyncio.run(app.cancel_process_request(request_id))
+
+    assert cancelled == {"job_id": job_id, "success": True}
+    assert app.jobs[job_id]["status"] == "failed"
+    assert app.jobs[job_id]["cancel_requested"] is True
+
+
+def test_cancel_process_request_rejects_malformed_ids():
+    with pytest.raises(HTTPException) as exc:
+        asyncio.run(app.cancel_process_request("../etc"))
+    assert exc.value.status_code == 400
+
+
+def test_request_registry_keeps_active_jobs_and_caps_pending_entries(monkeypatch):
+    now = app._now_ts()
+    old = now - app.PROCESS_REQUEST_TTL_SECONDS - 1
+    monkeypatch.setattr(app, "jobs", {
+        "queued-job": {"status": "queued"},
+        "done-job": {"status": "completed"},
+    })
+    monkeypatch.setattr(app, "PROCESS_REQUEST_MAX_PENDING", 2)
+    registry = {
+        "active_" + "a" * 8: {"job_id": "queued-job", "cancelled": False, "ts": old},
+        "finished" + "b" * 8: {"job_id": "done-job", "cancelled": False, "ts": old},
+        "stale___" + "c" * 8: {"job_id": None, "cancelled": True, "ts": old},
+        "pending1" + "d" * 8: {"job_id": None, "cancelled": False, "ts": now - 3},
+        "pending2" + "e" * 8: {"job_id": None, "cancelled": False, "ts": now - 2},
+        "pending3" + "f" * 8: {"job_id": None, "cancelled": False, "ts": now - 1},
+    }
+    monkeypatch.setattr(app, "_process_requests", registry)
+
+    app._prune_process_requests(now)
+
+    # The queued job outlives the TTL; finished and stale entries are gone;
+    # only the newest pending entries survive the cap.
+    assert set(registry) == {"active_" + "a" * 8, "pending2" + "e" * 8, "pending3" + "f" * 8}
+
+    # Cancelling the long-queued job by request id still reaches the job.
+    monkeypatch.setattr(app, "_terminate_job_processes", lambda job_id: None)
+    app.jobs["queued-job"].update({"job_id": "queued-job", "logs": [], "raw_logs": []})
+    monkeypatch.setattr(app, "_mark_job_status", lambda job_id, status, **kw: app.jobs[job_id].update(status=status))
+    monkeypatch.setattr(app, "_append_log", lambda *a, **k: None)
+    result = asyncio.run(app.cancel_process_request("active_" + "a" * 8))
+    assert result == {"job_id": "queued-job", "success": True}
+    assert app.jobs["queued-job"]["status"] == "failed"

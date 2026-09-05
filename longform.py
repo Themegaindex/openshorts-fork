@@ -28,14 +28,43 @@ DEFAULT_FALLBACK_WINDOW_SECONDS = 24.0
 DEFAULT_BOUNDARY_PADDING_SECONDS = 0.20
 DEFAULT_REVIEW_BOUNDARY_WINDOW_SECONDS = 75.0
 DEFAULT_REVIEW_BOUNDARY_MAX_UNITS = 24
+# Only words that can practically never close a sentence. Words such as
+# "that", "as", "when", "wie" or "als" regularly end complete sentences
+# ("...proud of that.") and must not be listed here.
 OBVIOUS_TRAILING_CONNECTORS = {
-    "aber", "als", "dass", "damit", "denn", "oder", "und", "weil", "wenn", "wie",
-    "and", "as", "because", "but", "if", "or", "that", "when", "while",
+    "aber", "dass", "damit", "denn", "oder", "und", "weil", "wenn",
+    "and", "because", "but", "if", "or", "while",
 }
+# Only subordinating words that cannot open a complete thought. Question and
+# temporal openers ("When did you start?", "Wenn du willst, ...") are legal
+# chapter starts and must not be listed here.
 OBVIOUS_LEADING_CONNECTORS = {
-    "damit", "dass", "obwohl", "sodass", "während", "weil", "wenn",
-    "because", "if", "unless", "when", "while",
+    "damit", "dass", "obwohl", "sodass", "weil",
+    "because", "unless",
 }
+
+
+def _obviously_incomplete_start(text: str) -> bool:
+    text = str(text or "").strip()
+    tokens = re.findall(r"[\w\u00c0-\u024f]+", text)
+    return bool(
+        tokens
+        and tokens[0].casefold() in OBVIOUS_LEADING_CONNECTORS
+        and "," not in text
+        and ";" not in text
+    )
+
+
+def _obviously_incomplete_end(text: str) -> bool:
+    text = str(text or "").rstrip()
+    if text.endswith((",", ";", ":")):
+        return True
+    if SENTENCE_END_RE.search(text):
+        # A sentence that ends with terminal punctuation is complete even if
+        # its last word happens to be a connector.
+        return False
+    tokens = re.findall(r"[\w\u00c0-\u024f]+", text)
+    return bool(tokens and tokens[-1].casefold() in OBVIOUS_TRAILING_CONNECTORS)
 
 
 def _word_start(word: dict) -> float:
@@ -552,20 +581,9 @@ def resolve_unit_plan(
                 issues.append(f"short_segment:{segment_id}")
             if segment_duration > float(max_segment_seconds) + 0.001:
                 issues.append(f"long_segment:{segment_id}")
-            opening_text = str(segment.get("first_unit_text") or "").strip()
-            ending_text = str(segment.get("last_unit_text") or "").rstrip()
-            opening_tokens = re.findall(r"[\w\u00c0-\u024f]+", opening_text)
-            ending_tokens = re.findall(r"[\w\u00c0-\u024f]+", ending_text)
-            if (
-                opening_tokens
-                and opening_tokens[0].casefold() in OBVIOUS_LEADING_CONNECTORS
-                and "," not in opening_text
-                and ";" not in opening_text
-            ):
+            if _obviously_incomplete_start(segment.get("first_unit_text")):
                 issues.append(f"obviously_incomplete_start:{segment_id}")
-            if ending_text.endswith((",", ";", ":")):
-                issues.append(f"obviously_incomplete_end:{segment_id}")
-            elif ending_tokens and ending_tokens[-1].casefold() in OBVIOUS_TRAILING_CONNECTORS:
+            if _obviously_incomplete_end(segment.get("last_unit_text")):
                 issues.append(f"obviously_incomplete_end:{segment_id}")
             if body_ranges and start_index <= body_ranges[-1][1]:
                 issues.append(f"non_chronological_or_overlapping:{segment_id}")
@@ -630,20 +648,9 @@ def resolve_unit_plan(
         teaser_duration = _duration(teaser)
         if teaser_duration < 5.0 - 0.001 or teaser_duration > float(cold_open_max_seconds) + 0.001:
             issues.append("invalid_cold_open_duration")
-        teaser_opening = str(teaser.get("first_unit_text") or "").strip()
-        teaser_ending = str(teaser.get("last_unit_text") or "").rstrip()
-        teaser_opening_tokens = re.findall(r"[\w\u00c0-\u024f]+", teaser_opening)
-        teaser_ending_tokens = re.findall(r"[\w\u00c0-\u024f]+", teaser_ending)
-        if (
-            teaser_opening_tokens
-            and teaser_opening_tokens[0].casefold() in OBVIOUS_LEADING_CONNECTORS
-            and "," not in teaser_opening
-            and ";" not in teaser_opening
-        ):
+        if _obviously_incomplete_start(teaser.get("first_unit_text")):
             issues.append("obviously_incomplete_start:cold_open")
-        if teaser_ending.endswith((",", ";", ":")) or (
-            teaser_ending_tokens and teaser_ending_tokens[-1].casefold() in OBVIOUS_TRAILING_CONNECTORS
-        ):
+        if _obviously_incomplete_end(teaser.get("last_unit_text")):
             issues.append("obviously_incomplete_end:cold_open")
         overlaps_body = any(
             max(cold_start_index, start_index) <= min(cold_end_index, end_index)
