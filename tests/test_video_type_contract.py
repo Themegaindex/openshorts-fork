@@ -155,7 +155,7 @@ class _Queue:
         self.items.append(item)
 
 
-def _json_request(payload, api_key="gemini-key"):
+def _json_request(payload, api_key="gemini-key", extra_headers=()):
     body = json.dumps(payload).encode("utf-8")
     delivered = False
 
@@ -173,6 +173,7 @@ def _json_request(payload, api_key="gemini-key"):
         "headers": [
             (b"content-type", b"application/json"),
             (b"x-gemini-key", api_key.encode("utf-8")),
+            *extra_headers,
         ],
     }, receive)
 
@@ -246,3 +247,228 @@ def test_translate_can_resolve_and_commit_a_long_video(monkeypatch, tmp_path):
     assert response["success"] is True
     saved = json.loads(metadata_path.read_text(encoding="utf-8"))
     assert saved["long_videos"][0]["video_url"].startswith(f"/videos/{job_id}/translated_de_")
+
+
+def test_subtitle_can_remap_and_remove_a_long_video_layer(monkeypatch, tmp_path):
+    job_id = "subtitle-long"
+    output_dir = tmp_path / job_id
+    output_dir.mkdir()
+    (output_dir / "long.mp4").write_bytes(b"video")
+    metadata_path = output_dir / "show_metadata.json"
+    _write_metadata(metadata_path, {
+        "transcript": {"segments": [{"words": [
+            {"word": " First", "start": 10.2, "end": 10.4},
+            {"word": " Second", "start": 20.3, "end": 20.5},
+        ]}]},
+        "shorts": [],
+        "long_videos": [{
+            "output_filename": "long.mp4",
+            "video_type": "long",
+            "start": 0,
+            "end": 2,
+            "segments": [
+                {"start": 10, "end": 11},
+                {"start": 20, "end": 21},
+            ],
+        }],
+    })
+    monkeypatch.setattr(app, "OUTPUT_DIR", str(tmp_path))
+    monkeypatch.setattr(app, "jobs", {
+        job_id: {
+            "job_id": job_id,
+            "status": "completed",
+            "output_dir": str(output_dir),
+            "result": {"clips": [{
+                "output_filename": "long.mp4",
+                "video_url": f"/videos/{job_id}/long.mp4",
+                "video_type": "long",
+            }]},
+            "raw_logs": [],
+            "important_logs": [],
+        },
+    })
+    captured = {}
+
+    def fake_generate_srt(transcript, start, end, output_path):
+        captured["transcript"] = transcript
+        captured["range"] = (start, end)
+        Path(output_path).write_text("subtitle", encoding="utf-8")
+        return True
+
+    def fake_render(_output_dir, _entry, output_path):
+        Path(output_path).write_bytes(b"subtitled video")
+
+    monkeypatch.setattr(app, "generate_srt", fake_generate_srt)
+    monkeypatch.setattr(app, "_render_stored_layers", fake_render)
+
+    response = asyncio.run(app._add_subtitles_locked(
+        app.SubtitleRequest(job_id=job_id, clip_index=0),
+    ))
+
+    words = [
+        word
+        for segment in captured["transcript"]["segments"]
+        for word in segment["words"]
+    ]
+    assert response["success"] is True
+    assert captured["range"] == (0, 2.0)
+    assert [word["start"] for word in words] == pytest.approx([0.2, 1.3])
+
+    removed = asyncio.run(app._remove_clip_layer_locked(
+        app.RemoveLayerRequest(job_id=job_id, clip_index=0, layer="subtitle"),
+    ))
+    assert removed["new_video_url"] == f"/videos/{job_id}/long.mp4"
+    assert removed["layers"] == {"subtitle": False, "hook": False}
+
+    saved = json.loads(metadata_path.read_text(encoding="utf-8"))
+    assert saved["long_videos"][0]["video_url"] == f"/videos/{job_id}/long.mp4"
+
+
+def test_long_result_card_offers_subtitles_instead_of_dubbing():
+    result_card = (
+        Path(__file__).parents[1] / "dashboard" / "src" / "components" / "ResultCard.jsx"
+    ).read_text(encoding="utf-8")
+    actions = result_card.split("{/* Actions Footer */}", 1)[1]
+    long_actions = actions.split("{isLong ? (", 1)[1].split(") : (", 1)[0]
+    assert "setShowSubtitleModal(true)" in long_actions
+    assert "Dub Voice" not in long_actions
+
+
+def _process_with_request_id(monkeypatch, tmp_path, queue, request_id):
+    monkeypatch.setattr(app, "OUTPUT_DIR", str(tmp_path))
+    monkeypatch.setattr(app, "QUALITY_GATE_MIN_HEIGHT", 0)
+    monkeypatch.setattr(app, "job_queue", queue)
+    request = _json_request(
+        {"url": "https://example.com/video", "output_format": "vertical",
+         "layout_style": "smart", "video_type": "shorts"},
+        extra_headers=[(b"x-process-request-id", request_id.encode())],
+    )
+    return asyncio.run(app.process_endpoint(
+        request, file=None, url=None, output_format=None, layout_style=None, video_type=None,
+    ))
+
+
+def test_stop_before_process_answers_never_enqueues_the_job(monkeypatch, tmp_path):
+    """"Stop & New" during the upload/quality check: the cancel arrives before
+    the job exists, so the job must never be created."""
+    queue = _Queue()
+    monkeypatch.setattr(app, "jobs", {})
+    monkeypatch.setattr(app, "_process_requests", {})
+    monkeypatch.setattr(app, "_precancelled_requests", app.OrderedDict())
+    request_id = "req_" + "a" * 12
+
+    cancelled = asyncio.run(app.cancel_process_request(request_id))
+    assert cancelled["job_id"] is None and cancelled["success"] is True
+    # The cancel path never grows the main registry.
+    assert app._process_requests == {}
+
+    response = _process_with_request_id(monkeypatch, tmp_path, queue, request_id)
+
+    assert response == {"job_id": None, "status": "cancelled"}
+    assert queue.items == [] and app.jobs == {}
+    assert list(tmp_path.iterdir()) == []  # job directory cleaned up
+
+
+def test_stop_after_process_answered_cancels_the_created_job(monkeypatch, tmp_path):
+    queue = _Queue()
+    monkeypatch.setattr(app, "jobs", {})
+    monkeypatch.setattr(app, "_process_requests", {})
+    monkeypatch.setattr(app, "_precancelled_requests", app.OrderedDict())
+    monkeypatch.setattr(app, "_terminate_job_processes", lambda job_id: None)
+    request_id = "req_" + "b" * 12
+
+    response = _process_with_request_id(monkeypatch, tmp_path, queue, request_id)
+    job_id = response["job_id"]
+    assert queue.items == [job_id]
+
+    cancelled = asyncio.run(app.cancel_process_request(request_id))
+
+    assert cancelled == {"job_id": job_id, "success": True}
+    assert app.jobs[job_id]["status"] == "failed"
+    assert app.jobs[job_id]["cancel_requested"] is True
+
+
+def test_cancel_process_request_rejects_malformed_ids():
+    with pytest.raises(HTTPException) as exc:
+        asyncio.run(app.cancel_process_request("../etc"))
+    assert exc.value.status_code == 400
+
+
+def test_request_registry_keeps_active_jobs_and_caps_pending_entries(monkeypatch):
+    now = app._now_ts()
+    old = now - app.PROCESS_REQUEST_TTL_SECONDS - 1
+    monkeypatch.setattr(app, "jobs", {
+        "queued-job": {"status": "queued"},
+        "done-job": {"status": "completed"},
+    })
+    monkeypatch.setattr(app, "PROCESS_REQUEST_MAX_PENDING", 2)
+    registry = {
+        "active_" + "a" * 8: {"job_id": "queued-job", "cancelled": False, "ts": old},
+        "finished" + "b" * 8: {"job_id": "done-job", "cancelled": False, "ts": old},
+        "stale___" + "c" * 8: {"job_id": None, "cancelled": True, "ts": old},
+        "pending1" + "d" * 8: {"job_id": None, "cancelled": False, "ts": now - 3},
+        "pending2" + "e" * 8: {"job_id": None, "cancelled": False, "ts": now - 2},
+        "pending3" + "f" * 8: {"job_id": None, "cancelled": False, "ts": now - 1},
+    }
+    monkeypatch.setattr(app, "_process_requests", registry)
+    monkeypatch.setattr(app, "_precancelled_requests", app.OrderedDict())
+
+    app._prune_process_requests(now)
+
+    # The queued job outlives the TTL; finished and stale entries are gone;
+    # only the newest pending entries survive the cap.
+    assert set(registry) == {"active_" + "a" * 8, "pending2" + "e" * 8, "pending3" + "f" * 8}
+
+    # Cancelling the long-queued job by request id still reaches the job.
+    monkeypatch.setattr(app, "_terminate_job_processes", lambda job_id: None)
+    app.jobs["queued-job"].update({"job_id": "queued-job", "logs": [], "raw_logs": []})
+    monkeypatch.setattr(app, "_mark_job_status", lambda job_id, status, **kw: app.jobs[job_id].update(status=status))
+    monkeypatch.setattr(app, "_append_log", lambda *a, **k: None)
+    result = asyncio.run(app.cancel_process_request("active_" + "a" * 8))
+    assert result == {"job_id": "queued-job", "success": True}
+    assert app.jobs["queued-job"]["status"] == "failed"
+
+
+def test_in_flight_upload_entry_survives_registry_pressure(monkeypatch):
+    """Thousands of foreign cancels must not evict the entry of a request
+    that is still uploading, and its later cancel must still be honoured."""
+    now = app._now_ts()
+    registry = {}
+    monkeypatch.setattr(app, "_process_requests", registry)
+    monkeypatch.setattr(app, "_precancelled_requests", app.OrderedDict())
+    monkeypatch.setattr(app, "PROCESS_REQUEST_MAX_PENDING", 2)
+    monkeypatch.setattr(app, "PROCESS_PRECANCEL_MAX", 3)
+
+    upload = app._register_process_request("upload__" + "a" * 8)
+    upload["in_flight"] = True
+    upload["ts"] = now - 3600
+
+    for index in range(10):
+        asyncio.run(app.cancel_process_request(f"foreign{index:02d}" + "b" * 8))
+
+    assert registry == {upload["id"]: upload}
+    assert len(app._precancelled_requests) <= 3
+
+    result = asyncio.run(app.cancel_process_request(upload["id"]))
+    assert result["success"] is True
+    assert app._process_request_cancelled(upload) is True
+
+
+def test_precancel_marks_the_request_even_if_registry_entry_was_replaced(monkeypatch):
+    registry = {}
+    monkeypatch.setattr(app, "_process_requests", registry)
+    monkeypatch.setattr(app, "_precancelled_requests", app.OrderedDict())
+    entry = app._register_process_request("replaced" + "c" * 8)
+    # Simulate the handler's copy being detached from the registry.
+    registry.clear()
+    asyncio.run(app.cancel_process_request(entry["id"]))
+    assert app._process_request_cancelled(entry) is True
+    assert registry[entry["id"]] is entry
+
+
+def test_artifact_fallback_ignores_partial_render_files(tmp_path):
+    (tmp_path / "temp_partial_Title_vertical.mp4").write_bytes(b"half")
+    assert app._build_result_from_video_artifacts("job", str(tmp_path)) is None
+    (tmp_path / "Title_vertical.mp4").write_bytes(b"done")
+    result = app._build_result_from_video_artifacts("job", str(tmp_path))
+    assert result["clips"][0]["output_filename"] == "Title_vertical.mp4"

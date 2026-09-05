@@ -8,6 +8,8 @@ import re
 import sys
 import math
 import threading
+import os
+import copy
 from contextlib import contextmanager
 from scenedetect import SceneManager
 from scenedetect.detectors import ContentDetector
@@ -23,9 +25,13 @@ except ImportError:
     VideoManager = None
 from ultralytics import YOLO
 import torch
-import os
 import numpy as np
 from tqdm import tqdm
+# OpenShorts does not require third-party yt-dlp plugins. Disable globally
+# installed providers by default so a stale bgutil installation cannot make
+# every YouTube request probe a nonexistent localhost service on port 4416.
+# An advanced user can explicitly opt back in with YTDLP_NO_PLUGINS="".
+os.environ.setdefault("YTDLP_NO_PLUGINS", "1")
 import yt_dlp
 import mediapipe as mp
 from mediapipe.tasks import python as mp_python
@@ -128,19 +134,57 @@ AUTO_FULL_VIDEO_FALLBACK_MAX_SECONDS = max(
     float(os.environ.get("AUTO_FULL_VIDEO_FALLBACK_MAX_SECONDS", "1800")),
 )
 GEMINI_WORKER_SCRIPT = os.path.join(os.path.dirname(os.path.abspath(__file__)), "gemini_worker.py")
-LONGFORM_TARGET_MIN_SECONDS = float(os.environ.get("LONGFORM_TARGET_MIN_SECONDS", "480"))
-LONGFORM_TARGET_MAX_SECONDS = float(os.environ.get("LONGFORM_TARGET_MAX_SECONDS", "600"))
-# Unlike GEMINI_LONG_VIDEO_SECONDS (a two-hour Shorts shortlist threshold), this
-# controls when Smart/Auto may attempt an 8-10 minute long-form edit.
-LONGFORM_MIN_SOURCE_SECONDS = float(os.environ.get("LONGFORM_MIN_SOURCE_SECONDS", "540"))
+LONGFORM_TARGET_MIN_SECONDS = float(
+    os.environ.get("LONGFORM_MIN_OUTPUT_SECONDS", os.environ.get("LONGFORM_TARGET_MIN_SECONDS", "240"))
+)
+LONGFORM_TARGET_MAX_SECONDS = float(
+    os.environ.get("LONGFORM_MAX_OUTPUT_SECONDS", os.environ.get("LONGFORM_TARGET_MAX_SECONDS", "600"))
+)
+# Auto only attempts a long video when the source can plausibly spare the best
+# 4-10 minutes. Below this a "best-of" would be close to the full recording, so
+# Auto stays with Shorts instead of burning a planning pass on it.
+LONGFORM_MIN_SOURCE_SECONDS = float(os.environ.get("LONGFORM_MIN_SOURCE_SECONDS", "720"))
+# The explicit Long mode keeps the lower physical bound: the user asked for a
+# long video, so attempt it and let the quality gate decide.
 LONGFORM_HARD_MIN_SOURCE_SECONDS = float(os.environ.get("LONGFORM_HARD_MIN_SOURCE_SECONDS", "240"))
 LONGFORM_MIN_SEGMENT_SECONDS = float(os.environ.get("LONGFORM_MIN_SEGMENT_SECONDS", "20"))
 LONGFORM_MAX_SEGMENT_SECONDS = float(os.environ.get("LONGFORM_MAX_SEGMENT_SECONDS", "240"))
-LONGFORM_MERGE_GAP_SECONDS = float(os.environ.get("LONGFORM_MERGE_GAP_SECONDS", "4"))
-LONGFORM_MAX_SEGMENTS = int(os.environ.get("LONGFORM_MAX_SEGMENTS", "30"))
+LONGFORM_MAX_SEGMENTS = int(os.environ.get("LONGFORM_MAX_SEGMENTS", "12"))
+LONGFORM_MAX_CHAPTERS = int(os.environ.get("LONGFORM_MAX_CHAPTERS", "6"))
+# A best-of edit needs at least two distinct topics; one chapter means the
+# planner (or the review pass dropping chapters) collapsed to a single-topic
+# compilation. Set to 1 to allow genuinely single-topic sources.
+LONGFORM_MIN_CHAPTERS = min(
+    LONGFORM_MAX_CHAPTERS,
+    max(1, int(os.environ.get("LONGFORM_MIN_CHAPTERS", "2"))),
+)
 LONGFORM_COLD_OPEN = os.environ.get("LONGFORM_COLD_OPEN", "1").strip().lower() not in ("0", "false", "off", "no")
-LONGFORM_COLD_OPEN_MAX_SECONDS = float(os.environ.get("LONGFORM_COLD_OPEN_MAX_SECONDS", "20"))
-LONGFORM_AUDIO_FADE_SECONDS = float(os.environ.get("LONGFORM_AUDIO_FADE_SECONDS", "0.04"))
+_cold_open_max_requested = float(os.environ.get("LONGFORM_COLD_OPEN_MAX_SECONDS", "15"))
+LONGFORM_COLD_OPEN_MAX_SECONDS = min(15.0, max(5.0, _cold_open_max_requested))
+if LONGFORM_COLD_OPEN_MAX_SECONDS != _cold_open_max_requested:
+    print(
+        f"⚠️ LONGFORM_COLD_OPEN_MAX_SECONDS={_cold_open_max_requested:g} is outside the "
+        f"supported 5-15s range; using {LONGFORM_COLD_OPEN_MAX_SECONDS:g}s."
+    )
+LONGFORM_STRONG_PAUSE_SECONDS = float(os.environ.get("LONGFORM_STRONG_PAUSE_SECONDS", "0.55"))
+LONGFORM_PAUSE_FALLBACK_WINDOW_SECONDS = float(
+    os.environ.get("LONGFORM_PAUSE_FALLBACK_WINDOW_SECONDS", "24")
+)
+LONGFORM_BOUNDARY_PADDING_SECONDS = float(os.environ.get("LONGFORM_BOUNDARY_PADDING_SECONDS", "0.20"))
+LONGFORM_AUDIO_FADE_SECONDS = float(os.environ.get("LONGFORM_AUDIO_FADE_SECONDS", "0.01"))
+LONGFORM_REVIEW_MIN_OVERALL_SCORE = int(os.environ.get("LONGFORM_REVIEW_MIN_OVERALL_SCORE", "85"))
+LONGFORM_REVIEW_MIN_JOIN_SCORE = int(os.environ.get("LONGFORM_REVIEW_MIN_JOIN_SCORE", "80"))
+LONGFORM_REVIEW_REPAIR_RETRIES = max(0, int(os.environ.get("LONGFORM_REVIEW_REPAIR_RETRIES", "1")))
+LONGFORM_REVIEW_BOUNDARY_WINDOW_SECONDS = max(
+    0.0,
+    float(os.environ.get("LONGFORM_REVIEW_BOUNDARY_WINDOW_SECONDS", "75")),
+)
+LONGFORM_REVIEW_BOUNDARY_MAX_UNITS = max(
+    4,
+    int(os.environ.get("LONGFORM_REVIEW_BOUNDARY_MAX_UNITS", "24")),
+)
+LONGFORM_SCENE_SCAN_MAX_SECONDS = max(0.0, float(os.environ.get("LONGFORM_SCENE_SCAN_MAX_SECONDS", "1.5")))
+LONGFORM_SCENE_CUT_THRESHOLD = max(0.0, float(os.environ.get("LONGFORM_SCENE_CUT_THRESHOLD", "18")))
 LONGFORM_CANVAS_WIDTH = int(os.environ.get("LONGFORM_CANVAS_WIDTH", "1920"))
 LONGFORM_CANVAS_HEIGHT = int(os.environ.get("LONGFORM_CANVAS_HEIGHT", "1080"))
 GEMINI_LONGFORM_TIMEOUT_SECONDS = min(
@@ -841,7 +885,32 @@ def _iter_batches(items, batch_size):
 
 
 def _merge_cost_analyses(cost_analyses):
-    valid = [cost for cost in cost_analyses if cost]
+    numeric_fields = (
+        "input_tokens",
+        "output_tokens",
+        "thinking_tokens",
+        "input_cost",
+        "output_cost",
+        "total_cost",
+    )
+
+    def valid_cost(cost):
+        if not isinstance(cost, dict) or not cost:
+            return False
+        for field in numeric_fields:
+            if field not in cost:
+                continue
+            value = cost[field]
+            if (
+                isinstance(value, bool)
+                or not isinstance(value, (int, float))
+                or not math.isfinite(float(value))
+                or value < 0
+            ):
+                return False
+        return True
+
+    valid = [cost for cost in cost_analyses if valid_cost(cost)]
     if not valid:
         return None
     return {
@@ -1884,10 +1953,9 @@ def download_youtube_video(url, output_dir=".", resume=False):
             with open(cookies_path, 'w') as f:
                 f.write(cookies_env)
             if os.path.exists(cookies_path):
-                 print(f"   Debug: Cookies file created. Size: {os.path.getsize(cookies_path)} bytes")
-                 with open(cookies_path, 'r') as f:
-                     content = f.read(100)
-                     print(f"   Debug: First 100 chars of cookie file: {content}")
+                # Never echo cookie contents: stdout lands in the job log,
+                # the dashboard and persisted support logs.
+                print(f"   Cookies file created. Size: {os.path.getsize(cookies_path)} bytes")
         except Exception as e:
             print(f"⚠️ Failed to write cookies file: {e}")
             cookies_path = None
@@ -2178,11 +2246,38 @@ def _render_clip(input_video, final_output_video, output_format="vertical", layo
     Legacy ``auto``/``horizontal`` values are accepted for saved jobs and map
     to the explicit ``vertical``/``original`` choices."""
     output_format = normalize_output_format(output_format)
+    # Render into a sibling file and move it into place only when complete.
+    # The dashboard polls the job directory for finished clips while rendering
+    # runs; a half-written MP4 under the final name shows up as a "ready" clip
+    # that then fails to play until a manual reload.
+    partial_output = _partial_render_path(final_output_video)
+    _remove_quietly(partial_output)
     if output_format == "original":
-        return _finalize_clip_passthrough(input_video, final_output_video, progress_callback)
-    aspect = output_aspect_ratio(output_format)
-    return process_video_to_vertical(input_video, final_output_video, progress_callback,
-                                     aspect_ratio=aspect, layout_style=layout_style)
+        success = _finalize_clip_passthrough(input_video, partial_output, progress_callback)
+    else:
+        aspect = output_aspect_ratio(output_format)
+        success = process_video_to_vertical(input_video, partial_output, progress_callback,
+                                            aspect_ratio=aspect, layout_style=layout_style)
+    if not success:
+        _remove_quietly(partial_output)
+        return False
+    os.replace(partial_output, final_output_video)
+    return True
+
+
+def _partial_render_path(final_output_video):
+    directory, filename = os.path.split(final_output_video)
+    return os.path.join(directory, f"temp_partial_{filename}")
+
+
+def _remove_quietly(path):
+    """A stale scratch file that cannot be removed (Windows lock, permissions)
+    must not turn into a crash of the whole render."""
+    try:
+        if os.path.exists(path):
+            os.remove(path)
+    except OSError as exc:
+        print(f"⚠️ Could not remove scratch file {path}: {exc}")
 
 
 def _full_render_filename(output_dir, video_title, output_format):
@@ -2309,7 +2404,8 @@ def process_video_to_vertical(input_video, final_output_video, progress_callback
         progress_callback(20.0, "Processing video frames...")
     
     command = [
-        'ffmpeg', '-y', '-f', 'rawvideo', '-vcodec', 'rawvideo',
+        'ffmpeg', '-y', '-nostats', '-loglevel', 'error',
+        '-f', 'rawvideo', '-vcodec', 'rawvideo',
         '-s', f'{OUTPUT_WIDTH}x{OUTPUT_HEIGHT}', '-pix_fmt', 'bgr24',
         '-r', str(fps), '-i', '-', '-c:v', 'libx264',
         '-preset', 'fast', '-crf', '23', '-pix_fmt', 'yuv420p',
@@ -2317,6 +2413,21 @@ def process_video_to_vertical(input_video, final_output_video, progress_callback
     ]
 
     ffmpeg_process = subprocess.Popen(command, stdin=subprocess.PIPE, stdout=subprocess.DEVNULL, stderr=subprocess.PIPE)
+
+    # Drain stderr while frames are being written. Reading it only after the
+    # frame loop lets the pipe fill up on long clips: ffmpeg then blocks on
+    # its write, we block on stdin.write, and the job hangs until the watchdog
+    # kills it.
+    stderr_chunks = []
+
+    def _drain_stderr():
+        try:
+            stderr_chunks.append(ffmpeg_process.stderr.read())
+        except Exception:
+            pass
+
+    stderr_thread = threading.Thread(target=_drain_stderr, daemon=True, name="ffmpeg-stderr")
+    stderr_thread.start()
 
     cap = cv2.VideoCapture(input_video)
     total_frames = int(cap.get(cv2.CAP_PROP_FRAME_COUNT))
@@ -2435,7 +2546,6 @@ def process_video_to_vertical(input_video, final_output_video, progress_callback
                 last_progress_emit = time.time()
 
         ffmpeg_process.stdin.close()
-        stderr_output = ffmpeg_process.stderr.read().decode()
         ffmpeg_process.wait()
     finally:
         cap.release()
@@ -2446,6 +2556,8 @@ def process_video_to_vertical(input_video, final_output_video, progress_callback
                 ffmpeg_process.wait(timeout=5)
             except subprocess.TimeoutExpired:
                 ffmpeg_process.kill()
+        stderr_thread.join(timeout=5)
+        stderr_output = b"".join(stderr_chunks).decode(errors="replace")
 
     print(f"   🎥 Artificial camera switches: {artificial_switches}")
 
@@ -2813,6 +2925,58 @@ def _run_score_stage(windows, transcript_language, video_duration, output_dir, v
     return scored_windows, scored_input_ids, skipped_score_ids, attempts, all_costs
 
 
+# Detail windows already include 20s of padding; anything further out is not
+# a boundary tweak but a clip from a different timeline.
+DETAIL_WINDOW_TOLERANCE_SECONDS = 5.0
+
+
+def _drop_clips_outside_windows(clips, windows, *, label):
+    """Gemini sometimes answers with window-relative timestamps (0-30 instead
+    of 3600-3630). Such clips would silently cut the wrong part of the source,
+    so keep only clips that lie inside one of the windows they were asked
+    about. Entries without parseable times are left for normalization."""
+    ranges = []
+    for window in windows:
+        try:
+            ranges.append((float(window["start"]), float(window["end"])))
+        except (KeyError, TypeError, ValueError):
+            continue
+    if not ranges:
+        return list(clips)
+    # Neighbouring detail windows overlap through their padding; a clip that
+    # spans such a boundary is still inside the analyzed material.
+    ranges.sort()
+    merged = []
+    for window_start, window_end in ranges:
+        if merged and window_start <= merged[-1][1] + DETAIL_WINDOW_TOLERANCE_SECONDS:
+            merged[-1] = (merged[-1][0], max(merged[-1][1], window_end))
+        else:
+            merged.append((window_start, window_end))
+    ranges = merged
+    kept, dropped = [], []
+    for clip in clips:
+        try:
+            start = float(clip.get("start"))
+            end = float(clip.get("end"))
+        except (AttributeError, TypeError, ValueError):
+            kept.append(clip)
+            continue
+        inside = any(
+            window_start - DETAIL_WINDOW_TOLERANCE_SECONDS <= start
+            and end <= window_end + DETAIL_WINDOW_TOLERANCE_SECONDS
+            for window_start, window_end in ranges
+        )
+        (kept if inside else dropped).append(clip)
+    if dropped:
+        JOB_REPORTER.warning(
+            f"Dropped {len(dropped)} clip(s) from {label}: timestamps "
+            f"{[(c.get('start'), c.get('end')) for c in dropped]} lie outside the analyzed window(s) "
+            f"{[(round(s, 1), round(e, 1)) for s, e in ranges]}.",
+            category="gemini",
+        )
+    return kept
+
+
 def _report_shorts_analysis_failure(error_message, *, defer_terminal_error=False):
     """Report a Shorts failure without prematurely failing an Auto job."""
     if defer_terminal_error:
@@ -3002,7 +3166,10 @@ def get_viral_clips(
                     time.sleep(min(10.0, float(2 ** attempt_number)))
         if batch_result is not None and isinstance(batch_result.get("shorts"), list):
             detailed_input_ids.update(str(window.get("id")) for window in batch_windows)
-            collected_clips.extend(batch_result["shorts"])
+            collected_clips.extend(_drop_clips_outside_windows(
+                batch_result["shorts"], batch_windows,
+                label=f"detail batch {batch_index + 1}/{total_detail_batches}",
+            ))
         elif last_error_type in RESCUABLE_GEMINI_ERROR_TYPES:
             JOB_REPORTER.warning(
                 f"Recovering detail batch {batch_index + 1}/{total_detail_batches} one window at a time.",
@@ -3023,7 +3190,10 @@ def get_viral_clips(
             for window, worker_result in rescued:
                 payload = worker_result.get("payload") or {}
                 if isinstance(payload.get("shorts"), list):
-                    collected_clips.extend(payload["shorts"])
+                    collected_clips.extend(_drop_clips_outside_windows(
+                        payload["shorts"], [window],
+                        label=f"rescued window {window.get('id')}",
+                    ))
                     detailed_input_ids.add(str(window.get("id")))
                 else:
                     failed_ids.append(str(window.get("id")))
@@ -3122,17 +3292,10 @@ def get_viral_clips(
 
 def _longform_target_range(video_duration):
     duration = max(0.0, float(video_duration))
-    warnings = []
-    if duration < LONGFORM_MIN_SOURCE_SECONDS:
-        target_min = min(LONGFORM_TARGET_MIN_SECONDS, duration * 0.60)
-        target_max = min(LONGFORM_TARGET_MAX_SECONDS, duration * 0.80)
-        warnings.append("scaled_target_for_short_source")
-    else:
-        target_min = min(LONGFORM_TARGET_MIN_SECONDS, duration * 0.90)
-        target_max = min(LONGFORM_TARGET_MAX_SECONDS, duration)
-    target_min = max(LONGFORM_MIN_SEGMENT_SECONDS, target_min)
-    target_max = max(target_min, target_max)
-    return round(target_min, 3), round(target_max, 3), warnings
+    target_max = min(float(LONGFORM_TARGET_MAX_SECONDS), duration)
+    target_min = min(float(LONGFORM_TARGET_MIN_SECONDS), target_max)
+    target_min = max(0.0, target_min)
+    return round(target_min, 3), round(target_max, 3), []
 
 
 def _validate_longform_source_duration(video_type, duration):
@@ -3147,13 +3310,25 @@ def _validate_longform_source_duration(video_type, duration):
         )
 
 
-def _longform_analysis_coverage(windows, scored_windows, skipped_score_ids, *, plan_attempted):
+def _longform_analysis_coverage(
+    windows,
+    scored_windows,
+    skipped_score_ids,
+    *,
+    plan_attempted,
+    editorial_units=0,
+    review_attempted=False,
+    repair_attempted=False,
+):
     scored_ids = {str(item.get("id")) for item in scored_windows or []}
     return {
         "score_windows_total": len(windows or []),
         "score_windows_processed": len(scored_ids),
         "score_windows_skipped": sorted(str(item) for item in (skipped_score_ids or [])),
         "longform_plan_attempted": bool(plan_attempted),
+        "editorial_units": int(editorial_units),
+        "longform_review_attempted": bool(review_attempted),
+        "longform_repair_attempted": bool(repair_attempted),
     }
 
 
@@ -3166,9 +3341,8 @@ def get_longform_plan(
     windows=None,
     scored_windows=None,
 ):
-    """Score the full transcript and ask Gemini for one coherent edit plan."""
+    """Build, independently review, and quality-gate a Longform V2 edit."""
     transcript_language = str(transcript_result.get("language") or "unknown")
-    words = _extract_words_for_analysis(transcript_result)
     windows = list(windows or _build_transcript_windows(transcript_result, video_duration))
     reused_scoring = scored_windows is not None
     scored_windows = list(scored_windows) if scored_windows is not None else None
@@ -3219,281 +3393,517 @@ def get_longform_plan(
             "scored_windows": scored_windows,
         }
 
-    score_by_id = {}
-    for item in sorted(scored_windows, key=lambda candidate: candidate.get("score", 0), reverse=True):
-        score_by_id.setdefault(str(item.get("id")), item)
-    planning_windows = []
-    for window in windows:
-        score = score_by_id.get(str(window.get("id")), {})
-        planning_windows.append({
-            "id": window.get("id"),
-            "start": window.get("start"),
-            "end": window.get("end"),
-            "score": int(score.get("score", 0) or 0),
-            "reason": str(score.get("reason") or ""),
-            "text": str(window.get("text") or ""),
-        })
+    editorial_units = longform.build_editorial_units(
+        transcript_result,
+        video_duration,
+        strong_pause_seconds=LONGFORM_STRONG_PAUSE_SECONDS,
+        fallback_window_seconds=LONGFORM_PAUSE_FALLBACK_WINDOW_SECONDS,
+        boundary_padding_seconds=LONGFORM_BOUNDARY_PADDING_SECONDS,
+    )
+    if not editorial_units:
+        return {
+            "plan_data": None,
+            "error": "The transcript did not contain usable word or segment boundaries.",
+            "attempts": attempts,
+            "cost_analysis": _merge_cost_analyses(all_costs),
+            "analysis_coverage": _longform_analysis_coverage(
+                windows,
+                scored_windows,
+                skipped_score_ids,
+                plan_attempted=False,
+                editorial_units=0,
+            ),
+            "windows": windows,
+            "scored_windows": scored_windows,
+        }
+    fingerprint = longform.transcript_fingerprint(editorial_units)
+    planning_blocks = longform.build_planning_blocks(editorial_units, scored_windows)
+    _save_json_checkpoint(output_dir, video_title, "longform_units_v2", {
+        "planner_version": longform.PLANNER_VERSION,
+        "transcript_fingerprint": fingerprint,
+        "units": editorial_units,
+        "blocks": planning_blocks,
+    })
 
-    target_min, target_max, target_warnings = _longform_target_range(video_duration)
-    payload = {
+    target_min, target_max, _target_warnings = _longform_target_range(video_duration)
+    plan_payload = {
         "video_duration": round(float(video_duration), 3),
         "language": transcript_language,
-        "windows": planning_windows,
+        "blocks": planning_blocks,
         "target_min_seconds": target_min,
         "target_max_seconds": target_max,
         "min_segment_seconds": LONGFORM_MIN_SEGMENT_SECONDS,
         "max_segment_seconds": LONGFORM_MAX_SEGMENT_SECONDS,
+        "max_segments": LONGFORM_MAX_SEGMENTS,
+        "max_chapters": LONGFORM_MAX_CHAPTERS,
+        "min_chapters": LONGFORM_MIN_CHAPTERS,
+        "cold_open_enabled": LONGFORM_COLD_OPEN,
+        "cold_open_max_seconds": LONGFORM_COLD_OPEN_MAX_SECONDS,
     }
-    last_error = None
-    plan_progress = 96.0 if reused_scoring else 45.0
-    normalize_progress = 98.0 if reused_scoring else 90.0
-    complete_progress = 99.0 if reused_scoring else 95.0
+    plan_progress = 96.0 if reused_scoring else 55.0
     JOB_REPORTER.progress(
-        plan_progress, message="Planning a coherent long-form story...", important=True, category="analyze",
+        plan_progress,
+        message="Planning the strongest chronological topics with stable cut IDs...",
+        important=True,
+        category="analyze",
     )
-    for attempt_number, attempt in enumerate(_gemini_attempt_specs()[:GEMINI_MAX_ATTEMPTS], start=1):
-        try:
-            worker_result = _call_gemini_worker(
-                "longform_plan",
-                payload,
-                output_dir=output_dir,
-                video_title=video_title,
-                strategy=attempt["strategy"],
-                batch_index=0,
-                total_batches=1,
-                attempt=attempt_number,
-                timeout_seconds=GEMINI_LONGFORM_TIMEOUT_SECONDS,
-            )
-            cost = worker_result.get("cost_analysis")
-            if cost:
-                all_costs.append(cost)
-            JOB_REPORTER.progress(
-                normalize_progress, message="Validating long-form story and cut boundaries...", category="analyze",
-            )
-            normalized = longform.normalize_longform_plan(
-                worker_result.get("payload"),
-                video_duration,
-                words=words,
-                min_segment_seconds=LONGFORM_MIN_SEGMENT_SECONDS,
-                max_segment_seconds=LONGFORM_MAX_SEGMENT_SECONDS,
-                merge_gap_seconds=LONGFORM_MERGE_GAP_SECONDS,
-                target_min_seconds=target_min,
-                target_max_seconds=target_max,
-                max_segments=LONGFORM_MAX_SEGMENTS,
-                cold_open=LONGFORM_COLD_OPEN,
-                cold_open_max_seconds=LONGFORM_COLD_OPEN_MAX_SECONDS,
-            )
-            normalized["warnings"] = list(dict.fromkeys(target_warnings + normalized.get("warnings", [])))
-            attempts.append({
-                "stage": "longform_plan",
-                "attempt": attempt_number,
-                "name": attempt["name"],
-                "status": "success",
-                "viable": normalized.get("viable"),
-            })
-            checkpoint = {
-                "plan_data": normalized,
-                "attempts": attempts,
-                "cost_analysis": _merge_cost_analyses(all_costs),
-            }
-            _save_json_checkpoint(output_dir, video_title, "longform_plan", checkpoint)
-            JOB_REPORTER.progress(
-                complete_progress,
-                message=("Long-form plan ready." if normalized.get("viable") else "Long-form plan needs a deterministic fallback."),
-                important=True,
-                category="analyze",
-            )
-            return {
-                "plan_data": normalized,
-                "error": None if normalized.get("viable") else "Gemini marked the source as not viable for long-form.",
-                "attempts": attempts,
-                "cost_analysis": _merge_cost_analyses(all_costs),
-                "analysis_coverage": _longform_analysis_coverage(
-                    windows, scored_windows, skipped_score_ids, plan_attempted=True,
-                ),
-                "windows": windows,
-                "scored_windows": scored_windows,
-            }
-        except Exception as exc:
-            last_error = str(exc)
-            cost = _cost_from_worker_error(exc)
-            if cost:
-                all_costs.append(cost)
-            attempts.append({
-                "stage": "longform_plan",
-                "attempt": attempt_number,
-                "name": attempt["name"],
-                "status": "failed",
-                "error": last_error,
-                "error_type": getattr(exc, "error_type", "worker_error"),
-            })
-            JOB_REPORTER.warning(
-                f"Long-form planning attempt {attempt_number} failed: {last_error}",
-                category="gemini",
-                attempt=attempt_number,
-            )
 
+    def call_stage(mode, payload, stage, *, artifact_suffix=None):
+        last_error = None
+        for attempt_number, attempt in enumerate(
+            _gemini_attempt_specs()[:GEMINI_MAX_ATTEMPTS], start=1,
+        ):
+            try:
+                worker_result = _call_gemini_worker(
+                    mode,
+                    payload,
+                    output_dir=output_dir,
+                    video_title=video_title,
+                    strategy=attempt["strategy"],
+                    batch_index=0,
+                    total_batches=1,
+                    attempt=attempt_number,
+                    timeout_seconds=GEMINI_LONGFORM_TIMEOUT_SECONDS,
+                    artifact_suffix=artifact_suffix,
+                )
+                cost = worker_result.get("cost_analysis")
+                if cost:
+                    all_costs.append(cost)
+                stage_payload = worker_result.get("payload")
+                if not isinstance(stage_payload, dict):
+                    raise ValueError(f"Gemini {stage} returned a non-object JSON payload.")
+                attempts.append({
+                    "stage": stage,
+                    "attempt": attempt_number,
+                    "name": attempt["name"],
+                    "status": "success",
+                })
+                return stage_payload, None
+            except Exception as exc:
+                last_error = str(exc)
+                cost = _cost_from_worker_error(exc)
+                if cost:
+                    all_costs.append(cost)
+                attempts.append({
+                    "stage": stage,
+                    "attempt": attempt_number,
+                    "name": attempt["name"],
+                    "status": "failed",
+                    "error": last_error,
+                    "error_type": getattr(exc, "error_type", "worker_error"),
+                })
+                JOB_REPORTER.warning(
+                    f"Gemini {stage} attempt {attempt_number} failed: {last_error}",
+                    category="gemini",
+                    attempt=attempt_number,
+                )
+        return None, last_error or f"Gemini {stage} did not return usable JSON."
+
+    raw_plan, plan_error = call_stage(
+        "longform_plan_v2", plan_payload, "longform_plan_v2", artifact_suffix="draft",
+    )
+    if raw_plan is None:
+        return {
+            "plan_data": None,
+            "error": plan_error,
+            "attempts": attempts,
+            "cost_analysis": _merge_cost_analyses(all_costs),
+            "analysis_coverage": _longform_analysis_coverage(
+                windows,
+                scored_windows,
+                skipped_score_ids,
+                plan_attempted=True,
+                editorial_units=len(editorial_units),
+            ),
+            "windows": windows,
+            "scored_windows": scored_windows,
+        }
+
+    model_raw_plan = raw_plan
+    raw_plan, chronology_protected_chapter_ids = longform.order_unit_plan_chronologically(
+        raw_plan,
+        editorial_units,
+    )
+    chronology_normalized = longform.plan_selection_signature(model_raw_plan) != longform.plan_selection_signature(raw_plan)
+
+    try:
+        draft = longform.resolve_unit_plan(
+            raw_plan,
+            editorial_units,
+            min_output_seconds=target_min,
+            max_output_seconds=target_max,
+            min_segment_seconds=LONGFORM_MIN_SEGMENT_SECONDS,
+            max_segment_seconds=LONGFORM_MAX_SEGMENT_SECONDS,
+            max_chapters=LONGFORM_MAX_CHAPTERS,
+            min_chapters=LONGFORM_MIN_CHAPTERS,
+            max_segments=LONGFORM_MAX_SEGMENTS,
+            cold_open_enabled=LONGFORM_COLD_OPEN,
+            cold_open_max_seconds=LONGFORM_COLD_OPEN_MAX_SECONDS,
+        )
+    except Exception as exc:
+        return {
+            "plan_data": None,
+            "error": f"Gemini's Longform V2 unit plan was invalid: {exc}",
+            "attempts": attempts + [{"stage": "resolve_v2", "status": "failed", "error": str(exc)}],
+            "cost_analysis": _merge_cost_analyses(all_costs),
+            "analysis_coverage": _longform_analysis_coverage(
+                windows,
+                scored_windows,
+                skipped_score_ids,
+                plan_attempted=True,
+                editorial_units=len(editorial_units),
+            ),
+            "windows": windows,
+            "scored_windows": scored_windows,
+        }
+
+    _save_json_checkpoint(output_dir, video_title, "longform_draft_v2", {
+        "planner_version": longform.PLANNER_VERSION,
+        "transcript_fingerprint": fingerprint,
+        "model_raw_plan": model_raw_plan,
+        "raw_plan": raw_plan,
+        "chronology_normalized": chronology_normalized,
+        "chronology_protected_chapter_ids": sorted(chronology_protected_chapter_ids),
+        "resolved_plan": draft,
+    })
+    if not draft.get("viable"):
+        return {
+            "plan_data": draft,
+            "error": "Gemini found fewer than four strong minutes for a polished long video.",
+            "attempts": attempts,
+            "cost_analysis": _merge_cost_analyses(all_costs),
+            "analysis_coverage": _longform_analysis_coverage(
+                windows,
+                scored_windows,
+                skipped_score_ids,
+                plan_attempted=True,
+                editorial_units=len(editorial_units),
+            ),
+            "windows": windows,
+            "scored_windows": scored_windows,
+        }
+
+    JOB_REPORTER.progress(
+        98.0 if reused_scoring else 82.0,
+        message="Independently reviewing every Long Video transition...",
+        important=True,
+        category="analyze",
+    )
+
+    anchor_review_context = longform.build_review_context(
+        draft,
+        editorial_units,
+        neighbor_seconds=LONGFORM_REVIEW_BOUNDARY_WINDOW_SECONDS,
+        max_neighbor_units=LONGFORM_REVIEW_BOUNDARY_MAX_UNITS,
+    )
+    anchor_boundary_neighborhoods = anchor_review_context.get("boundary_neighborhoods") or []
+    anchor_neighborhoods_by_segment = {
+        str(neighborhood.get("segment_id")): neighborhood
+        for neighborhood in anchor_boundary_neighborhoods
+        if isinstance(neighborhood, dict)
+    }
+    allowed_unit_ids_by_segment = {
+        str(neighborhood.get("segment_id")): {
+            "start": {
+                str(unit.get("id"))
+                for unit in neighborhood.get("start_candidate_units") or []
+            },
+            "end": {
+                str(unit.get("id"))
+                for unit in neighborhood.get("end_candidate_units") or []
+            },
+        }
+        for neighborhood in anchor_boundary_neighborhoods
+    }
+
+    def review_once(
+        current_raw_plan,
+        current_plan,
+        *,
+        repair_required,
+        repair_feedback,
+        suffix,
+        final_verification=False,
+    ):
+        review_context = longform.build_review_context(
+            current_plan,
+            editorial_units,
+            neighbor_seconds=LONGFORM_REVIEW_BOUNDARY_WINDOW_SECONDS,
+            max_neighbor_units=LONGFORM_REVIEW_BOUNDARY_MAX_UNITS,
+        )
+        # A failed first review must not widen its own authority for the repair
+        # pass. Boundary choices stay anchored to the original draft's local
+        # candidate lists, while current boundary IDs, assembled text, and joins
+        # reflect the current edit.
+        if not final_verification:
+            constrained_neighborhoods = []
+            for neighborhood in review_context.get("boundary_neighborhoods") or []:
+                constrained = copy.deepcopy(neighborhood)
+                anchor = anchor_neighborhoods_by_segment.get(
+                    str(neighborhood.get("segment_id")),
+                )
+                constrained["start_candidate_units"] = copy.deepcopy(
+                    anchor.get("start_candidate_units") or [] if anchor else [],
+                )
+                constrained["end_candidate_units"] = copy.deepcopy(
+                    anchor.get("end_candidate_units") or [] if anchor else [],
+                )
+                constrained_neighborhoods.append(constrained)
+            review_context["boundary_neighborhoods"] = constrained_neighborhoods
+        review_payload = {
+            "video_duration": round(float(video_duration), 3),
+            "language": transcript_language,
+            "target_min_seconds": target_min,
+            "target_max_seconds": target_max,
+            "min_segment_seconds": LONGFORM_MIN_SEGMENT_SECONDS,
+            "max_segment_seconds": LONGFORM_MAX_SEGMENT_SECONDS,
+            "max_segments": LONGFORM_MAX_SEGMENTS,
+            "max_chapters": LONGFORM_MAX_CHAPTERS,
+            "min_chapters": LONGFORM_MIN_CHAPTERS,
+            "draft_plan": current_raw_plan,
+            "review_context": review_context,
+            "repair_required": bool(repair_required),
+            "final_verification": bool(final_verification),
+            "repair_feedback": list(repair_feedback or []),
+        }
+        review, error = call_stage(
+            "longform_review",
+            review_payload,
+            (
+                "longform_final_review"
+                if final_verification
+                else "longform_repair" if repair_required else "longform_review"
+            ),
+            artifact_suffix=suffix,
+        )
+        if review is None:
+            return None, None, [error or "review_failed"]
+        malformed_fields = [
+            field
+            for field in (
+                "critical_issues",
+                "dropped_chapter_ids",
+                "boundary_reviews",
+                "joins",
+            )
+            if not isinstance(review.get(field), list)
+        ]
+        for field in ("boundary_reviews", "joins"):
+            items = review.get(field)
+            if isinstance(items, list) and not all(isinstance(item, dict) for item in items):
+                malformed_fields.append(field)
+        if not isinstance(review.get("plan"), dict):
+            malformed_fields.append("plan")
+        if malformed_fields:
+            return review, None, [
+                f"invalid_review_payload:{field}"
+                for field in dict.fromkeys(malformed_fields)
+            ]
+        verification_issues = []
+        if final_verification:
+            reviewed_plan = current_plan
+            if review.get("plan") != current_raw_plan:
+                verification_issues.append("final_review_mutated_plan")
+        else:
+            try:
+                reviewed_raw_plan, _moved_ids = longform.order_unit_plan_chronologically(
+                    review.get("plan"),
+                    editorial_units,
+                )
+                review["plan"] = reviewed_raw_plan
+                reviewed_plan = longform.resolve_unit_plan(
+                    reviewed_raw_plan,
+                    editorial_units,
+                    min_output_seconds=target_min,
+                    max_output_seconds=target_max,
+                    min_segment_seconds=LONGFORM_MIN_SEGMENT_SECONDS,
+                    max_segment_seconds=LONGFORM_MAX_SEGMENT_SECONDS,
+                    max_chapters=LONGFORM_MAX_CHAPTERS,
+                    min_chapters=LONGFORM_MIN_CHAPTERS,
+                    max_segments=LONGFORM_MAX_SEGMENTS,
+                    cold_open_enabled=LONGFORM_COLD_OPEN,
+                    cold_open_max_seconds=LONGFORM_COLD_OPEN_MAX_SECONDS,
+                    allowed_unit_ids_by_segment=allowed_unit_ids_by_segment,
+                )
+            except Exception as exc:
+                return review, None, [f"invalid_reviewed_plan:{exc}"]
+        gate_issues = longform.assess_editorial_quality(
+            reviewed_plan,
+            review,
+            minimum_overall_score=LONGFORM_REVIEW_MIN_OVERALL_SCORE,
+            minimum_join_score=LONGFORM_REVIEW_MIN_JOIN_SCORE,
+            protected_chapter_ids=chronology_protected_chapter_ids,
+        )
+        gate_issues = list(dict.fromkeys(verification_issues + gate_issues))
+        return review, reviewed_plan, gate_issues
+
+    review, final_plan, gate_issues = review_once(
+        raw_plan,
+        draft,
+        repair_required=False,
+        repair_feedback=draft.get("validation_issues") or [],
+        suffix="review",
+    )
+    _save_json_checkpoint(output_dir, video_title, "longform_review_v2", {
+        "review": review,
+        "gate_issues": gate_issues,
+    })
+
+    def review_state_is_usable(review_payload, resolved_plan, issues):
+        avoidable_drop = any(
+            str(issue).startswith("avoidable_chapter_drop:")
+            for issue in issues or []
+        )
+        return (
+            not avoidable_drop
+            and isinstance(review_payload, dict)
+            and isinstance(review_payload.get("plan"), dict)
+            and isinstance(resolved_plan, dict)
+            and bool(resolved_plan.get("viable"))
+            and bool(resolved_plan.get("segments"))
+        )
+
+    repair_attempted = False
+    current_raw = raw_plan
+    current_plan = draft
+    if review_state_is_usable(review, final_plan, gate_issues):
+        current_raw = review["plan"]
+        current_plan = final_plan
+    for repair_index in range(LONGFORM_REVIEW_REPAIR_RETRIES):
+        if not gate_issues:
+            break
+        repair_attempted = True
+        JOB_REPORTER.warning(
+            "Long-form quality gate requested one focused Gemini repair pass.",
+            category="analyze",
+            gate_issues=gate_issues,
+        )
+        review, final_plan, gate_issues = review_once(
+            current_raw,
+            current_plan,
+            repair_required=True,
+            repair_feedback=gate_issues,
+            suffix=f"repair_{repair_index + 1}",
+        )
+        _save_json_checkpoint(output_dir, video_title, f"longform_repair_v2_{repair_index + 1}", {
+            "review": review,
+            "gate_issues": gate_issues,
+        })
+        if review_state_is_usable(review, final_plan, gate_issues):
+            current_raw = review["plan"]
+            current_plan = final_plan
+
+    final_verification_attempted = False
+    if repair_attempted and not gate_issues and isinstance(final_plan, dict):
+        final_verification_attempted = True
+        JOB_REPORTER.progress(
+            99.0 if reused_scoring else 94.0,
+            message="Running a fresh read-only review of the repaired Long Video...",
+            important=True,
+            category="analyze",
+        )
+        review, final_plan, gate_issues = review_once(
+            current_raw,
+            current_plan,
+            repair_required=False,
+            repair_feedback=[],
+            suffix="final_review",
+            final_verification=True,
+        )
+        _save_json_checkpoint(output_dir, video_title, "longform_final_review_v2", {
+            "review": review,
+            "gate_issues": gate_issues,
+        })
+
+    if gate_issues or not isinstance(final_plan, dict):
+        rejected = dict(current_plan) if isinstance(current_plan, dict) else draft
+        rejected["viable"] = False
+        rejected["warnings"] = list(dict.fromkeys(
+            list(rejected.get("warnings") or []) + ["editorial_quality_gate_failed"] + list(gate_issues or [])
+        ))
+        rejected["editorial_review"] = {
+            "approved": False,
+            "repair_attempted": repair_attempted,
+            "final_verification_attempted": final_verification_attempted,
+            "gate_issues": list(gate_issues or ["review_unavailable"]),
+        }
+        return {
+            "plan_data": rejected,
+            "error": "The Long Video still failed its editorial quality gate after repair.",
+            "attempts": attempts,
+            "cost_analysis": _merge_cost_analyses(all_costs),
+            "analysis_coverage": _longform_analysis_coverage(
+                windows,
+                scored_windows,
+                skipped_score_ids,
+                plan_attempted=True,
+                editorial_units=len(editorial_units),
+                review_attempted=True,
+                repair_attempted=repair_attempted,
+            ),
+            "windows": windows,
+            "scored_windows": scored_windows,
+        }
+
+    final_plan["planner_version"] = longform.PLANNER_VERSION
+    final_plan["quality_gate_version"] = longform.QUALITY_GATE_VERSION
+    final_plan["transcript_fingerprint"] = fingerprint
+    final_plan["viable"] = True
+    final_plan["editorial_review"] = {
+        "approved": True,
+        "overall_score": int(review.get("overall_score", 0) or 0),
+        "ending_complete": bool(review.get("ending_complete")),
+        "joins": review.get("joins") or [],
+        "critical_issues": review.get("critical_issues") or [],
+        "repair_attempted": repair_attempted,
+        "final_verification_attempted": final_verification_attempted,
+        "boundary_reviews": review.get("boundary_reviews") or [],
+    }
+    original_chapter_ids = {
+        str(chapter.get("id") or "")
+        for chapter in raw_plan.get("chapters") or []
+        if isinstance(chapter, dict)
+    }
+    retained_chapter_ids = {
+        str(segment.get("chapter_id") or "")
+        for segment in final_plan.get("segments") or []
+        if segment.get("role") != "cold_open"
+    }
+    final_plan["dropped_topics"] = sorted(original_chapter_ids - retained_chapter_ids)
+    final_plan["chronology_normalized"] = chronology_normalized
+    cold_segments = [item for item in final_plan.get("segments", []) if item.get("role") == "cold_open"]
+    final_plan["cold_open_replayed"] = bool(cold_segments and cold_segments[0].get("replay_in_body"))
+    checkpoint = {
+        "planner_version": longform.PLANNER_VERSION,
+        "transcript_fingerprint": fingerprint,
+        "plan_data": final_plan,
+        "attempts": attempts,
+        "cost_analysis": _merge_cost_analyses(all_costs),
+    }
+    _save_json_checkpoint(output_dir, video_title, "longform_plan_v2", checkpoint)
+    JOB_REPORTER.progress(
+        99.0 if reused_scoring else 95.0,
+        message=f"Long Video passed editorial review at {final_plan['total_duration']:.0f}s.",
+        important=True,
+        category="analyze",
+    )
     return {
-        "plan_data": None,
-        "error": last_error or "Gemini did not return a usable long-form plan.",
+        "plan_data": final_plan,
+        "error": None,
         "attempts": attempts,
         "cost_analysis": _merge_cost_analyses(all_costs),
         "analysis_coverage": _longform_analysis_coverage(
-            windows, scored_windows, skipped_score_ids, plan_attempted=True,
+            windows,
+            scored_windows,
+            skipped_score_ids,
+            plan_attempted=True,
+            editorial_units=len(editorial_units),
+            review_attempted=True,
+            repair_attempted=repair_attempted,
         ),
         "windows": windows,
         "scored_windows": scored_windows,
     }
-
-
-def _score_fallback_selection_value(item, selected, video_duration):
-    """Prefer strong SCORE results while using normalized distance for continuity."""
-    distance = min(
-        min(abs(item["start"] - picked["end"]), abs(picked["start"] - item["end"]))
-        for picked in selected
-    )
-    normalized_distance = min(1.0, distance / max(1.0, float(video_duration)))
-    return float(item["score"]) - (normalized_distance * 25.0)
-
-
-def _score_based_longform_fallback(
-    transcript_result,
-    video_duration,
-    *,
-    video_title,
-    windows,
-    scored_windows,
-):
-    """Build a bounded chronological edit from SCORE output when planning fails."""
-    if not windows or not scored_windows:
-        return None
-    target_min, target_max, target_warnings = _longform_target_range(video_duration)
-    language_code = str(transcript_result.get("language") or "en").lower().split("-")[0]
-    part_label = {
-        "de": "Teil", "en": "Part", "es": "Parte", "fr": "Partie",
-        "it": "Parte", "pt": "Parte", "nl": "Deel", "pl": "Część",
-        "tr": "Bölüm", "sv": "Del", "da": "Del", "no": "Del",
-    }.get(language_code, "Part")
-    score_by_id = {}
-    for item in sorted(scored_windows, key=lambda candidate: candidate.get("score", 0), reverse=True):
-        score_by_id.setdefault(str(item.get("id")), item)
-
-    candidates = [
-        {
-            "id": str(window.get("id")),
-            "start": float(window.get("start", 0)),
-            "end": float(window.get("end", 0)),
-            "score": int(score_by_id.get(str(window.get("id")), {}).get("score", 0) or 0),
-        }
-        for window in windows
-        if (
-            str(window.get("id")) in score_by_id
-            and float(window.get("end", 0)) > float(window.get("start", 0))
-        )
-    ]
-    if not candidates:
-        return None
-
-    selected = []
-    remaining = list(candidates)
-    while remaining:
-        if not selected:
-            chosen = max(remaining, key=lambda item: (item["score"], item["end"] - item["start"]))
-        else:
-            chosen = max(
-                remaining,
-                key=lambda item: _score_fallback_selection_value(
-                    item, selected, video_duration,
-                ),
-            )
-        selected.append(chosen)
-        remaining.remove(chosen)
-        merged = longform.merge_plan_segments([
-            {
-                **item,
-                "chapter_title": "Highlights",
-                "priority": item["score"],
-                "continuity_importance": max(30, item["score"]),
-                "required": False,
-                "role": "body",
-            }
-            for item in selected
-        ], LONGFORM_MERGE_GAP_SECONDS)
-        assembled = sum(float(item["end"]) - float(item["start"]) for item in merged)
-        if assembled >= target_min:
-            break
-
-    selected.sort(key=lambda item: (item["start"], item["end"]))
-    ranges = longform.merge_plan_segments([
-        {
-            **item,
-            "chapter_title": f"{part_label} {index + 1}",
-            "priority": item["score"],
-            "continuity_importance": max(30, item["score"]),
-            "required": False,
-            "role": "body",
-        }
-        for index, item in enumerate(selected)
-    ], LONGFORM_MERGE_GAP_SECONDS)
-    body = [item for item in ranges if item.get("role") != "cold_open"]
-    if body:
-        body[0]["role"] = "setup"
-        body[0]["required"] = True
-        body[-1]["role"] = "payoff"
-        body[-1]["required"] = True
-
-    strongest = max(candidates, key=lambda item: item["score"])
-    teaser_midpoint = (strongest["start"] + strongest["end"]) / 2.0
-    teaser_start = max(strongest["start"], teaser_midpoint - 6.0)
-    teaser_end = min(strongest["end"], teaser_start + 12.0)
-    payload = {
-        "viable": True,
-        # Keep deterministic copy language-neutral: the source title is known,
-        # while fabricating prose in the wrong language would be worse than an
-        # empty description followed by the automatically generated chapters.
-        "video_title": str(video_title).replace("_", " ").strip()[:100],
-        "youtube_description": "",
-        "segments": [{
-            "start": teaser_start,
-            "end": teaser_end,
-            "chapter_title": "Intro",
-            "priority": strongest["score"],
-            "continuity_importance": 100,
-            "required": True,
-            "role": "cold_open",
-            "reason": "Strongest scored moment used as deterministic teaser.",
-        }] + body,
-    }
-    try:
-        normalized = longform.normalize_longform_plan(
-            payload,
-            video_duration,
-            words=_extract_words_for_analysis(transcript_result),
-            min_segment_seconds=LONGFORM_MIN_SEGMENT_SECONDS,
-            max_segment_seconds=LONGFORM_MAX_SEGMENT_SECONDS,
-            merge_gap_seconds=LONGFORM_MERGE_GAP_SECONDS,
-            target_min_seconds=target_min,
-            target_max_seconds=target_max,
-            max_segments=LONGFORM_MAX_SEGMENTS,
-            cold_open=LONGFORM_COLD_OPEN,
-            cold_open_max_seconds=LONGFORM_COLD_OPEN_MAX_SECONDS,
-        )
-    except Exception as exc:
-        JOB_REPORTER.warning(f"Score-based long-form fallback was invalid: {exc}", category="analyze")
-        return None
-    for index, segment in enumerate(
-        (item for item in normalized.get("segments", []) if item.get("role") != "cold_open"),
-        start=1,
-    ):
-        segment["chapter_title"] = f"{part_label} {index}"
-    warnings = [
-        item for item in target_warnings + ["score_based_fallback"] + normalized.get("warnings", [])
-        if item != "fewer_than_three_chapters"
-    ]
-    if len(longform.build_chapters(normalized.get("segments", []))) < 3:
-        warnings.append("fewer_than_three_chapters")
-    normalized["warnings"] = list(dict.fromkeys(warnings))
-    return normalized if normalized.get("viable") else None
 
 
 def _render_shorts_clips(
@@ -3634,6 +4044,156 @@ def _run_checked_ffmpeg(command, *, label):
         raise RuntimeError(f"{label} failed: {stderr}") from exc
 
 
+def _find_local_scene_cut(input_video, window_start, window_end, target_time):
+    """Inspect only a tiny safe pause window around one already-planned cut."""
+    allowed_start = max(0.0, float(window_start))
+    allowed_end = max(allowed_start, float(window_end))
+    target = min(allowed_end, max(allowed_start, float(target_time)))
+    max_window = float(LONGFORM_SCENE_SCAN_MAX_SECONDS)
+    if max_window <= 0 or allowed_end - allowed_start < 0.04:
+        return None
+
+    half_window = max_window / 2.0
+    scan_start = max(allowed_start, target - half_window)
+    scan_end = min(allowed_end, scan_start + max_window)
+    scan_start = max(allowed_start, scan_end - max_window)
+    if scan_end - scan_start < 0.04:
+        return None
+
+    cap = cv2.VideoCapture(input_video)
+    if not cap.isOpened():
+        cap.release()
+        return None
+    try:
+        fps = max(1.0, float(cap.get(cv2.CAP_PROP_FPS) or 0.0))
+        cap.set(cv2.CAP_PROP_POS_MSEC, scan_start * 1000.0)
+        previous = None
+        best_score = -1.0
+        best_time = None
+        max_frames = max(2, int(math.ceil((scan_end - scan_start) * fps)) + 3)
+        for _index in range(max_frames):
+            frame_time = float(cap.get(cv2.CAP_PROP_POS_MSEC) or (scan_start * 1000.0)) / 1000.0
+            if frame_time > scan_end + (1.0 / fps):
+                break
+            ok, frame = cap.read()
+            if not ok:
+                break
+            if frame is None or not getattr(frame, "size", 0):
+                continue
+            height, width = frame.shape[:2]
+            if width > 320:
+                scaled_height = max(2, int(round(height * (320.0 / width))))
+                frame = cv2.resize(frame, (320, scaled_height))
+            gray = cv2.cvtColor(frame, cv2.COLOR_BGR2GRAY)
+            if previous is not None:
+                score = float(np.mean(cv2.absdiff(previous, gray)))
+                if score > best_score:
+                    best_score = score
+                    best_time = frame_time
+            previous = gray
+        if best_time is not None and best_score >= float(LONGFORM_SCENE_CUT_THRESHOLD):
+            return round(min(allowed_end, max(allowed_start, best_time)), 3)
+        return None
+    except Exception:
+        return None
+    finally:
+        cap.release()
+
+
+def _refine_longform_cut_plan(plan, input_video):
+    """Align V2 speech-pause cuts to local source edits without a full scan."""
+    original = copy.deepcopy(plan)
+    refined = copy.deepcopy(plan)
+    if int(refined.get("planner_version") or 0) != longform.PLANNER_VERSION:
+        return refined
+    cache = {}
+    aligned_count = 0
+    for segment in refined.get("segments") or []:
+        alignment = {}
+        for edge, window_key in (("start", "start_cut_window"), ("end", "end_cut_window")):
+            window = segment.get(window_key)
+            if not isinstance(window, list) or len(window) != 2:
+                alignment[edge] = "speech_pause"
+                continue
+            allowed_start = float(window[0])
+            allowed_end = float(window[1])
+            target = float(segment.get(edge, allowed_start))
+            cache_key = (
+                round(allowed_start, 3), round(allowed_end, 3), round(target, 3),
+            )
+            if cache_key not in cache:
+                cache[cache_key] = _find_local_scene_cut(
+                    input_video, allowed_start, allowed_end, target,
+                )
+            scene_cut = cache[cache_key]
+            if scene_cut is not None:
+                segment[edge] = scene_cut
+                alignment[edge] = "local_scene_cut"
+                aligned_count += 1
+            else:
+                alignment[edge] = "speech_pause"
+        segment["cut_alignment"] = alignment
+    refined["total_duration"] = round(sum(
+        max(0.0, float(item.get("end", 0)) - float(item.get("start", 0)))
+        for item in refined.get("segments") or []
+    ), 3)
+    alignment_metadata = {
+        "strategy": "bounded_per_cut_window",
+        "max_window_seconds": float(LONGFORM_SCENE_SCAN_MAX_SECONDS),
+        "aligned_edges": aligned_count,
+        "inspected_edges": len(refined.get("segments") or []) * 2,
+    }
+    target_min = float(refined.get("target_min_seconds", LONGFORM_TARGET_MIN_SECONDS))
+    target_max = float(refined.get("target_max_seconds", LONGFORM_TARGET_MAX_SECONDS))
+    revert_reasons = []
+    if refined["total_duration"] < target_min - 0.5:
+        revert_reasons.append("adaptive_minimum")
+    if refined["total_duration"] > target_max + 0.5:
+        revert_reasons.append("adaptive_maximum")
+    body_segments = []
+    for segment in refined.get("segments") or []:
+        segment_duration = float(segment.get("end", 0)) - float(segment.get("start", 0))
+        if segment.get("role") == "cold_open":
+            if segment_duration < 5.0 - 0.001 or segment_duration > LONGFORM_COLD_OPEN_MAX_SECONDS + 0.001:
+                revert_reasons.append(f"cold_open_duration:{segment.get('segment_id')}")
+        else:
+            body_segments.append(segment)
+            if (
+                segment_duration < LONGFORM_MIN_SEGMENT_SECONDS - 0.001
+                or segment_duration > LONGFORM_MAX_SEGMENT_SECONDS + 0.001
+            ):
+                revert_reasons.append(f"segment_duration:{segment.get('segment_id')}")
+    for previous, current in zip(body_segments, body_segments[1:]):
+        if float(current.get("start", 0)) < float(previous.get("end", 0)) - 0.001:
+            revert_reasons.append(
+                f"source_overlap:{previous.get('segment_id')}->{current.get('segment_id')}"
+            )
+
+    if revert_reasons:
+        for segment in original.get("segments") or []:
+            segment["cut_alignment"] = {"start": "speech_pause", "end": "speech_pause"}
+        original["total_duration"] = round(sum(
+            max(0.0, float(item.get("end", 0)) - float(item.get("start", 0)))
+            for item in original.get("segments") or []
+        ), 3)
+        alignment_metadata.update({
+            "aligned_edges": 0,
+            "attempted_aligned_edges": aligned_count,
+            "reverted_for_duration": any(
+                reason in {"adaptive_minimum", "adaptive_maximum"}
+                for reason in revert_reasons
+            ),
+            "reverted_for_safety": True,
+            "revert_reasons": list(dict.fromkeys(revert_reasons)),
+        })
+        original["local_scene_alignment"] = alignment_metadata
+        return original
+    alignment_metadata["reverted_for_duration"] = False
+    alignment_metadata["reverted_for_safety"] = False
+    refined["local_scene_alignment"] = alignment_metadata
+    return refined
+
+
 def _render_longform_video(
     plan,
     input_video,
@@ -3736,7 +4296,14 @@ def _render_longform_video(
         message="Finalizing the long video.",
         category="render",
     ):
-        success = _finalize_clip_passthrough(joined_path, final_path, _finalize_progress)
+        # Same atomic hand-over as _render_clip: the dashboard must never
+        # list a half-written long video as ready.
+        partial_path = _partial_render_path(final_path)
+        success = _finalize_clip_passthrough(joined_path, partial_path, _finalize_progress)
+        if success:
+            os.replace(partial_path, final_path)
+        else:
+            _remove_quietly(partial_path)
     if not success:
         raise RuntimeError("Long-form finalization failed.")
 
@@ -3754,6 +4321,15 @@ def _build_longform_metadata_entry(plan, output_filename):
     chapters = longform.build_chapters(plan.get("segments") or [])
     description = str(plan.get("youtube_description") or "")
     total_duration = round(float(plan.get("total_duration") or 0.0), 3)
+    public_segment_keys = {
+        "segment_id", "chapter_id", "chapter_title", "role", "start", "end",
+        "unit_start_id", "unit_end_id", "priority", "reason", "cut_alignment",
+        "replay_in_body", "boundary_confidence",
+    }
+    public_segments = [
+        {key: value for key, value in segment.items() if key in public_segment_keys}
+        for segment in (plan.get("segments") or [])
+    ]
     return {
         "video_type": "long",
         "output_filename": os.path.basename(output_filename),
@@ -3763,24 +4339,48 @@ def _build_longform_metadata_entry(plan, output_filename):
         "title": str(plan.get("video_title") or "Long Video"),
         "youtube_description": description,
         "chapters": chapters,
-        "segments": plan.get("segments") or [],
+        "segments": public_segments,
         "description_with_chapters": longform.build_youtube_description(description, chapters),
         "warnings": plan.get("warnings") or [],
         "aspect_ratio": "16:9",
+        "planner_version": plan.get("planner_version"),
+        "duration_reason": plan.get("duration_reason") or "",
+        "editorial_review": plan.get("editorial_review") or {},
+        "dropped_topics": plan.get("dropped_topics") or [],
+        "cold_open_replayed": bool(plan.get("cold_open_replayed")),
+        "local_scene_alignment": plan.get("local_scene_alignment") or {},
     }
 
 
-def _longform_result_has_valid_plan(result):
+def _longform_result_has_valid_plan(
+    result,
+    *,
+    require_reviewed_v2=False,
+    transcript_fingerprint=None,
+):
     if not isinstance(result, dict):
         return False
     plan = result.get("plan_data")
-    return bool(
+    valid = bool(
         isinstance(plan, dict)
         and plan.get("viable") is True
         and isinstance(plan.get("segments"), list)
         and plan["segments"]
         and float(plan.get("total_duration") or 0) > 0
     )
+    if not valid:
+        return False
+    if require_reviewed_v2:
+        if int(plan.get("planner_version") or 0) != longform.PLANNER_VERSION:
+            return False
+        if int(plan.get("quality_gate_version") or 0) != longform.QUALITY_GATE_VERSION:
+            return False
+        review = plan.get("editorial_review")
+        if not isinstance(review, dict) or review.get("approved") is not True:
+            return False
+        if transcript_fingerprint and plan.get("transcript_fingerprint") != transcript_fingerprint:
+            return False
+    return True
 
 
 def _analyze_longform_with_fallback(
@@ -3795,9 +4395,21 @@ def _analyze_longform_with_fallback(
     scored_windows=None,
 ):
     result_path = os.path.join(output_dir, f"{video_title}_longform_result.json")
+    current_units = longform.build_editorial_units(
+        transcript,
+        duration,
+        strong_pause_seconds=LONGFORM_STRONG_PAUSE_SECONDS,
+        fallback_window_seconds=LONGFORM_PAUSE_FALLBACK_WINDOW_SECONDS,
+        boundary_padding_seconds=LONGFORM_BOUNDARY_PADDING_SECONDS,
+    )
+    current_fingerprint = longform.transcript_fingerprint(current_units) if current_units else None
     if resume_requested and resume_phase != "analyze":
         checkpoint = _load_json_file(result_path)
-        if _longform_result_has_valid_plan(checkpoint):
+        if _longform_result_has_valid_plan(
+            checkpoint,
+            require_reviewed_v2=True,
+            transcript_fingerprint=current_fingerprint,
+        ):
             JOB_REPORTER.artifact("longform_result", result_path)
             return checkpoint
 
@@ -3809,22 +4421,6 @@ def _analyze_longform_with_fallback(
         windows=windows,
         scored_windows=scored_windows,
     )
-    plan = result.get("plan_data")
-    if not isinstance(plan, dict) or not plan.get("viable"):
-        fallback = _score_based_longform_fallback(
-            transcript,
-            duration,
-            video_title=video_title,
-            windows=result.get("windows") or windows or [],
-            scored_windows=result.get("scored_windows") or scored_windows or [],
-        )
-        if fallback:
-            result["plan_data"] = fallback
-            result["fallback_used"] = "scored_windows"
-            JOB_REPORTER.warning(
-                "Gemini's narrative plan was unavailable; using the bounded score-based long-form fallback.",
-                category="analyze",
-            )
     _save_json_file(result_path, result)
     JOB_REPORTER.artifact("longform_result", result_path)
     return result
@@ -3982,6 +4578,15 @@ def _run_video_type_pipeline(
         if _longform_result_has_valid_plan(long_result):
             long_plan = long_result["plan_data"]
 
+    if long_plan and int(long_plan.get("planner_version") or 0) == longform.PLANNER_VERSION:
+        long_plan = _refine_longform_cut_plan(long_plan, input_video)
+        if isinstance(long_result, dict):
+            long_result["plan_data"] = long_plan
+            _save_json_file(
+                os.path.join(output_dir, f"{video_title}_longform_result.json"),
+                long_result,
+            )
+
     has_shorts = bool(shorts_data and shorts_data.get("shorts"))
     has_long = bool(long_plan)
     short_error = analysis_result.get("error") if isinstance(analysis_result, dict) else None
@@ -4112,12 +4717,10 @@ def _run_video_type_pipeline(
             if not has_long:
                 raise
             _cleanup_render_temp_files([
-                os.path.join(
-                    output_dir,
-                    f"temp_{os.path.basename(str(item.get('output_filename') or ''))}",
-                )
+                os.path.join(output_dir, f"{prefix}{os.path.basename(str(item.get('output_filename') or ''))}")
                 for item in shorts_data["shorts"]
                 if item.get("output_filename")
+                for prefix in ("temp_", "temp_partial_")
             ])
             if completed_shorts:
                 metadata["shorts"] = completed_shorts
@@ -4726,11 +5329,16 @@ if __name__ == '__main__':
                         message="Gemini analysis worker started.",
                         category="analyze",
                     ):
+                        # A failed analysis is followed by the full-video
+                        # fallback below, so it must not mark the job failed
+                        # (the dashboard would stop polling and hide the
+                        # fallback result).
                         analysis_result = get_viral_clips(
                             transcript,
                             duration,
                             output_dir=output_dir,
                             video_title=video_title,
+                            defer_terminal_error=True,
                         )
                     _save_json_file(analysis_result_file, analysis_result)
                     reporter.artifact("analysis_result", analysis_result_file)

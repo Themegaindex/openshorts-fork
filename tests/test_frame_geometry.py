@@ -1,3 +1,4 @@
+import pathlib
 import pytest
 
 cv2 = pytest.importorskip("cv2", reason="OpenCV integration tests run in the video environment")
@@ -47,21 +48,59 @@ def test_landscape_to_vertical_crop_keeps_target_aspect():
     assert (x2 - x1, y2 - y1) == (608, 1080)
 
 
+def _fake_renderer(calls):
+    """Stand-in renderer that writes the requested output file like ffmpeg would."""
+    def _render(input_video, output_path, *args, **kwargs):
+        calls.append((input_video, output_path, args, kwargs))
+        pathlib.Path(output_path).write_bytes(b"video")
+        return True
+    return _render
+
+
 @pytest.mark.parametrize("format_name", ["original", "horizontal"])
-def test_original_and_legacy_horizontal_use_passthrough(monkeypatch, format_name):
+def test_original_and_legacy_horizontal_use_passthrough(monkeypatch, tmp_path, format_name):
     calls = []
-    monkeypatch.setattr(main, "_finalize_clip_passthrough", lambda *args: calls.append(args) or True)
+    monkeypatch.setattr(main, "_finalize_clip_passthrough", _fake_renderer(calls))
     monkeypatch.setattr(main, "process_video_to_vertical", lambda *args, **kwargs: False)
-    assert main._render_clip("in.mp4", "out.mp4", output_format=format_name) is True
+    final = tmp_path / "out.mp4"
+    assert main._render_clip("in.mp4", str(final), output_format=format_name) is True
     assert len(calls) == 1
+    assert final.read_bytes() == b"video"
 
 
-def test_legacy_auto_is_explicit_vertical(monkeypatch):
+def test_legacy_auto_is_explicit_vertical(monkeypatch, tmp_path):
     calls = []
-    monkeypatch.setattr(main, "process_video_to_vertical", lambda *args, **kwargs: calls.append(kwargs) or True)
+    monkeypatch.setattr(main, "process_video_to_vertical", _fake_renderer(calls))
     monkeypatch.setattr(main, "_finalize_clip_passthrough", lambda *args: False)
-    assert main._render_clip("in.mp4", "out.mp4", output_format="auto") is True
-    assert calls[0]["aspect_ratio"] == pytest.approx(9 / 16)
+    assert main._render_clip("in.mp4", str(tmp_path / "out.mp4"), output_format="auto") is True
+    assert calls[0][3]["aspect_ratio"] == pytest.approx(9 / 16)
+
+
+def test_render_clip_never_exposes_a_half_written_final_file(monkeypatch, tmp_path):
+    """The dashboard lists any file under the final name as a ready clip, so
+    the renderer must write elsewhere and move the file into place at the end."""
+    final = tmp_path / "clip.mp4"
+    seen = {}
+
+    def _render(input_video, output_path, *args, **kwargs):
+        seen["output_path"] = output_path
+        seen["final_exists_during_render"] = final.exists()
+        pathlib.Path(output_path).write_bytes(b"video")
+        return True
+
+    monkeypatch.setattr(main, "process_video_to_vertical", _render)
+    assert main._render_clip("in.mp4", str(final), output_format="vertical") is True
+    assert seen["output_path"] != str(final)
+    assert seen["final_exists_during_render"] is False
+    assert final.read_bytes() == b"video"
+    assert not pathlib.Path(seen["output_path"]).exists()
+
+    # A failed render leaves neither the final nor the partial file behind.
+    monkeypatch.setattr(main, "process_video_to_vertical", lambda *a, **k: False)
+    final.unlink()
+    assert main._render_clip("in.mp4", str(final), output_format="vertical") is False
+    assert not final.exists()
+    assert list(tmp_path.iterdir()) == []
 
 
 def test_wide_layout_skips_video_and_detector_analysis(monkeypatch):
@@ -592,3 +631,35 @@ def test_null_detail_rescue_payload_becomes_window_failure(monkeypatch, tmp_path
     assert result["clips_data"] is None
     assert result["analysis_coverage"]["detail_windows_processed"] == 0
     assert result["analysis_coverage"]["detail_windows_skipped"] == ["window_001"]
+
+
+def test_detail_clips_outside_their_window_are_dropped(monkeypatch):
+    """Window-relative answers (0-30 instead of 3600-3630) must not cut the
+    wrong place of the source."""
+    warnings = []
+    monkeypatch.setattr(main.JOB_REPORTER, "warning", lambda message, **extra: warnings.append(message))
+    windows = [{"id": "w1", "start": 3580.0, "end": 3650.0}]
+    clips = [
+        {"start": 3600.0, "end": 3630.0},   # inside
+        {"start": 3577.0, "end": 3600.0},   # within tolerance at the edge
+        {"start": 0.0, "end": 30.0},        # window-relative: wrong timeline
+        {"start": "n/a", "end": None},      # left for normalization to reject
+    ]
+    kept = main._drop_clips_outside_windows(clips, windows, label="test")
+    assert kept == [clips[0], clips[1], clips[3]]
+    assert len(warnings) == 1 and "0.0, 30.0" in warnings[0]
+    # No usable windows: nothing is filtered.
+    assert main._drop_clips_outside_windows(clips, [{"id": "x"}], label="t") == clips
+
+
+def test_detail_clip_spanning_two_overlapping_windows_is_kept(monkeypatch):
+    warnings = []
+    monkeypatch.setattr(main.JOB_REPORTER, "warning", lambda message, **extra: warnings.append(message))
+    windows = [
+        {"id": "w1", "start": 100.0, "end": 200.0},
+        {"id": "w2", "start": 180.0, "end": 280.0},  # overlaps w1 through padding
+    ]
+    clips = [{"start": 170.0, "end": 215.0}, {"start": 0.0, "end": 45.0}]
+    kept = main._drop_clips_outside_windows(clips, windows, label="test")
+    assert kept == [clips[0]]
+    assert len(warnings) == 1

@@ -1,3 +1,6 @@
+import shutil
+import subprocess
+
 import pytest
 
 from subtitles import build_layer_command, build_subtitle_filter
@@ -95,6 +98,17 @@ class TestHookEntrance:
         assert "[0:v][hk]overlay=90:" in fc
         # eased slide-up: starts 60px lower and decelerates into place
         assert "'384+60*pow(1-min(t/0.5,1),2)'" in fc
+        # The PNG must be looped into a real stream, otherwise the fade leaves
+        # a single transparent frame that overlay repeats forever.
+        png_index = cmd.index("h.png")
+        assert cmd[png_index - 3:png_index] == ["-loop", "1", "-i"]
+        assert ":shortest=1[v1]" in fc
+
+    def test_static_hook_is_not_looped(self):
+        cmd = build_layer_command("in.mp4", "out.mp4", hook_png="h.png",
+                                  hook_x=90, hook_y=384, hook_entrance=False)
+        assert "-loop" not in cmd
+        assert "shortest" not in cmd[cmd.index("-filter_complex") + 1]
 
     def test_entrance_with_subtitles_single_pass(self):
         cmd = build_layer_command("in.mp4", "out.mp4", subtitle_filter="ass='s.ass'",
@@ -102,7 +116,7 @@ class TestHookEntrance:
         fc = cmd[cmd.index("-filter_complex") + 1]
         assert fc == ("[1:v]format=rgba,fade=t=in:st=0:d=0.35:alpha=1[hk];"
                       "[0:v]format=yuv444p,ass='s.ass'[v0];"
-                      "[v0][hk]overlay=10:'20+60*pow(1-min(t/0.5,1),2)'[v1];"
+                      "[v0][hk]overlay=10:'20+60*pow(1-min(t/0.5,1),2)':shortest=1[v1];"
                       f"[v1]{EVEN_PAD_FILTER},format=yuv420p[vout]")
 
     def test_no_entrance_keeps_static_overlay(self):
@@ -129,3 +143,45 @@ class TestHookEntrance:
         for command in commands:
             filters = command[command.index("-vf") + 1] if "-vf" in command else command[command.index("-filter_complex") + 1]
             assert EVEN_PAD_FILTER in filters
+
+
+@pytest.mark.skipif(
+    not (shutil.which("ffmpeg") and shutil.which("ffprobe")),
+    reason="ffmpeg and ffprobe are required for the pixel-level hook render test",
+)
+def test_animated_hook_is_visible_in_rendered_pixels(tmp_path):
+    """Regression: the entrance fade used to leave the hook fully transparent.
+    Render a black clip with a solid white hook and sample real pixels."""
+    Image = pytest.importorskip("PIL.Image")
+    from subtitles import burn_layers
+
+    video = tmp_path / "in.mp4"
+    subprocess.run([
+        "ffmpeg", "-y", "-loglevel", "error",
+        "-f", "lavfi", "-i", "color=c=black:s=64x64:r=25:d=2",
+        "-pix_fmt", "yuv420p", str(video),
+    ], check=True)
+    hook = tmp_path / "hook.png"
+    Image.new("RGBA", (32, 32), (255, 255, 255, 255)).save(hook)
+
+    out = tmp_path / "out.mp4"
+    burn_layers(str(video), str(out), hook_png=str(hook), hook_x=16, hook_y=16,
+                hook_entrance=True)
+
+    # Sample the frame at t=1.5s, well after the 0.5s entrance animation.
+    raw = subprocess.run([
+        "ffmpeg", "-loglevel", "error", "-ss", "1.5", "-i", str(out),
+        "-frames:v", "1", "-f", "rawvideo", "-pix_fmt", "gray", "-",
+    ], check=True, capture_output=True).stdout
+    assert len(raw) == 64 * 64
+    centre = raw[32 * 64 + 32]
+    corner = raw[2 * 64 + 2]
+    assert centre > 200, f"hook pixel is {centre}, hook is not visible"
+    assert corner < 40, f"background pixel is {corner}"
+
+    # The output must not be cut short by the looped image input.
+    probe = subprocess.run([
+        "ffprobe", "-v", "error", "-show_entries", "format=duration",
+        "-of", "csv=p=0", str(out),
+    ], check=True, capture_output=True, text=True).stdout.strip()
+    assert abs(float(probe) - 2.0) < 0.2

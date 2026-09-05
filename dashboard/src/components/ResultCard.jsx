@@ -12,6 +12,7 @@ export default function ResultCard({ clip, index, jobId, uploadPostKey, uploadUs
     const [showSubtitleModal, setShowSubtitleModal] = useState(false);
     const videoRef = React.useRef(null);
     const [currentVideoUrl, setCurrentVideoUrl] = useState(getApiUrl(clip.video_url));
+    const [videoError, setVideoError] = useState(null);
 
     const [platforms, setPlatforms] = useState({
         tiktok: true,
@@ -366,6 +367,27 @@ export default function ResultCard({ clip, index, jobId, uploadPostKey, uploadUs
         document.body.removeChild(anchor);
     };
 
+    const handleVideoError = () => {
+        const code = videoRef.current?.error?.code;
+        const messages = {
+            2: 'The preview could not reach the video file.',
+            3: 'The browser could not decode this preview.',
+            4: 'This browser does not support the generated video.',
+        };
+        setVideoError(messages[code] || 'The video preview could not start.');
+    };
+
+    const retryVideo = () => {
+        setVideoError(null);
+        const video = videoRef.current;
+        if (!video) return;
+        video.load();
+        video.play().catch(() => {
+            // The browser may still require the native play button. A real
+            // media error will fire onError and restore the message.
+        });
+    };
+
     return (
         <div className={`bg-surface border border-white/5 rounded-2xl overflow-hidden flex group hover:border-white/10 transition-all animate-[fadeIn_0.5s_ease-out] h-auto ${isLong ? 'xl:col-span-2 flex-col min-h-[520px]' : 'flex-col md:flex-row min-h-[300px]'}`} style={{ animationDelay: `${index * 0.1}s` }}>
             {/* Left: Video Preview (Responsive Width) */}
@@ -374,8 +396,11 @@ export default function ResultCard({ clip, index, jobId, uploadPostKey, uploadUs
                     ref={videoRef}
                     src={currentVideoUrl}
                     controls
+                    preload="metadata"
                     className="w-full h-full object-contain"
                     playsInline
+                    onCanPlay={() => setVideoError(null)}
+                    onError={handleVideoError}
                     onPlay={() => {
                         // A long edit has a discontinuous assembled timeline,
                         // so its playback time cannot seek the original preview.
@@ -391,6 +416,20 @@ export default function ResultCard({ clip, index, jobId, uploadPostKey, uploadUs
                         }
                     }}
                 />
+                {videoError && (
+                    <div className="absolute inset-0 z-20 flex flex-col items-center justify-center gap-3 bg-black/80 p-5 text-center">
+                        <AlertCircle size={24} className="text-amber-400" />
+                        <p className="max-w-sm text-xs text-zinc-200">{videoError}</p>
+                        <button
+                            type="button"
+                            onClick={retryVideo}
+                            className="rounded-lg border border-white/15 bg-white/10 px-3 py-2 text-xs font-semibold text-white transition-colors hover:bg-white/15"
+                        >
+                            Reload preview
+                        </button>
+                        <span className="text-[10px] text-zinc-500">The download remains available.</span>
+                    </div>
+                )}
                 <div className="absolute top-3 left-3 flex gap-2">
                     <span className="bg-black/60 backdrop-blur-md text-white text-[10px] font-bold px-2 py-1 rounded-md border border-white/10 uppercase tracking-wide">
                         {isLong ? 'Long Video · 16:9' : `Clip ${index + 1}`}
@@ -509,12 +548,12 @@ export default function ResultCard({ clip, index, jobId, uploadPostKey, uploadUs
 
                 {/* Applied layers. Burning one in used to be a one-way door:
                     the only way out was overwriting it with another style. */}
-                {!isLong && (layers.subtitle || layers.hook) && (
+                {(layers.subtitle || (!isLong && layers.hook)) && (
                     <div className="mt-auto flex flex-wrap items-center gap-2 pt-4 text-[10px]">
                         <span className="text-zinc-600 uppercase tracking-wider">Applied</span>
                         {[
                             { id: 'subtitle', label: 'Subtitles', active: layers.subtitle },
-                            { id: 'hook', label: 'Hook', active: layers.hook },
+                            { id: 'hook', label: 'Hook', active: !isLong && layers.hook },
                         ].filter((entry) => entry.active).map((entry) => (
                             <button
                                 key={entry.id}
@@ -536,12 +575,12 @@ export default function ResultCard({ clip, index, jobId, uploadPostKey, uploadUs
                 {isLong ? (
                     <div className="mt-auto grid grid-cols-2 gap-3 border-t border-white/5 pt-4">
                         <button
-                            onClick={() => setShowTranslateModal(true)}
-                            disabled={isTranslating}
-                            className="flex items-center justify-center gap-2 rounded-lg bg-gradient-to-r from-green-500 to-teal-600 px-3 py-2.5 text-xs font-bold text-white shadow-lg shadow-green-500/20 transition-all hover:from-green-400 hover:to-teal-500 active:scale-[0.98] disabled:opacity-60"
+                            onClick={() => setShowSubtitleModal(true)}
+                            disabled={isSubtitling}
+                            className="flex items-center justify-center gap-2 rounded-lg bg-gradient-to-r from-yellow-600 to-orange-600 px-3 py-2.5 text-xs font-bold text-white shadow-lg shadow-orange-500/20 transition-all hover:from-yellow-500 hover:to-orange-500 active:scale-[0.98] disabled:opacity-60"
                         >
-                            {isTranslating ? <Loader2 size={14} className="animate-spin" /> : <Languages size={14} />}
-                            {isTranslating ? 'Translating...' : 'Dub Voice'}
+                            {isSubtitling ? <Loader2 size={14} className="animate-spin" /> : <Type size={14} />}
+                            {isSubtitling ? 'Adding...' : 'Subtitles'}
                         </button>
                         <button
                             onClick={handleDownload}
@@ -731,14 +770,16 @@ export default function ResultCard({ clip, index, jobId, uploadPostKey, uploadUs
                 initialText={clip.viral_hook_text}
             />
 
-            <TranslateModal
-                isOpen={showTranslateModal}
-                onClose={() => setShowTranslateModal(false)}
-                onTranslate={handleTranslate}
-                isProcessing={isTranslating}
-                videoUrl={currentVideoUrl}
-                hasApiKey={!!elevenLabsKey}
-            />
+            {!isLong && (
+                <TranslateModal
+                    isOpen={showTranslateModal}
+                    onClose={() => setShowTranslateModal(false)}
+                    onTranslate={handleTranslate}
+                    isProcessing={isTranslating}
+                    videoUrl={currentVideoUrl}
+                    hasApiKey={!!elevenLabsKey}
+                />
+            )}
         </div>
     );
 }

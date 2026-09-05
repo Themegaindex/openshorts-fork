@@ -18,6 +18,11 @@ from dotenv import load_dotenv
 
 load_dotenv()
 
+# Keep the pre-flight subprocess on the same reproducible yt-dlp surface as
+# main.py. In particular, never auto-load a stale bgutil provider from the
+# host Python environment and probe its default localhost port.
+os.environ.setdefault("YTDLP_NO_PLUGINS", "1")
+
 
 def _find_cookies_path():
     # Mirrors main.py's cookie discovery.

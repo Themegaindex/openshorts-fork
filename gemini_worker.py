@@ -7,7 +7,7 @@ from typing import List, Optional
 from dotenv import load_dotenv
 from google import genai
 from google.genai import types as genai_types
-from pydantic import BaseModel
+from pydantic import BaseModel, Field
 
 from clip_selection import lookup_model_prices
 
@@ -44,22 +44,72 @@ class DetailResponse(BaseModel):
     shorts: List[DetailClipModel]
 
 
-class LongformSegmentModel(BaseModel):
-    start: float
-    end: float
-    chapter_title: str
+class LongformUnitSpanModel(BaseModel):
+    id: str
+    start_unit_id: str
+    end_unit_id: str
+
+
+class LongformColdOpenModel(LongformUnitSpanModel):
+    title: str
     priority: int
-    continuity_importance: int
-    required: bool
-    role: str
     reason: str
+    replay_in_body: bool
 
 
-class LongformPlanResponse(BaseModel):
+class LongformChapterModel(BaseModel):
+    id: str
+    title: str
+    topic: str
+    priority: int
+    reason: str
+    spans: List[LongformUnitSpanModel]
+
+
+class LongformPlanV2Response(BaseModel):
     viable: bool
     video_title: str
     youtube_description: str
-    segments: List[LongformSegmentModel]
+    recommended_duration_seconds: int
+    duration_reason: str
+    # Optional without a default is a required key in pydantic v2; Gemini may
+    # simply omit cold_open, which must not burn every attempt.
+    cold_open: Optional[LongformColdOpenModel] = None
+    chapters: List[LongformChapterModel]
+
+
+class LongformJoinReviewModel(BaseModel):
+    id: str
+    score: int
+    context_complete: bool
+    issue: str
+
+
+class LongformBoundaryReviewModel(BaseModel):
+    segment_id: str
+    opening_complete: bool
+    ending_complete: bool
+    continuation_needed: bool
+    issue: str
+
+
+class LongformReviewResponse(BaseModel):
+    approved: bool
+    overall_score: int
+    ending_complete: bool
+    critical_issues: List[str] = Field(default_factory=list)
+    dropped_chapter_ids: List[str] = Field(default_factory=list)
+    boundary_reviews: List[LongformBoundaryReviewModel] = Field(default_factory=list)
+    joins: List[LongformJoinReviewModel] = Field(default_factory=list)
+    plan: LongformPlanV2Response
+
+
+_RESPONSE_SCHEMAS = {
+    "detail": DetailResponse,
+    "score": ScoreResponse,
+    "longform_plan_v2": LongformPlanV2Response,
+    "longform_review": LongformReviewResponse,
+}
 
 
 def _configure_stdio() -> None:
@@ -175,64 +225,220 @@ Return only:
 """
 
 
-LONGFORM_PLAN_PROMPT_TEMPLATE = """
-You are a senior YouTube editor and story producer. Build ONE coherent long-form
-video that feels deliberately edited, never like unrelated shorts stitched
-together. The requested assembled duration is {target_min_seconds} to
-{target_max_seconds} seconds.
+LONGFORM_PLAN_V2_PROMPT_TEMPLATE = """
+You are the planning editor for a polished YouTube interview edit. Use the
+existing importance scores to select the strongest DISTINCT topics, while
+making every retained topic understandable on its own. This is a chronological
+best-of edit, not a random compilation and not one artificially forced story.
 
-STORY RULES:
-- Return only valid JSON.
-- Preserve one clear through-line: context/setup -> development/bridges -> payoff.
-- Apart from the optional cold open, every segment MUST be in chronological
-  source order and use absolute seconds from the source video.
-- Prefer a few substantial passages (60-180 seconds is ideal). Every body
-  segment must be between {min_segment_seconds} and {max_segment_seconds} seconds.
-- Preserve connective tissue that a viewer needs to understand the next scene.
-  Remove greetings, sponsors, housekeeping, repetition and unrelated tangents.
-- Begin on a sentence boundary and end after a complete sentence.
-- Scores indicate audience interest, but narrative coherence beats a higher score.
-- Use `role` values setup, bridge, body or payoff. Mark indispensable context
-  with `required: true`, and rate `continuity_importance` from 0 to 100.
-- If the material cannot honestly sustain {target_min_seconds} coherent seconds,
-  return `viable: false` instead of padding it. In that case still return all
-  schema fields, using an empty `youtube_description` and `segments: []`.
+NON-NEGOTIABLE CONTRACT:
+- Return only valid JSON matching the requested schema.
+- Select boundaries ONLY with the supplied editorial unit IDs. Never invent
+  timestamps and never split an editorial unit.
+- After the optional cold open, all spans must remain in strict source order.
+  Order chapters by their earliest selected unit, never by priority or headline
+  strength. The application will safely normalize a simple ordering mistake,
+  but it will never delete material to do so.
+- Include every genuinely strong distinct topic that fits, but quality beats
+  topic count. Use {min_chapters}-{max_chapters} chapters, at most 2 spans per
+  chapter and at most {max_segments} body spans in total.
+{chapter_rule}
+- Every body span must be {min_segment_seconds}-{max_segment_seconds} seconds.
+  Use a second chronological span for a topic only when its useful material is
+  separated; do not create one oversized passage.
+- A chapter must start with the original question, setup, or a self-contained
+  statement. It must end after a complete answer or thought.
+- Units whose boundary is `best_pause` are the fast-speaker fallback. They are
+  allowed only when the selected multi-unit passage is still semantically
+  complete; prefer `sentence` or `strong_pause` boundaries.
+- Preserve short connective material that is needed to understand names,
+  pronouns, claims, or the next answer. Remove greetings, sponsors, repeated
+  points, housekeeping, and unrelated tangents.
+- Choose an honest assembled duration between {target_min_seconds} and
+  {target_max_seconds} seconds based on how much strong material exists. Never
+  pad to ten minutes. `recommended_duration_seconds` includes the cold open.
+- If fewer than {target_min_seconds} strong coherent seconds exist, or fewer
+  than {min_chapters} distinct chapters can be filled, return `viable:false`,
+  `cold_open:null`, and `chapters:[]`.
 
-COLD OPEN:
-- You may add exactly one first segment with `role: "cold_open"`: a 5-15 second
-  teaser of the strongest moment, without spoiling the complete payoff.
-- Its content may appear again later in full chronological context.
+{cold_open_rules}
 
-CHAPTERS AND COPY:
-- Give related consecutive body segments the same short `chapter_title`, written
-  in TRANSCRIPT_LANGUAGE. Use a distinct title when the story actually advances.
-- `video_title` must be curiosity-driven, truthful and at most 100 characters.
-- `youtube_description` must be 2-4 sentences without timestamps; chapters are
-  appended by the application.
-- All generated text must use TRANSCRIPT_LANGUAGE ({language}).
+COPY:
+- All generated copy must use TRANSCRIPT_LANGUAGE ({language}).
+- `video_title` is truthful, compelling, and at most 100 characters.
+- `youtube_description` is 2-4 sentences without timestamps.
 
 TRANSCRIPT_LANGUAGE: {language}
 VIDEO_DURATION_SECONDS: {video_duration}
-WINDOWS_JSON:
-{windows_json}
+PLANNING_BLOCKS_JSON (each transcript unit appears exactly once):
+{blocks_json}
 
-Return only:
+Return only an object shaped like:
 {{
   "viable": true,
   "video_title": "<title>",
-  "youtube_description": "<2-4 sentences>",
-  "segments": [
-    {{
-      "start": <absolute seconds>,
-      "end": <absolute seconds>,
-      "chapter_title": "<short chapter>",
-      "priority": <integer 0-100>,
-      "continuity_importance": <integer 0-100>,
-      "required": <true or false>,
-      "role": "cold_open|setup|bridge|body|payoff",
-      "reason": "<short editorial reason>"
-    }}
-  ]
+  "youtube_description": "<description>",
+  "recommended_duration_seconds": <{target_min_seconds}-{target_max_seconds}>,
+  "duration_reason": "<brief reason based on content richness>",
+  "cold_open": {{
+    "id": "cold_open",
+    "start_unit_id": "u000001",
+    "end_unit_id": "u000003",
+    "title": "Cold Open",
+    "priority": 100,
+    "reason": "<why it hooks>",
+    "replay_in_body": false
+  }},
+  "chapters": [{{
+    "id": "chapter_01",
+    "title": "<short chapter title>",
+    "topic": "<topic>",
+    "priority": 85,
+    "reason": "<why this belongs>",
+    "spans": [{{
+      "id": "chapter_01_span_01",
+      "start_unit_id": "u000010",
+      "end_unit_id": "u000030"
+    }}]
+  }}]
+}}
+"""
+
+
+def longform_plan_rules(payload):
+    """Prompt rules that must agree with the deterministic quality gate.
+    LONGFORM_MIN_CHAPTERS=1 and LONGFORM_COLD_OPEN=0 are honoured here so the
+    prompt does not demand what the validator will then reject."""
+    try:
+        min_chapters = max(1, int(payload.get("min_chapters", 2) or 1))
+    except (TypeError, ValueError):
+        min_chapters = 2
+    if min_chapters > 1:
+        chapter_rule = (
+            f"- {min_chapters} distinct chapters are MANDATORY. A single-chapter plan is a\n"
+            "  one-topic compilation, not a best-of edit, and is rejected. If the source\n"
+            "  truly carries one subject, split it into its distinct parts (for example\n"
+            "  question/setup, development, conclusion) and give each its own chapter."
+        )
+    else:
+        chapter_rule = (
+            "- A single strong chapter is acceptable when the source truly carries one\n"
+            "  subject. Do not invent artificial splits only to raise the chapter count."
+        )
+    if payload.get("cold_open_enabled", True):
+        try:
+            cold_open_max = max(5, int(float(payload.get("cold_open_max_seconds", 15) or 15)))
+        except (TypeError, ValueError):
+            cold_open_max = 15
+        cold_open_rules = (
+            "COLD OPEN:\n"
+            f"- Prefer one self-contained 5-{cold_open_max} second highlight with a complete\n"
+            "  beginning and ending. Never end on a comma, conjunction, or unfinished\n"
+            "  question.\n"
+            "- Set `replay_in_body:true` only if removing those same units from the later\n"
+            "  chronological passage would damage its context. Otherwise choose a highlight\n"
+            "  outside the body spans so it is not duplicated."
+        )
+    else:
+        cold_open_rules = (
+            "COLD OPEN:\n"
+            "- Cold opens are disabled for this job. Return `cold_open:null` and start\n"
+            "  the video directly with the first chapter."
+        )
+    return {"chapter_rule": chapter_rule, "cold_open_rules": cold_open_rules}
+
+
+LONGFORM_REVIEW_PROMPT_TEMPLATE = """
+You are the independent final-cut editor. Review the proposed assembled video,
+not the source in isolation. Fix awkward openings, unfinished endings,
+unexplained references, duplicate teaser content, and unnatural transitions.
+
+REVIEW RULES:
+- Return only valid JSON matching the requested schema.
+- Keep the `id` of every surviving cold open/span unchanged. Each span may use
+  `start_unit_id` only from its own `start_candidate_units` and `end_unit_id`
+  only from its own `end_candidate_units` for that exact `segment_id` in
+  BOUNDARY_NEIGHBORHOODS_JSON. Never connect IDs from two segments or edges.
+- You may extend or contract a span to neighboring units, or drop a chapter
+  that cannot connect naturally. Never reorder body chapters.
+- Never drop a chapter merely to repair source order. Simple source-order
+  mistakes are normalized deterministically before this review. If remaining
+  chapter ranges interleave and cannot be fixed without changing selection,
+  reject the plan instead of deleting a strong topic.
+- If REPAIR_FEEDBACK contains `avoidable_chapter_drop:<id>`, keep that chapter
+  from DRAFT_PLAN and repair its boundaries/transitions. The application has
+  deliberately restored the last lossless plan for this retry.
+- The final plan must keep at least {min_chapters} chapters. Dropping a chapter
+  below that limit is not allowed; reject the plan instead. If REPAIR_FEEDBACK
+  reports `too_few_chapters`, regroup the EXISTING spans into at least
+  {min_chapters} chapters by giving each its own chapter object and title —
+  keep every span `id` and its unit boundaries unchanged. If the spans are not
+  thematically separable, return `approved:false`.
+- Retain as many strong distinct topics as possible, but drop a topic instead
+  of approving a confusing transition.
+- The final assembled duration must remain {target_min_seconds}-
+  {target_max_seconds} seconds, every body span must remain
+  {min_segment_seconds}-{max_segment_seconds} seconds, and the plan may contain
+  no more than {max_segments} body spans or {max_chapters} chapters.
+- Every opening must provide its question/setup; every ending must finish the
+  thought. A final video ending on words such as "dass", "und", or a comma is
+  always incomplete.
+- Audit EVERY segment separately. In each boundary neighborhood, compare
+  `current_start_unit_id` and `current_end_unit_id` with the surrounding units
+  in `start_candidate_units` and `end_candidate_units`. If material after the cut answers,
+  explains, qualifies, or resolves the selected claim, set
+  `continuation_needed:true` and do not approve that boundary. Punctuation by
+  itself never proves that a thought is complete.
+- A `best_pause` boundary can pass only when the surrounding language proves
+  the thought is complete.
+- Decide whether the cold open needs to replay later for comprehension. If
+  `replay_in_body:false`, its source units must not overlap the body.
+- Score the FINAL joins, after all revisions, from 0-100. Include exactly one
+  join object for each adjacent pair in the final assembled plan. Set
+  `context_complete:true` only when a viewer can follow the new passage without
+  missing information.
+- `approved:true` requires no critical issue, a complete ending, every join at
+  least 80, every segment boundary complete, and an honest overall score of at
+  least 85.
+
+FINAL_VERIFICATION_ONLY: {final_verification}
+When this is true, this is a fresh critic pass after a repair. Copy DRAFT_PLAN
+exactly into `plan`: do not alter IDs, boundaries, order, chapters, replay
+policy, title, or description. Do not drop anything. Only audit the repaired
+cut and reject it when any opening, ending, continuation, or join is weak.
+
+REPAIR_REQUIRED: {repair_required}
+REPAIR_FEEDBACK_JSON:
+{repair_feedback_json}
+
+TRANSCRIPT_LANGUAGE: {language}
+DRAFT_PLAN_JSON:
+{draft_plan_json}
+
+ASSEMBLED_AND_BOUNDARY_CONTEXT_JSON:
+{review_context_json}
+
+Return only:
+{{
+  "approved": true,
+  "overall_score": 90,
+  "ending_complete": true,
+  "critical_issues": [],
+  "dropped_chapter_ids": [],
+  "boundary_reviews": [{{
+    "segment_id": "span_id",
+    "opening_complete": true,
+    "ending_complete": true,
+    "continuation_needed": false,
+    "issue": ""
+  }}],
+  "joins": [{{
+    "id": "left_span_id->right_span_id",
+    "score": 90,
+    "context_complete": true,
+    "issue": ""
+  }}],
+  "plan": <the complete final LongformPlanV2 object>
 }}
 """
 
@@ -273,22 +479,55 @@ def _escape_invalid_unicode_escapes(text: str) -> str:
     return "".join(chars)
 
 
+def _require_json_object(value: object) -> dict:
+    if not isinstance(value, dict):
+        raise ValueError("Gemini response JSON root must be an object.")
+    return value
+
+
+def _validate_response_payload(mode: str, value: object) -> dict:
+    payload = _require_json_object(value)
+    schema = _RESPONSE_SCHEMAS[mode]
+    if hasattr(schema, "model_validate"):
+        validated = schema.model_validate(payload)
+    else:  # Pydantic v1 compatibility for older local installations.
+        validated = schema.parse_obj(payload)
+    return validated.model_dump() if hasattr(validated, "model_dump") else validated.dict()
+
+
 def _parse_json_response_text(text: str) -> dict:
     if not text:
         raise ValueError("Gemini returned an empty response body.")
-    candidate = _extract_json_candidate(text).replace("\x00", "").strip()
-    if not candidate:
+    cleaned = _strip_code_fences(text).replace("\x00", "").strip()
+    if not cleaned:
         raise ValueError("Gemini response did not contain a JSON object.")
-    parse_attempts = [candidate]
-    sanitized_candidate = _escape_invalid_unicode_escapes(candidate)
-    if sanitized_candidate != candidate:
-        parse_attempts.append(sanitized_candidate)
+
+    parse_attempts = [cleaned]
+    sanitized_cleaned = _escape_invalid_unicode_escapes(cleaned)
+    if sanitized_cleaned != cleaned:
+        parse_attempts.append(sanitized_cleaned)
     last_error: Optional[Exception] = None
     for parse_candidate in parse_attempts:
         try:
-            return json.loads(parse_candidate)
+            return _require_json_object(json.loads(parse_candidate))
         except json.JSONDecodeError as e:
             last_error = e
+
+    # Gemini occasionally wraps an otherwise valid object in prose. Recover
+    # that object only after the complete response failed JSON decoding. This
+    # preserves the true root type for valid arrays such as ``[{...}]`` so they
+    # cannot masquerade as an object by having their outer brackets trimmed.
+    candidate = _extract_json_candidate(cleaned).strip()
+    if candidate != cleaned:
+        recovery_attempts = [candidate]
+        sanitized_candidate = _escape_invalid_unicode_escapes(candidate)
+        if sanitized_candidate != candidate:
+            recovery_attempts.append(sanitized_candidate)
+        for parse_candidate in recovery_attempts:
+            try:
+                return _require_json_object(json.loads(parse_candidate))
+            except json.JSONDecodeError as e:
+                last_error = e
     raise ValueError(f"Failed to parse Gemini JSON response: {last_error}")
 
 
@@ -378,13 +617,13 @@ def _calculate_cost_analysis(response, model_name: str) -> Optional[dict]:
     }
 
 
-def _thinking_config_from_env(model_name: str):
-    """GEMINI_THINKING_SCORE: off (default) | low | high | <token budget>.
-
-    Applied only to the scoring stage. Gemini 3 models take thinking_level,
-    Gemini 2.5 takes thinking_budget; returns None (= model default) if the
-    setting is off or the SDK rejects the config."""
-    raw = (os.getenv("GEMINI_THINKING_SCORE") or "off").strip().lower()
+def _thinking_config_from_env(
+    model_name: str,
+    env_name: str = "GEMINI_THINKING_SCORE",
+    default: str = "off",
+):
+    """Build a model-compatible thinking config from one environment value."""
+    raw = (os.getenv(env_name) or default).strip().lower()
     if raw in ("", "off", "0", "none", "false"):
         return None
     try:
@@ -395,7 +634,7 @@ def _thinking_config_from_env(model_name: str):
                 return genai_types.ThinkingConfig(thinking_level=raw)
             return genai_types.ThinkingConfig(thinking_budget=2048 if raw == "low" else 8192)
     except Exception as e:
-        _log(f"⚠️ Ignoring GEMINI_THINKING_SCORE={raw!r}: {e}")
+        _log(f"⚠️ Ignoring {env_name}={raw!r}: {e}")
     return None
 
 
@@ -408,12 +647,14 @@ def _config_for_strategy(strategy: str, mode: str, model_name: str) -> genai_typ
         "response_mime_type": "application/json",
         "candidate_count": 1,
     }
-    if mode == "longform_plan":
+    if mode == "longform_plan_v2":
         kwargs["temperature"] = {
-            "structured-schema": 0.4,
-            "strict-json": 0.2,
-            "json-text-recovery": 0.1,
-        }.get(strategy, 0.2)
+            "structured-schema": 0.2,
+            "strict-json": 0.1,
+            "json-text-recovery": 0.0,
+        }.get(strategy, 0.1)
+    elif mode == "longform_review":
+        kwargs["temperature"] = 0.0
     elif strategy == "strict-json":
         kwargs["temperature"] = 0.7 if creative else 0.1
     elif strategy == "json-text-recovery":
@@ -422,13 +663,17 @@ def _config_for_strategy(strategy: str, mode: str, model_name: str) -> genai_typ
         kwargs["temperature"] = 0.9 if creative else 0.2
 
     if strategy == "structured-schema":
-        kwargs["response_schema"] = {
-            "detail": DetailResponse,
-            "score": ScoreResponse,
-            "longform_plan": LongformPlanResponse,
-        }[mode]
+        kwargs["response_schema"] = _RESPONSE_SCHEMAS[mode]
         if mode == "score":
             thinking = _thinking_config_from_env(model_name)
+            if thinking is not None:
+                kwargs["thinking_config"] = thinking
+        elif mode in {"longform_plan_v2", "longform_review"}:
+            thinking = _thinking_config_from_env(
+                model_name,
+                env_name="GEMINI_THINKING_LONGFORM",
+                default="low",
+            )
             if thinking is not None:
                 kwargs["thinking_config"] = thinking
     return genai_types.GenerateContentConfig(**kwargs)
@@ -438,7 +683,11 @@ def main() -> int:
     _configure_stdio()
 
     parser = argparse.ArgumentParser(description="Run one Gemini request for clip or long-form analysis.")
-    parser.add_argument("--mode", choices=["score", "detail", "longform_plan"], required=True)
+    parser.add_argument(
+        "--mode",
+        choices=["score", "detail", "longform_plan_v2", "longform_review"],
+        required=True,
+    )
     parser.add_argument("--input", dest="input_path", required=True)
     parser.add_argument("--output", dest="output_path", required=True)
     parser.add_argument("--strategy", default="structured-schema")
@@ -460,19 +709,31 @@ def main() -> int:
     template = {
         "score": SCORE_PROMPT_TEMPLATE,
         "detail": DETAIL_PROMPT_TEMPLATE,
-        "longform_plan": LONGFORM_PLAN_PROMPT_TEMPLATE,
+        "longform_plan_v2": LONGFORM_PLAN_V2_PROMPT_TEMPLATE,
+        "longform_review": LONGFORM_REVIEW_PROMPT_TEMPLATE,
     }[args.mode]
     prompt = template.format(
         video_duration=payload["video_duration"],
         language=language,
-        windows_json=json.dumps(payload["windows"], ensure_ascii=False),
+        windows_json=json.dumps(payload.get("windows", []), ensure_ascii=False),
+        blocks_json=json.dumps(payload.get("blocks", []), ensure_ascii=False),
+        draft_plan_json=json.dumps(payload.get("draft_plan", {}), ensure_ascii=False),
+        review_context_json=json.dumps(payload.get("review_context", {}), ensure_ascii=False),
+        repair_required=str(bool(payload.get("repair_required"))).lower(),
+        final_verification=str(bool(payload.get("final_verification"))).lower(),
+        repair_feedback_json=json.dumps(payload.get("repair_feedback", []), ensure_ascii=False),
         target_min_seconds=payload.get("target_min_seconds", 480),
         target_max_seconds=payload.get("target_max_seconds", 600),
         min_segment_seconds=payload.get("min_segment_seconds", 20),
         max_segment_seconds=payload.get("max_segment_seconds", 240),
+        max_segments=payload.get("max_segments", 12),
+        max_chapters=payload.get("max_chapters", 6),
+        min_chapters=payload.get("min_chapters", 2),
+        **longform_plan_rules(payload),
     )
 
-    _log(f"🤖 Gemini worker request: mode={args.mode} strategy={args.strategy} model={model_name} items={len(payload.get('windows', []))}")
+    item_count = len(payload.get("windows") or payload.get("blocks") or [])
+    _log(f"🤖 Gemini worker request: mode={args.mode} strategy={args.strategy} model={model_name} items={item_count}")
     try:
         response = client.models.generate_content(
             model=model_name,
@@ -505,6 +766,7 @@ def main() -> int:
             parsed = parsed_obj.model_dump() if hasattr(parsed_obj, "model_dump") else parsed_obj
         else:
             parsed = _parse_json_response_text(raw_text)
+        parsed = _validate_response_payload(args.mode, parsed)
     except Exception as exc:
         block_reason = diagnostics.get("prompt_feedback", {}).get("block_reason")
         explicitly_blocked = bool(block_reason and "UNSPECIFIED" not in block_reason.upper())
