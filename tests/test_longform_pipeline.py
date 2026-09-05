@@ -1766,7 +1766,8 @@ def test_local_scene_detection_never_decodes_more_than_its_bounded_window(monkey
     monkeypatch.setattr(main.cv2, "VideoCapture", lambda _path: capture)
     monkeypatch.setattr(main.cv2, "cvtColor", lambda frame, _mode: frame)
     monkeypatch.setattr(main.cv2, "absdiff", lambda _left, _right: 0)
-    monkeypatch.setattr(main.np, "mean", lambda _value: 0.0)
+    # CI stubs numpy without "mean"; raising=False lets the patch apply there too.
+    monkeypatch.setattr(main.np, "mean", lambda _value: 0.0, raising=False)
     monkeypatch.setattr(main, "LONGFORM_SCENE_SCAN_MAX_SECONDS", 1.5)
     monkeypatch.setattr(main, "LONGFORM_SCENE_CUT_THRESHOLD", 0.0)
 
