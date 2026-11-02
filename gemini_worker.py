@@ -629,10 +629,12 @@ def _thinking_config_from_env(
     try:
         if raw.isdigit():
             return genai_types.ThinkingConfig(thinking_budget=int(raw))
-        if raw in ("low", "high"):
+        if raw in ("low", "medium", "high"):
             if model_name.startswith("gemini-3"):
                 return genai_types.ThinkingConfig(thinking_level=raw)
-            return genai_types.ThinkingConfig(thinking_budget=2048 if raw == "low" else 8192)
+            return genai_types.ThinkingConfig(
+                thinking_budget={"low": 2048, "medium": 4096, "high": 8192}[raw],
+            )
     except Exception as e:
         _log(f"⚠️ Ignoring {env_name}={raw!r}: {e}")
     return None
