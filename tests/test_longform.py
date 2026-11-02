@@ -632,3 +632,15 @@ def test_plan_shorter_than_eight_minutes_is_flagged_by_default():
     resolved = longform.resolve_unit_plan(_v2_plan(second_chapter=True), units)
     assert "result_below_adaptive_minimum" in resolved["validation_issues"]
     assert resolved["target_min_seconds"] == 480
+
+
+def test_segment_cut_places_input_args_before_input_and_uses_given_video_args():
+    nvenc = ["-c:v", "h264_nvenc", "-cq", "19", "-pix_fmt", "yuv420p"]
+    command = longform.segment_cut_command(
+        "src.mp4", 10, 40, "seg.mp4", video_args=nvenc, input_args=["-hwaccel", "cuda"],
+    )
+    assert command[:4] == ["ffmpeg", "-y", "-hwaccel", "cuda"]
+    assert command.index("-hwaccel") < command.index("-ss") < command.index("-i")
+    assert command[command.index("-t") + 1] == "30.000"
+    assert command.index("-map") < command.index("h264_nvenc")
+    assert "libx264" not in command

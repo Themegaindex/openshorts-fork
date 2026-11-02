@@ -185,3 +185,39 @@ def test_animated_hook_is_visible_in_rendered_pixels(tmp_path):
         "-of", "csv=p=0", str(out),
     ], check=True, capture_output=True, text=True).stdout.strip()
     assert abs(float(probe) - 2.0) < 0.2
+
+
+def test_nvenc_layer_command_keeps_filters_and_flags():
+    nvenc_args = ["-c:v", "h264_nvenc", "-preset", "p7", "-cq", "21", "-b:v", "0", "-pix_fmt", "yuv420p"]
+    cmd = build_layer_command("in.mp4", "out.mp4", subtitle_filter="ass='s.ass'",
+                              hook_png="h.png", hook_x=10, hook_y=20, video_args=nvenc_args)
+    assert "-sws_flags" in cmd
+    fc = cmd[cmd.index("-filter_complex") + 1]
+    assert "format=yuv444p" in fc and fc.endswith(",format=yuv420p[vout]")
+    assert cmd[cmd.index("-c:a") + 1] == "copy"
+    assert "h264_nvenc" in cmd and "-cq" in cmd
+    assert cmd[-3:] == ["-movflags", "+faststart", "out.mp4"]
+
+
+def test_burn_layers_falls_back_to_x264_when_nvenc_fails(monkeypatch, tmp_path):
+    import subtitles
+    import video_encoding
+
+    monkeypatch.setenv("VIDEO_ENCODER", "auto")
+    monkeypatch.setattr(video_encoding, "_run_probe", lambda _profile: True)
+    video_encoding.reset_state()
+    out = tmp_path / "out.mp4"
+    commands = []
+
+    def fake_run(command, **_kwargs):
+        commands.append(command)
+        if "h264_nvenc" in command:
+            raise subprocess.CalledProcessError(1, command, stderr=b"OpenEncodeSessionEx failed")
+        out.write_bytes(b"x" * 4096)
+
+    monkeypatch.setattr(subtitles.subprocess, "run", fake_run)
+    assert subtitles.burn_layers("in.mp4", str(out), hook_png="h.png") is True
+    assert ["h264_nvenc" in c for c in commands] == [True, False]
+    assert commands[1][commands[1].index("-c:v") + 1:commands[1].index("-c:v") + 5] == [
+        "libx264", "-preset", "fast", "-crf",
+    ]

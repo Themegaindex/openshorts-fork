@@ -44,6 +44,7 @@ import json
 import shutil
 from typing import List, Optional
 import longform
+import video_encoding
 import whisper_runtime
 from youtube_download import (
     YouTubeDownloadError, open_youtube_dl, youtube_auth_attempts,
@@ -2128,31 +2129,45 @@ def _finalize_clip_passthrough(input_video, final_output_video, progress_callbac
         progress_callback(5.0, "Finalizing clip without reframing...")
 
     wm_png = None
+    width = height = None
     if WATERMARK_ENABLED:
         try:
-            width, _height = get_video_resolution(input_video)
+            width, height = get_video_resolution(input_video)
             wm_png = f"{os.path.splitext(final_output_video)[0]}_wm.png"
             _render_watermark_rgba(width).save(wm_png)
         except Exception as e:
             print(f"⚠️ Watermark skipped (render failed): {e}")
             wm_png = None
 
-    if wm_png:
-        command = [
-            'ffmpeg', '-y', '-i', input_video, '-i', wm_png,
+    def _build_watermarked(attempt):
+        return [
+            'ffmpeg', '-y', *attempt.input_args, '-i', input_video, '-i', wm_png,
             '-filter_complex',
             f'[0:v][1:v]overlay=(W-w)/2:(H-h)/2:format=auto,{EVEN_PAD_FILTER}',
-            '-c:v', 'libx264', '-preset', 'fast', '-crf', '20', '-pix_fmt', 'yuv420p',
+            *attempt.video_args, '-pix_fmt', 'yuv420p',
             '-c:a', 'copy', '-movflags', '+faststart', final_output_video,
-        ]
-    else:
-        command = [
-            'ffmpeg', '-y', '-i', input_video,
-            '-c', 'copy', '-movflags', '+faststart', final_output_video,
         ]
 
     try:
-        subprocess.run(command, check=True, stdout=subprocess.DEVNULL, stderr=subprocess.PIPE, timeout=1800)
+        if wm_png:
+            video_encoding.run_encode(
+                _build_watermarked,
+                tier=video_encoding.FINAL,
+                label="Watermark finalize",
+                output_path=final_output_video,
+                source=input_video,
+                width=width,
+                height=height,
+                warn=JOB_REPORTER.warning,
+                stdout=subprocess.DEVNULL,
+                stderr=subprocess.PIPE,
+                timeout=1800,
+            )
+        else:
+            subprocess.run(
+                ['ffmpeg', '-y', '-i', input_video, '-c', 'copy', '-movflags', '+faststart', final_output_video],
+                check=True, stdout=subprocess.DEVNULL, stderr=subprocess.PIPE, timeout=1800,
+            )
     except subprocess.TimeoutExpired:
         print("\n   ❌ Passthrough finalize timed out after 1800s.")
         return False
@@ -2214,9 +2229,13 @@ def _full_render_filename(output_dir, video_title, output_format):
     return os.path.join(output_dir, f"{video_title}_{suffix}.mp4")
 
 
-def process_video_to_vertical(input_video, final_output_video, progress_callback=None, aspect_ratio=ASPECT_RATIO, layout_style="smart"):
+def process_video_to_vertical(input_video, final_output_video, progress_callback=None, aspect_ratio=ASPECT_RATIO,
+                              layout_style="smart", video_encoder=None):
     """
     Core logic to convert horizontal video to vertical using scene detection and Active Speaker Tracking (MediaPipe).
+
+    video_encoder="x264" forces the CPU encoder; it is used to redo a clip
+    whose GPU encoder died mid-stream.
     """
     script_start_time = time.time()
 
@@ -2332,14 +2351,15 @@ def process_video_to_vertical(input_video, final_output_video, progress_callback
     if progress_callback:
         progress_callback(20.0, "Processing video frames...")
     
-    command = [
-        'ffmpeg', '-y', '-nostats', '-loglevel', 'error',
-        '-f', 'rawvideo', '-vcodec', 'rawvideo',
-        '-s', f'{OUTPUT_WIDTH}x{OUTPUT_HEIGHT}', '-pix_fmt', 'bgr24',
-        '-r', str(fps), '-i', '-', '-c:v', 'libx264',
-        '-preset', 'fast', '-crf', '23', '-pix_fmt', 'yuv420p',
-        '-an', temp_video_output
-    ]
+    # The size check and the cached NVENC probe run before any frame is made.
+    encode_attempt = video_encoding.encode_attempts(
+        video_encoding.REFRAME, width=OUTPUT_WIDTH, height=OUTPUT_HEIGHT, encoder=video_encoder,
+    )[0]
+    command = video_encoding.reframe_pipe_command(
+        OUTPUT_WIDTH, OUTPUT_HEIGHT, fps, temp_video_output, video_args=encode_attempt.video_args,
+    )
+    encoder_died = False
+    encode_started = time.monotonic()
 
     ffmpeg_process = subprocess.Popen(command, stdin=subprocess.PIPE, stdout=subprocess.DEVNULL, stderr=subprocess.PIPE)
 
@@ -2467,14 +2487,22 @@ def process_video_to_vertical(input_video, final_output_video, progress_callback
             if watermark is not None:
                 output_frame = _apply_watermark(output_frame, watermark)
 
-            ffmpeg_process.stdin.write(output_frame.tobytes())
+            try:
+                ffmpeg_process.stdin.write(output_frame.tobytes())
+            except OSError:
+                # POSIX raises BrokenPipeError, Windows EINVAL: the encoder exited.
+                encoder_died = True
+                break
             frame_number += 1
             if progress_callback and (time.time() - last_progress_emit >= 2.0 or frame_number == total_frames):
                 frame_progress = 20.0 + (70.0 * (frame_number / max(total_frames, 1)))
                 progress_callback(frame_progress, f"Processing video frames... {frame_number}/{total_frames}")
                 last_progress_emit = time.time()
 
-        ffmpeg_process.stdin.close()
+        try:
+            ffmpeg_process.stdin.close()
+        except OSError:
+            encoder_died = True
         ffmpeg_process.wait()
     finally:
         cap.release()
@@ -2490,10 +2518,28 @@ def process_video_to_vertical(input_video, final_output_video, progress_callback
 
     print(f"   🎥 Artificial camera switches: {artificial_switches}")
 
-    if ffmpeg_process.returncode != 0:
+    if ffmpeg_process.returncode != 0 or encoder_died:
+        if encode_attempt.encoder == "nvenc":
+            reason = video_encoding.short_reason(stderr_output or f"exit code {ffmpeg_process.returncode}")
+            video_encoding.note_nvenc_failure(reason)
+            JOB_REPORTER.warning(
+                f"GPU encoder failed after {frame_number} frames ({reason}); "
+                "rendering the clip again with libx264.",
+                category="render",
+            )
+            _remove_quietly(temp_video_output)
+            if progress_callback:
+                progress_callback(20.0, "GPU encoder failed - re-rendering on the CPU...")
+            return process_video_to_vertical(
+                input_video, final_output_video, progress_callback,
+                aspect_ratio=aspect_ratio, layout_style=layout_style, video_encoder="x264",
+            )
         print("\n   ❌ FFmpeg frame processing failed.")
         print("   Stderr:", stderr_output)
         return False
+    if encode_attempt.encoder == "nvenc":
+        video_encoding.note_nvenc_success()
+    print(f"   🎞️ Reframe encode: {encode_attempt.label}, frames + encode {time.monotonic() - encode_started:.1f}s")
 
     print("\n   🔊 Step 5: Extracting audio...")
     if progress_callback:
@@ -3924,15 +3970,12 @@ def _render_shorts_clips(
             important=True,
             category="render",
         )
-        cut_command = [
-            "ffmpeg", "-y",
-            "-ss", str(start),
-            "-to", str(end),
-            "-i", input_video,
-            "-c:v", "libx264", "-crf", "18", "-preset", "fast",
-            "-c:a", "aac",
-            clip_temp_path,
-        ]
+        def _build_cut(attempt, start=start, end=end, output_path=clip_temp_path):
+            return video_encoding.clip_cut_command(
+                input_video, start, end, output_path,
+                video_args=attempt.video_args, input_args=attempt.input_args,
+            )
+
         try:
             with JOB_REPORTER.operation(
                 f"FFmpeg clip cut {i + 1}/{total_clips}",
@@ -3940,11 +3983,17 @@ def _render_shorts_clips(
                 message=f"Cutting clip {i + 1}/{total_clips}.",
                 category="render",
             ):
-                subprocess.run(
-                    cut_command,
+                # GPU decode + GPU encode, then GPU encode only, then libx264.
+                video_encoding.run_encode(
+                    _build_cut,
+                    tier=video_encoding.HIGH,
+                    label=f"Clip cut {i + 1}/{total_clips}",
+                    output_path=clip_temp_path,
+                    source=input_video,
+                    gpu_frames=True,
+                    warn=JOB_REPORTER.warning,
                     stdout=subprocess.DEVNULL,
                     stderr=subprocess.PIPE,
-                    check=True,
                     timeout=BLOCKING_OPERATION_STALL_SECONDS,
                 )
         except subprocess.TimeoutExpired:
@@ -4211,33 +4260,59 @@ def _render_longform_video(
     manifest_path = os.path.join(output_dir, f"temp_{video_title}_long_concat.txt")
     joined_path = os.path.join(output_dir, f"temp_{video_title}_long_joined.mp4")
     final_path = os.path.join(output_dir, f"{video_title}_long_1.mp4")
-    completed = 0.0
-
-    for index, (segment, segment_path) in enumerate(zip(segments, temp_segments), start=1):
-        segment_duration = max(0.001, float(segment["end"]) - float(segment["start"]))
-        progress = float(weight_done_before) + (completed * 0.90)
-        JOB_REPORTER.progress(
-            (progress / combined_weight) * 100.0,
-            message=f"Cutting long-form segment {index}/{len(segments)}",
-            important=True,
-            category="render",
-        )
-        command = longform.segment_cut_command(
-            input_video,
-            segment["start"],
-            segment["end"],
-            segment_path,
-            fade_seconds=LONGFORM_AUDIO_FADE_SECONDS,
-            filter_complex=filter_complex,
-        )
-        with JOB_REPORTER.operation(
-            f"FFmpeg long-form cut {index}/{len(segments)}",
-            timeout_seconds=BLOCKING_OPERATION_STALL_SECONDS,
-            message=f"Encoding long-form segment {index}/{len(segments)}.",
-            category="render",
-        ):
-            _run_checked_ffmpeg(command, label=f"Long-form segment {index}")
-        completed += segment_duration
+    # One encoder for every segment: the join stream-copies the video, and
+    # mixed NVENC/libx264 segments (different SPS/PPS) would break the file.
+    # A failure therefore re-encodes ALL segments with the next attempt.
+    attempts = video_encoding.encode_attempts(video_encoding.HIGH, source=input_video, gpu_frames=False)
+    for attempt_index, attempt in enumerate(attempts):
+        completed = 0.0
+        try:
+            for index, (segment, segment_path) in enumerate(zip(segments, temp_segments), start=1):
+                segment_duration = max(0.001, float(segment["end"]) - float(segment["start"]))
+                progress = float(weight_done_before) + (completed * 0.90)
+                JOB_REPORTER.progress(
+                    (progress / combined_weight) * 100.0,
+                    message=f"Cutting long-form segment {index}/{len(segments)}",
+                    important=True,
+                    category="render",
+                )
+                command = longform.segment_cut_command(
+                    input_video,
+                    segment["start"],
+                    segment["end"],
+                    segment_path,
+                    fade_seconds=LONGFORM_AUDIO_FADE_SECONDS,
+                    filter_complex=filter_complex,
+                    video_args=attempt.video_args,
+                    input_args=attempt.input_args,
+                )
+                with JOB_REPORTER.operation(
+                    f"FFmpeg long-form cut {index}/{len(segments)}",
+                    timeout_seconds=BLOCKING_OPERATION_STALL_SECONDS,
+                    message=f"Encoding long-form segment {index}/{len(segments)}.",
+                    category="render",
+                ):
+                    _run_checked_ffmpeg(command, label=f"Long-form segment {index}")
+                completed += segment_duration
+        except RuntimeError as exc:
+            if attempt_index == len(attempts) - 1 or "timed out" in str(exc):
+                raise
+            if attempt.input_args:
+                video_encoding.mark_source_cpu_decode(input_video)
+            else:
+                video_encoding.note_nvenc_failure(str(exc))
+            JOB_REPORTER.warning(
+                f"Long-form segment {index} failed with {attempt.label} "
+                f"({video_encoding.short_reason(str(exc))}); re-encoding every segment with "
+                f"{attempts[attempt_index + 1].label} so the join stays valid.",
+                category="render",
+            )
+            _cleanup_render_temp_files(temp_segments)
+            continue
+        if attempt.encoder == "nvenc":
+            video_encoding.note_nvenc_success()
+        print(f"   🎞️ Long-form segments encoded with {attempt.label}")
+        break
 
     _save_text_file(manifest_path, longform.concat_manifest_text(temp_segments))
     JOB_REPORTER.progress(

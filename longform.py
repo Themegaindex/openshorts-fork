@@ -16,6 +16,7 @@ import re
 from typing import Iterable, Optional
 
 from clip_selection import snap_clip_to_words
+import video_encoding
 
 
 TARGET_ASPECT_RATIO = 16 / 9
@@ -974,13 +975,17 @@ def segment_cut_command(
     fade_seconds=0.01,
     *,
     filter_complex: Optional[str] = None,
+    video_args=None,
+    input_args=(),
 ) -> list[str]:
     start_value = max(0.0, float(start))
     duration = max(0.001, float(end) - start_value)
     fade = min(max(0.0, float(fade_seconds)), duration / 4.0)
     fade_out_start = max(0.0, duration - fade)
+    if video_args is None:
+        video_args = video_encoding.video_encode_args(video_encoding.HIGH)
     command = [
-        "ffmpeg", "-y", "-ss", f"{start_value:.3f}", "-i", os.fspath(input_video),
+        "ffmpeg", "-y", *input_args, "-ss", f"{start_value:.3f}", "-i", os.fspath(input_video),
         "-t", f"{duration:.3f}",
     ]
     if filter_complex:
@@ -989,10 +994,7 @@ def segment_cut_command(
         # An exact 16:9 pixel raster can still carry a non-square sample aspect
         # ratio.  Reset SAR so the delivered display canvas is genuinely 16:9.
         command.extend(["-map", "0:v:0", "-map", "0:a?", "-vf", "setsar=1"])
-    command.extend([
-        "-c:v", "libx264", "-crf", "18", "-preset", "fast", "-pix_fmt", "yuv420p",
-        "-c:a", "aac",
-    ])
+    command.extend([*video_args, "-pix_fmt", "yuv420p", "-c:a", "aac"])
     if fade > 0:
         command.extend([
             "-af", f"afade=t=in:st=0:d={fade:.3f},afade=t=out:st={fade_out_start:.3f}:d={fade:.3f}",

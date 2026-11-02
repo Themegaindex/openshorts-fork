@@ -2144,3 +2144,38 @@ def test_type_pipeline_keeps_earlier_stats_exclusions(monkeypatch, tmp_path):
 
     _metadata, reporter = _run_auto_with_both_outputs(monkeypatch, tmp_path, render_shorts, render_long)
     assert {"transcribe", "analyze", "render"} <= reporter.stats_excluded_phases
+
+
+def test_longform_nvenc_failure_rerenders_all_segments_with_x264(monkeypatch, tmp_path):
+    import video_encoding
+
+    reporter = _Reporter()
+    commands = []
+    monkeypatch.setattr(main, "JOB_REPORTER", reporter)
+    monkeypatch.setattr(main, "get_video_resolution", lambda _path: (640, 480))
+    nvenc = video_encoding.EncodeAttempt("nvenc", ("-c:v", "h264_nvenc", "-cq", "19", "-pix_fmt", "yuv420p"))
+    x264 = video_encoding.EncodeAttempt("x264", tuple(video_encoding._X264_ARGS[video_encoding.HIGH]))
+    monkeypatch.setattr(main.video_encoding, "encode_attempts", lambda *_a, **_k: [nvenc, x264])
+    monkeypatch.setattr(main.video_encoding, "note_nvenc_failure", lambda _reason: None)
+
+    def fake_ffmpeg(command, **kwargs):
+        commands.append(command)
+        if "h264_nvenc" in command and kwargs.get("label") == "Long-form segment 2":
+            raise RuntimeError("Long-form segment 2 failed: OpenEncodeSessionEx failed")
+
+    monkeypatch.setattr(main, "_run_checked_ffmpeg", fake_ffmpeg)
+
+    def finalize(_input, output, _progress):
+        with open(output, "wb") as handle:
+            handle.write(b"video")
+        return True
+
+    monkeypatch.setattr(main, "_finalize_clip_passthrough", finalize)
+    plan = {"total_duration": 90, "segments": [
+        {"start": 10, "end": 40}, {"start": 80, "end": 110}, {"start": 200, "end": 230},
+    ]}
+    main._render_longform_video(plan, "source.mp4", str(tmp_path), "Video", total_weight=90)
+
+    encoders = ["nvenc" if "h264_nvenc" in c else "x264" if "libx264" in c else "copy" for c in commands]
+    assert encoders == ["nvenc", "nvenc", "x264", "x264", "x264", "copy"]
+    assert any(e[0] == "warning" and "re-encoding every segment" in e[1][0] for e in reporter.events)
