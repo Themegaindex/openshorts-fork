@@ -1704,6 +1704,9 @@ def test_single_chapter_draft_is_rejected_when_the_repair_keeps_one_topic(monkey
 def test_longform_rejects_only_after_failed_repair_retry(monkeypatch, tmp_path):
     reporter = _Reporter()
     monkeypatch.setattr(main, "JOB_REPORTER", reporter)
+    # main.py loads the project .env at import; pin the budget so a local
+    # LONGFORM_REVIEW_REPAIR_RETRIES override cannot change this test.
+    monkeypatch.setattr(main, "LONGFORM_REVIEW_REPAIR_RETRIES", 1)
     monkeypatch.setenv("GEMINI_API_KEY", "test")
     raw_plan = _v2_raw_plan()
     review_calls = 0
@@ -1828,3 +1831,115 @@ def test_scene_alignment_reverts_when_a_segment_would_become_too_short(monkeypat
     assert refined["segments"][0]["start"] == 10.0
     assert refined["segments"][0]["end"] == 30.0
     assert "segment_duration:span_01" in refined["local_scene_alignment"]["revert_reasons"]
+
+
+def test_final_review_verdict_via_viable_flag_is_not_a_plan_mutation(monkeypatch, tmp_path):
+    """Regression: the read-only critic copied the plan exactly but set
+    viable=false to express its verdict; the gate treated that as a mutation."""
+    reporter = _Reporter()
+    monkeypatch.setattr(main, "JOB_REPORTER", reporter)
+    monkeypatch.setenv("GEMINI_API_KEY", "test")
+    raw_plan = _v2_raw_plan()
+
+    def fake_worker(mode, payload, **_kwargs):
+        if mode == "longform_plan_v2":
+            return {"payload": raw_plan, "cost_analysis": None}
+        if payload.get("final_verification"):
+            review = _v2_review(raw_plan, approved=True, score=93)
+            review["plan"] = {**copy.deepcopy(raw_plan), "viable": False}
+            return {"payload": review, "cost_analysis": None}
+        if payload.get("repair_required"):
+            return {"payload": _v2_review(raw_plan, approved=True, score=92), "cost_analysis": None}
+        return {"payload": _v2_review(raw_plan, approved=False, score=70), "cost_analysis": None}
+
+    monkeypatch.setattr(main, "_call_gemini_worker", fake_worker)
+    result = main.get_longform_plan(
+        _v2_word_transcript(), 360, output_dir=str(tmp_path), video_title="Video",
+        windows=[{"id": "window_001", "start": 0, "end": 360, "text": "text"}],
+        scored_windows=[{"id": "window_001", "start": 0, "end": 360, "score": 90, "reason": "strong"}],
+    )
+
+    assert result["error"] is None
+    assert result["plan_data"]["viable"] is True
+    assert "final_review_mutated_plan" not in (result["plan_data"].get("warnings") or [])
+
+
+def test_failed_final_review_spends_the_remaining_repair_budget(monkeypatch, tmp_path):
+    """With two repairs allowed, a critic rejection after the first repair
+    drives a second repair instead of failing the job outright."""
+    reporter = _Reporter()
+    monkeypatch.setattr(main, "JOB_REPORTER", reporter)
+    monkeypatch.setattr(main, "LONGFORM_REVIEW_REPAIR_RETRIES", 2)
+    monkeypatch.setenv("GEMINI_API_KEY", "test")
+    raw_plan = _v2_raw_plan()
+    calls = []
+
+    def fake_worker(mode, payload, **_kwargs):
+        calls.append((mode, bool(payload.get("repair_required")), bool(payload.get("final_verification"))))
+        if mode == "longform_plan_v2":
+            return {"payload": raw_plan, "cost_analysis": None}
+        verifications = sum(1 for c in calls if c[2])
+        if payload.get("final_verification"):
+            if verifications == 1:
+                rejected = _v2_review(raw_plan, approved=False, score=72)
+                rejected["critical_issues"] = ["Abrupter Themenwechsel"]
+                return {"payload": rejected, "cost_analysis": None}
+            return {"payload": _v2_review(raw_plan, approved=True, score=95), "cost_analysis": None}
+        if payload.get("repair_required"):
+            assert payload.get("repair_feedback"), "repair must receive the critic's feedback"
+            return {"payload": _v2_review(raw_plan, approved=True, score=92), "cost_analysis": None}
+        return {"payload": _v2_review(raw_plan, approved=False, score=70), "cost_analysis": None}
+
+    monkeypatch.setattr(main, "_call_gemini_worker", fake_worker)
+    result = main.get_longform_plan(
+        _v2_word_transcript(), 360, output_dir=str(tmp_path), video_title="Video",
+        windows=[{"id": "window_001", "start": 0, "end": 360, "text": "text"}],
+        scored_windows=[{"id": "window_001", "start": 0, "end": 360, "score": 90, "reason": "strong"}],
+    )
+
+    assert result["error"] is None
+    assert result["plan_data"]["viable"] is True
+    assert calls == [
+        ("longform_plan_v2", False, False),
+        ("longform_review", False, False),
+        ("longform_review", True, False),
+        ("longform_review", False, True),
+        ("longform_review", True, False),
+        ("longform_review", False, True),
+    ]
+    assert result["plan_data"]["editorial_review"]["final_verification_attempted"] is True
+    names = {p.name for p in tmp_path.glob("*.json")}
+    assert any(n.endswith("_longform_repair_v2_2.json") for n in names)
+    assert any(n.endswith("_longform_final_review_v2_2.json") for n in names)
+
+
+def test_failed_final_review_still_fails_when_no_repair_budget_is_left(monkeypatch, tmp_path):
+    reporter = _Reporter()
+    monkeypatch.setattr(main, "JOB_REPORTER", reporter)
+    monkeypatch.setattr(main, "LONGFORM_REVIEW_REPAIR_RETRIES", 1)
+    monkeypatch.setenv("GEMINI_API_KEY", "test")
+    raw_plan = _v2_raw_plan()
+    calls = []
+
+    def fake_worker(mode, payload, **_kwargs):
+        calls.append((mode, bool(payload.get("repair_required")), bool(payload.get("final_verification"))))
+        if mode == "longform_plan_v2":
+            return {"payload": raw_plan, "cost_analysis": None}
+        if payload.get("final_verification"):
+            rejected = _v2_review(raw_plan, approved=False, score=40)
+            rejected["critical_issues"] = ["Abrupter Themenwechsel"]
+            return {"payload": rejected, "cost_analysis": None}
+        if payload.get("repair_required"):
+            return {"payload": _v2_review(raw_plan, approved=True, score=92), "cost_analysis": None}
+        return {"payload": _v2_review(raw_plan, approved=False, score=70), "cost_analysis": None}
+
+    monkeypatch.setattr(main, "_call_gemini_worker", fake_worker)
+    result = main.get_longform_plan(
+        _v2_word_transcript(), 360, output_dir=str(tmp_path), video_title="Video",
+        windows=[{"id": "window_001", "start": 0, "end": 360, "text": "text"}],
+        scored_windows=[{"id": "window_001", "start": 0, "end": 360, "score": 90, "reason": "strong"}],
+    )
+
+    assert result["error"] is not None
+    assert len([c for c in calls if c[1]]) == 1
+    assert "critical_review_issue" in result["plan_data"]["editorial_review"]["gate_issues"]

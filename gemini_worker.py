@@ -376,6 +376,13 @@ REVIEW RULES:
   thematically separable, return `approved:false`.
 - Retain as many strong distinct topics as possible, but drop a topic instead
   of approving a confusing transition.
+- This is a chronological best-of of DISTINCT topics: a change of topic at a
+  chapter boundary is expected and is never a weak join by itself. Score a
+  join on the cut, not on thematic continuity. The left segment must end on a
+  complete thought and the right segment must open with its own question or
+  setup, so a viewer can follow it without the skipped material. Treat
+  "unrelated topics" as a defect only when the right segment depends on
+  context the viewer never saw.
 - The final assembled duration must remain {target_min_seconds}-
   {target_max_seconds} seconds, every body span must remain
   {min_segment_seconds}-{max_segment_seconds} seconds, and the plan may contain

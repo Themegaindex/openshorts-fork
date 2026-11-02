@@ -3290,6 +3290,12 @@ def get_viral_clips(
     }
 
 
+def _plan_without_verdict(plan):
+    if not isinstance(plan, dict):
+        return plan
+    return {key: value for key, value in plan.items() if key != "viable"}
+
+
 def _longform_target_range(video_duration):
     duration = max(0.0, float(video_duration))
     target_max = min(float(LONGFORM_TARGET_MAX_SECONDS), duration)
@@ -3702,7 +3708,9 @@ def get_longform_plan(
         verification_issues = []
         if final_verification:
             reviewed_plan = current_plan
-            if review.get("plan") != current_raw_plan:
+            # The read-only critic may express its verdict via viable=false;
+            # only changed IDs/boundaries/copy count as a mutation.
+            if _plan_without_verdict(review.get("plan")) != _plan_without_verdict(current_raw_plan):
                 verification_issues.append("final_review_mutated_plan")
         else:
             try:
@@ -3764,38 +3772,46 @@ def get_longform_plan(
         )
 
     repair_attempted = False
+    repairs_used = 0
+    final_verification_attempted = False
+    verification_rounds = 0
     current_raw = raw_plan
     current_plan = draft
     if review_state_is_usable(review, final_plan, gate_issues):
         current_raw = review["plan"]
         current_plan = final_plan
-    for repair_index in range(LONGFORM_REVIEW_REPAIR_RETRIES):
-        if not gate_issues:
+    while True:
+        # Spend the repair budget while the gate still reports issues.
+        while gate_issues and repairs_used < LONGFORM_REVIEW_REPAIR_RETRIES:
+            repairs_used += 1
+            repair_attempted = True
+            JOB_REPORTER.warning(
+                "Long-form quality gate requested one focused Gemini repair pass.",
+                category="analyze",
+                gate_issues=gate_issues,
+            )
+            review, final_plan, gate_issues = review_once(
+                current_raw,
+                current_plan,
+                repair_required=True,
+                repair_feedback=gate_issues,
+                suffix=f"repair_{repairs_used}",
+            )
+            _save_json_checkpoint(output_dir, video_title, f"longform_repair_v2_{repairs_used}", {
+                "review": review,
+                "gate_issues": gate_issues,
+            })
+            if review_state_is_usable(review, final_plan, gate_issues):
+                current_raw = review["plan"]
+                current_plan = final_plan
+        if gate_issues or not repair_attempted or not isinstance(final_plan, dict):
             break
-        repair_attempted = True
-        JOB_REPORTER.warning(
-            "Long-form quality gate requested one focused Gemini repair pass.",
-            category="analyze",
-            gate_issues=gate_issues,
-        )
-        review, final_plan, gate_issues = review_once(
-            current_raw,
-            current_plan,
-            repair_required=True,
-            repair_feedback=gate_issues,
-            suffix=f"repair_{repair_index + 1}",
-        )
-        _save_json_checkpoint(output_dir, video_title, f"longform_repair_v2_{repair_index + 1}", {
-            "review": review,
-            "gate_issues": gate_issues,
-        })
-        if review_state_is_usable(review, final_plan, gate_issues):
-            current_raw = review["plan"]
-            current_plan = final_plan
-
-    final_verification_attempted = False
-    if repair_attempted and not gate_issues and isinstance(final_plan, dict):
+        # A repaired plan gets a fresh read-only critic pass. If that critic
+        # rejects it and repair budget is left, its feedback drives one more
+        # repair instead of failing a job that already cost an hour of
+        # transcription.
         final_verification_attempted = True
+        verification_rounds += 1
         JOB_REPORTER.progress(
             99.0 if reused_scoring else 94.0,
             message="Running a fresh read-only review of the repaired Long Video...",
@@ -3807,13 +3823,17 @@ def get_longform_plan(
             current_plan,
             repair_required=False,
             repair_feedback=[],
-            suffix="final_review",
+            suffix="final_review" if verification_rounds == 1 else f"final_review_{verification_rounds}",
             final_verification=True,
         )
-        _save_json_checkpoint(output_dir, video_title, "longform_final_review_v2", {
-            "review": review,
-            "gate_issues": gate_issues,
-        })
+        _save_json_checkpoint(
+            output_dir,
+            video_title,
+            "longform_final_review_v2" if verification_rounds == 1 else f"longform_final_review_v2_{verification_rounds}",
+            {"review": review, "gate_issues": gate_issues},
+        )
+        if not gate_issues or repairs_used >= LONGFORM_REVIEW_REPAIR_RETRIES:
+            break
 
     if gate_issues or not isinstance(final_plan, dict):
         rejected = dict(current_plan) if isinstance(current_plan, dict) else draft

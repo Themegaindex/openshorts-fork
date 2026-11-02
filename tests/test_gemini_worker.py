@@ -238,3 +238,16 @@ def test_longform_plan_accepts_missing_cold_open_and_review_lists():
         "plan": plan.model_dump(),
     })
     assert review.critical_issues == [] and review.joins == []
+
+
+def test_review_prompt_treats_topic_changes_as_expected_in_a_best_of():
+    prompt = gemini_worker.LONGFORM_REVIEW_PROMPT_TEMPLATE.format(
+        language="de", target_min_seconds=240, target_max_seconds=600,
+        min_segment_seconds=20, max_segment_seconds=240, max_segments=12,
+        max_chapters=6, min_chapters=2, repair_required="false",
+        final_verification="true", repair_feedback_json="[]",
+        draft_plan_json="{}", review_context_json="{}",
+    )
+    # A best-of of distinct topics must not be rejected merely for changing topic.
+    assert "never a weak join by itself" in prompt
+    assert "Score a\n  join on the cut, not on thematic continuity" in prompt
