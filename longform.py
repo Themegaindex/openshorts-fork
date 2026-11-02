@@ -955,15 +955,30 @@ def needs_16_9_canvas(width: int, height: int, tolerance: float = 0.0) -> bool:
     return (int(width) * 9) != (int(height) * 16)
 
 
-def blurred_16_9_filter(width: int = 1920, height: int = 1080) -> str:
+def blurred_16_9_filter(width: int = 1920, height: int = 1080, blur_downscale: int = 1) -> str:
     width = max(2, int(width) // 2 * 2)
     height = max(2, int(height) // 2 * 2)
+    factor = max(1, int(blur_downscale or 1))
+    if factor == 1:
+        background = (
+            f"[bg]scale={width}:{height}:force_original_aspect_ratio=increase,"
+            f"crop={width}:{height},gblur=sigma=28[bg_blur];"
+        )
+    else:
+        # Blur at 1/factor size, then scale up: the backdrop has no detail to
+        # lose (upstream openshorts blurred_backdrop measured SSIM 0.994-0.998).
+        small_w = max(2, (width // factor) // 2 * 2)
+        small_h = max(2, (height // factor) // 2 * 2)
+        background = (
+            f"[bg]scale={small_w}:{small_h}:force_original_aspect_ratio=increase,"
+            f"crop={small_w}:{small_h},gblur=sigma={28 / factor:g},"
+            f"scale={width}:{height}[bg_blur];"
+        )
     return (
-        f"[0:v]split=2[bg][fg];"
-        f"[bg]scale={width}:{height}:force_original_aspect_ratio=increase,"
-        f"crop={width}:{height},gblur=sigma=28[bg_blur];"
-        f"[fg]scale={width}:{height}:force_original_aspect_ratio=decrease[fg_fit];"
-        f"[bg_blur][fg_fit]overlay=(W-w)/2:(H-h)/2,setsar=1,format=yuv420p[video]"
+        "[0:v]split=2[bg][fg];"
+        + background
+        + f"[fg]scale={width}:{height}:force_original_aspect_ratio=decrease[fg_fit];"
+        "[bg_blur][fg_fit]overlay=(W-w)/2:(H-h)/2,setsar=1,format=yuv420p[video]"
     )
 
 

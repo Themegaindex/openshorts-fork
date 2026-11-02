@@ -43,6 +43,7 @@ from dotenv import load_dotenv
 import json
 import shutil
 from typing import List, Optional
+import frame_sampler
 import longform
 import video_encoding
 import whisper_runtime
@@ -73,7 +74,7 @@ from render_planning import (
     smooth_scene_strategies,
     split_crop_windows,
 )
-from speaker_tracking import SpeakerTracker, TargetState
+from speaker_tracking import FallbackThrottle, SpeakerTracker, TargetState, effective_detect_stride
 from video_formats import (
     CANONICAL_OUTPUT_FORMATS,
     EVEN_PAD_FILTER,
@@ -93,6 +94,49 @@ load_dotenv()
 ASPECT_RATIO = 9 / 16
 OUTPUT_FORMATS = CANONICAL_OUTPUT_FORMATS
 LAYOUT_STYLES = ("smart", "zoom", "wide")
+
+
+def _env_flag(name, default):
+    raw = os.environ.get(name, "").strip().lower()
+    return default if not raw else raw not in ("0", "false", "off", "no")
+
+
+def _env_number(name, default, cast, minimum):
+    raw = os.environ.get(name, "").strip()
+    if not raw:
+        return default
+    try:
+        return max(minimum, cast(raw))
+    except ValueError:
+        print(f"⚠️ {name}={raw!r} is not a number; using {default}.")
+        return default
+
+
+# Reframe speedups. REFRAME_FAST=0 restores every legacy reframe path; each
+# variable below switches off one speedup on its own.
+REFRAME_FAST = _env_flag("REFRAME_FAST", True)
+
+
+def _fast_or_legacy(fast, legacy):
+    return fast if REFRAME_FAST else legacy
+
+
+# Scene-analysis samples are read in one forward pass (0 = one seek each).
+REFRAME_SAMPLE_MAX_FORWARD = _env_number(
+    "REFRAME_SAMPLE_MAX_FORWARD", _fast_or_legacy(frame_sampler.MAX_FORWARD, 0), int, 0)
+# Frames between TRACK face detections (the tracker itself works in seconds).
+REFRAME_DETECT_STRIDE = _env_number("REFRAME_DETECT_STRIDE", _fast_or_legacy(4, 2), int, 1)
+# Minimum video-time gap between YOLO person-fallback runs while LOST.
+REFRAME_YOLO_INTERVAL_SECONDS = _env_number(
+    "REFRAME_YOLO_INTERVAL_SECONDS", _fast_or_legacy(0.3, 0.0), float, 0.0)
+# Blurred backdrops are computed at 1/N size and scaled up (1 = full size).
+REFRAME_BLUR_DOWNSCALE = _env_number("REFRAME_BLUR_DOWNSCALE", _fast_or_legacy(4, 1), int, 1)
+# Frames decoded ahead on a worker thread in the frame loop (0 = off).
+REFRAME_DECODE_PREFETCH = _env_number("REFRAME_DECODE_PREFETCH", _fast_or_legacy(4, 0), int, 0)
+LONGFORM_BLUR_DOWNSCALE = _env_number("LONGFORM_BLUR_DOWNSCALE", _fast_or_legacy(4, 1), int, 1)
+# GaussianBlur((51, 51), 0) derives sigma 0.3*((51-1)*0.5-1)+0.8 = 8.0.
+GENERAL_BLUR_KSIZE = 51
+GENERAL_BLUR_SIGMA = 8.0
 # Watermark: subtle centered overlay so rendered clips can't be re-uploaded as
 # someone else's work. Configure via env; WATERMARK_TEXT wins over the image.
 WATERMARK_ENABLED = os.environ.get("WATERMARK_ENABLED", "1").strip().lower() not in ("0", "false", "off", "no")
@@ -1578,27 +1622,47 @@ def detect_person_yolo(frame):
                 
     return best_box
 
-def create_general_frame(frame, output_width, output_height):
+def _blurred_backdrop(frame, output_width, output_height, downscale):
+    """Blurred 'cover' backdrop for a general shot.
+
+    downscale <= 1 is the legacy full-size path. Otherwise the visible region
+    is shrunk once to 1/downscale of the output, blurred with a matching
+    sigma and scaled up: a blurred backdrop has no detail to lose, and the
+    sharp foreground is untouched.
+    """
+    orig_h, orig_w = frame.shape[:2]
+    # Generic "cover" scaling works for landscape, portrait and square
+    # sources without negative slices or distortion.
+    scale = max(output_width / orig_w, output_height / orig_h)
+    if downscale <= 1:
+        bg_w = max(output_width, int(round(orig_w * scale)))
+        bg_h = max(output_height, int(round(orig_h * scale)))
+        bg_resized = cv2.resize(frame, (bg_w, bg_h))
+        start_x = max(0, (bg_w - output_width) // 2)
+        start_y = max(0, (bg_h - output_height) // 2)
+        background = bg_resized[start_y:start_y + output_height, start_x:start_x + output_width]
+        return cv2.GaussianBlur(background, (GENERAL_BLUR_KSIZE, GENERAL_BLUR_KSIZE), 0)
+    crop_w = max(1, min(orig_w, int(round(output_width / scale))))
+    crop_h = max(1, min(orig_h, int(round(output_height / scale))))
+    x0, y0 = (orig_w - crop_w) // 2, (orig_h - crop_h) // 2
+    small_w = max(2, output_width // downscale)
+    small_h = max(2, output_height // downscale)
+    small = cv2.resize(frame[y0:y0 + crop_h, x0:x0 + crop_w], (small_w, small_h), interpolation=cv2.INTER_AREA)
+    small = cv2.GaussianBlur(small, (0, 0), GENERAL_BLUR_SIGMA / downscale)
+    return cv2.resize(small, (output_width, output_height), interpolation=cv2.INTER_LINEAR)
+
+
+def create_general_frame(frame, output_width, output_height, blur_downscale=None):
     """
     Creates a 'General Shot' frame: 
     - Background: Blurred zoom of original
     - Foreground: Original video scaled to fit width, centered vertically.
     """
     orig_h, orig_w = frame.shape[:2]
-    
-    # 1. Background: generic "cover" scaling works for landscape, portrait
-    # and square sources without negative slices or distortion.
-    bg_scale = max(output_width / orig_w, output_height / orig_h)
-    bg_w = max(output_width, int(round(orig_w * bg_scale)))
-    bg_h = max(output_height, int(round(orig_h * bg_scale)))
-    bg_resized = cv2.resize(frame, (bg_w, bg_h))
-    start_x = max(0, (bg_w - output_width) // 2)
-    start_y = max(0, (bg_h - output_height) // 2)
-    background = bg_resized[start_y:start_y + output_height,
-                            start_x:start_x + output_width]
-        
-    # Blur background
-    background = cv2.GaussianBlur(background, (51, 51), 0)
+    downscale = REFRAME_BLUR_DOWNSCALE if blur_downscale is None else int(blur_downscale)
+
+    # 1. Background (a new array, safe to draw into).
+    final_frame = _blurred_backdrop(frame, output_width, output_height, downscale)
     
     # 2. Foreground: generic "contain" scaling preserves the whole source.
     scale = min(output_width / orig_w, output_height / orig_h)
@@ -1609,9 +1673,6 @@ def create_general_frame(frame, output_width, output_height):
     # 3. Overlay
     y_offset = (output_height - fg_h) // 2
     x_offset = (output_width - fg_w) // 2
-    
-    # Clone background to avoid modifying it
-    final_frame = background.copy()
     final_frame[y_offset:y_offset + fg_h, x_offset:x_offset + fg_w] = foreground
     
     return final_frame
@@ -1758,34 +1819,35 @@ def analyze_scenes_strategy(video_path, scenes, layout_style="smart"):
     frame_width = int(cap.get(cv2.CAP_PROP_FRAME_WIDTH) or 0) or 1920
     fps = float(cap.get(cv2.CAP_PROP_FPS) or 0) or 30.0
 
-    for start, end in tqdm(scenes, desc="   Analyzing Scenes"):
-        # Duration-aware coverage: short shots still get five observations;
-        # long shots get up to 24 instead of being judged from five snapshots.
-        frames_to_check = sample_scene_frames(
-            start.get_frames(),
-            end.get_frames(),
-            fps,
-        )
+    # Duration-aware coverage: short shots still get five observations;
+    # long shots get up to 24 instead of being judged from five snapshots.
+    plan = [sample_scene_frames(start.get_frames(), end.get_frames(), fps) for start, end in scenes]
+    # Same indices as before, read in ONE forward pass over the clip.
+    frames = frame_sampler.read_at(
+        cap, [index for indices in plan for index in indices], max_forward=REFRAME_SAMPLE_MAX_FORWARD,
+    )
+    try:
+        for frames_to_check in tqdm(plan, desc="   Analyzing Scenes"):
+            face_samples = []
+            person_samples = []
+            for _index in frames_to_check:
+                frame = next(frames, None)
+                if frame is None:
+                    continue
 
-        face_samples = []
-        person_samples = []
-        for f_idx in frames_to_check:
-            cap.set(cv2.CAP_PROP_POS_FRAMES, f_idx)
-            ret, frame = cap.read()
-            if not ret: continue
+                # Full resolution on purpose: layout evidence stays exact.
+                candidates = detect_face_candidates(frame)
+                face_samples.append([c['box'] for c in candidates])
+                if layout_style != "zoom":
+                    person_samples.append(detect_person_boxes(frame))
 
-            candidates = detect_face_candidates(frame)
-            face_samples.append([c['box'] for c in candidates])
-            if layout_style != "zoom":
-                person_samples.append(detect_person_boxes(frame))
-
-        decision = decide_scene_layout_detailed(
-            face_samples, frame_width, layout_style=layout_style,
-            person_samples=person_samples,
-        )
-        decisions.append(decision)
-
-    cap.release()
+            decision = decide_scene_layout_detailed(
+                face_samples, frame_width, layout_style=layout_style,
+                person_samples=person_samples,
+            )
+            decisions.append(decision)
+    finally:
+        cap.release()
     return decisions
 
 def detect_scenes(video_path):
@@ -2261,7 +2323,9 @@ def process_video_to_vertical(input_video, final_output_video, progress_callback
     print("   Step 1: Detecting scenes...")
     if progress_callback:
         progress_callback(2.0, "Detecting scenes...")
+    stage_started = time.perf_counter()
     scenes, fps = detect_scenes(input_video)
+    scenes_seconds = time.perf_counter() - stage_started
     
     if not scenes:
         print("   ℹ️ No cuts detected. Analyzing the full clip as one scene.")
@@ -2291,7 +2355,9 @@ def process_video_to_vertical(input_video, final_output_video, progress_callback
     print("\n   🤖 Step 3: Analyzing Scenes for Strategy (Single vs Group)...")
     if progress_callback:
         progress_callback(14.0, "Analyzing scene strategy...")
+    stage_started = time.perf_counter()
     scene_decisions = analyze_scenes_strategy(input_video, scenes, layout_style=layout_style)
+    analysis_seconds = time.perf_counter() - stage_started
     if len(scene_decisions) != len(scenes):
         # A failed analysis must not guess a tight crop.  GENERAL preserves
         # everyone until a future run can collect valid evidence.
@@ -2401,11 +2467,26 @@ def process_video_to_vertical(input_video, final_output_video, progress_callback
     fps_value = max(float(fps or 0), 1.0)
     artificial_switches = 0
     scene_had_target = False
+    # Evidence cadence only: the tracker's thresholds stay in seconds.
+    detect_stride = effective_detect_stride(fps_value, REFRAME_DETECT_STRIDE)
+    yolo_throttle = FallbackThrottle(REFRAME_YOLO_INTERVAL_SECONDS)
+    face_calls = yolo_calls = 0
+    detect_seconds = 0.0
+    reader = (
+        frame_sampler.FramePrefetcher(cap, REFRAME_DECODE_PREFETCH)
+        if REFRAME_DECODE_PREFETCH > 0 and cap.isOpened() else None
+    )
+    loop_started = time.perf_counter()
 
     last_progress_emit = time.time()
     try:
-        while cap.isOpened():
-            ret, frame = cap.read()
+        while True:
+            if reader is not None:
+                ret, frame = reader.read()
+            elif cap.isOpened():
+                ret, frame = cap.read()
+            else:
+                break
             if not ret:
                 break
 
@@ -2424,6 +2505,7 @@ def process_video_to_vertical(input_video, final_output_video, progress_callback
                 # IDs, fallback candidates and camera centers must not cross it.
                 speaker_tracker.reset()
                 cameraman.reset()
+                yolo_throttle.reset()
                 scene_had_target = False
                 previous_scene_index = current_scene_index
 
@@ -2448,9 +2530,11 @@ def process_video_to_vertical(input_video, final_output_video, progress_callback
 
             else:
                 # "Single Speaker" -> Track & Crop
-                if is_scene_start or frame_number % 2 == 0:
+                if is_scene_start or frame_number % detect_stride == 0:
+                    detect_started = time.perf_counter()
                     timestamp_seconds = frame_number / fps_value
                     candidates = detect_face_candidates(frame)
+                    face_calls += 1
                     target_decision = speaker_tracker.get_target(
                         candidates,
                         timestamp_seconds,
@@ -2461,11 +2545,16 @@ def process_video_to_vertical(input_video, final_output_video, progress_callback
                             artificial_switches += 1
                         cameraman.update_target(target_decision.box)
                         scene_had_target = True
-                    elif target_decision.state == TargetState.LOST:
+                    elif (
+                        target_decision.state == TargetState.LOST
+                        and yolo_throttle.should_run(timestamp_seconds)
+                    ):
                         # LOST means the previous subject is genuinely gone.
                         # HOLD intentionally does nothing and can never reach
-                        # this fallback branch.
+                        # this fallback branch. A throttled tick gives the
+                        # tracker no evidence at all.
                         person_box = detect_person_yolo(frame)
+                        yolo_calls += 1
                         fallback_decision = speaker_tracker.consider_person_fallback(
                             person_box,
                             timestamp_seconds,
@@ -2476,6 +2565,7 @@ def process_video_to_vertical(input_video, final_output_video, progress_callback
                                 artificial_switches += 1
                             cameraman.update_target(fallback_decision.box)
                             scene_had_target = True
+                    detect_seconds += time.perf_counter() - detect_started
 
                 x1, y1, x2, y2 = cameraman.get_crop_box(force_snap=is_scene_start)
                 if y2 > y1 and x2 > x1:
@@ -2505,7 +2595,11 @@ def process_video_to_vertical(input_video, final_output_video, progress_callback
             encoder_died = True
         ffmpeg_process.wait()
     finally:
-        cap.release()
+        released = reader.close() if reader is not None else True
+        if released:
+            cap.release()
+        else:
+            print("   ⚠️ Decode thread did not stop; leaving the capture open.")
         # If the frame loop aborted (exception/cancel), don't leak the encoder subprocess.
         if ffmpeg_process.poll() is None:
             ffmpeg_process.terminate()
@@ -2517,6 +2611,11 @@ def process_video_to_vertical(input_video, final_output_video, progress_callback
         stderr_output = b"".join(stderr_chunks).decode(errors="replace")
 
     print(f"   🎥 Artificial camera switches: {artificial_switches}")
+    print(
+        f"   ⏱️ Reframe: scenes {scenes_seconds:.1f}s, strategy {analysis_seconds:.1f}s, "
+        f"{frame_number} frames {time.perf_counter() - loop_started:.1f}s "
+        f"(detect {detect_seconds:.1f}s: {face_calls} face / {yolo_calls} YOLO calls, stride {detect_stride})"
+    )
 
     if ffmpeg_process.returncode != 0 or encoder_died:
         if encode_attempt.encoder == "nvenc":
@@ -4244,7 +4343,7 @@ def _render_longform_video(
     filter_complex = None
     if longform.needs_16_9_canvas(source_width, source_height):
         filter_complex = longform.blurred_16_9_filter(
-            LONGFORM_CANVAS_WIDTH, LONGFORM_CANVAS_HEIGHT,
+            LONGFORM_CANVAS_WIDTH, LONGFORM_CANVAS_HEIGHT, blur_downscale=LONGFORM_BLUR_DOWNSCALE,
         )
         print(
             f"🖼️  Long-form source is {source_width}x{source_height}; "

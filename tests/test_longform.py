@@ -45,6 +45,24 @@ def test_timestamp_and_description_formatting():
     assert description == "Watch the full story.\n\n0:00 Intro\n1:10 Reveal"
 
 
+def test_blurred_16_9_filter_default_is_the_legacy_full_size_blur():
+    assert longform.blurred_16_9_filter() == (
+        "[0:v]split=2[bg][fg];"
+        "[bg]scale=1920:1080:force_original_aspect_ratio=increase,"
+        "crop=1920:1080,gblur=sigma=28[bg_blur];"
+        "[fg]scale=1920:1080:force_original_aspect_ratio=decrease[fg_fit];"
+        "[bg_blur][fg_fit]overlay=(W-w)/2:(H-h)/2,setsar=1,format=yuv420p[video]"
+    )
+
+
+def test_blurred_16_9_filter_can_blur_the_backdrop_at_quarter_size():
+    graph = longform.blurred_16_9_filter(1920, 1080, blur_downscale=4)
+    assert "[bg]scale=480:270:force_original_aspect_ratio=increase,crop=480:270,gblur=sigma=7," in graph
+    assert "scale=1920:1080[bg_blur];" in graph
+    assert "[fg]scale=1920:1080:force_original_aspect_ratio=decrease[fg_fit]" in graph
+    assert graph.endswith("format=yuv420p[video]")
+
+
 def test_segment_cut_uses_duration_and_optional_16_9_canvas():
     filter_graph = longform.blurred_16_9_filter()
     command = longform.segment_cut_command(

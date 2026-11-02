@@ -33,6 +33,21 @@ def test_general_frame_handles_every_source_orientation(source_shape, output_siz
     assert rendered.shape == (output_height, output_width, 3)
 
 
+@pytest.mark.parametrize("blur_downscale", [1, 4])
+@pytest.mark.parametrize("source_shape", [(1080, 1920, 3), (1280, 720, 3), (1080, 1080, 3)])
+def test_quarter_size_backdrop_matches_the_full_size_blur(source_shape, blur_downscale):
+    height, width = source_shape[:2]
+    gradient_x = np.tile(np.linspace(0, 255, width, dtype=np.float32), (height, 1))
+    gradient_y = np.tile(np.linspace(0, 255, height, dtype=np.float32)[:, None], (1, width))
+    frame = np.dstack([gradient_x, gradient_y, (gradient_x + gradient_y) / 2]).astype(np.uint8)
+
+    legacy = main.create_general_frame(frame, 608, 1080, blur_downscale=1)
+    rendered = main.create_general_frame(frame, 608, 1080, blur_downscale=blur_downscale)
+    assert rendered.shape == legacy.shape == (1080, 608, 3)
+    diff = np.abs(rendered.astype(np.int16) - legacy.astype(np.int16))
+    assert diff.mean() < 2.0
+
+
 def test_portrait_to_square_crop_tracks_both_axes_without_stretching():
     camera = main.SmoothedCameraman(720, 720, 720, 1280, aspect_ratio=1.0)
     camera.update_target((200, 900, 200, 200))

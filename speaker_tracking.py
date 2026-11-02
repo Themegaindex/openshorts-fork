@@ -264,3 +264,43 @@ class SpeakerTracker:
         self.fallback_candidate_center = None
         self.fallback_candidate_since = None
         return TargetDecision(TargetState.TARGET, box, "stable YOLO fallback target")
+
+
+def effective_detect_stride(fps, stride, max_interval_seconds=0.25):
+    """Frames between TRACK face detections.
+
+    The tracker reasons in seconds, so the stride only changes how often it
+    gets evidence. Cap the gap for low frame rates, but never below two frames
+    so the legacy stride of 2 stays exact.
+    """
+    stride = max(1, int(stride))
+    try:
+        fps = float(fps or 0)
+    except (TypeError, ValueError):
+        fps = 0.0
+    if fps > 0 and max_interval_seconds > 0:
+        stride = min(stride, max(2, int(fps * max_interval_seconds)))
+    return stride
+
+
+class FallbackThrottle:
+    """Run the YOLO person fallback at most every min_interval_seconds.
+
+    reset() at each cut, so the first LOST tick of a scene always runs.
+    min_interval_seconds=0 runs on every LOST tick (legacy). A skipped tick
+    gives no evidence: callers must not feed the tracker for it.
+    """
+
+    def __init__(self, min_interval_seconds):
+        self.min_interval_seconds = max(0.0, float(min_interval_seconds))
+        self.reset()
+
+    def reset(self):
+        self.last_run_at = None
+
+    def should_run(self, timestamp_seconds):
+        now = float(timestamp_seconds)
+        if self.last_run_at is None or now - self.last_run_at >= self.min_interval_seconds - 1e-6:
+            self.last_run_at = now
+            return True
+        return False

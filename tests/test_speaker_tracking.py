@@ -1,4 +1,6 @@
-from speaker_tracking import SpeakerTracker, TargetState
+import pytest
+
+from speaker_tracking import FallbackThrottle, SpeakerTracker, TargetState, effective_detect_stride
 
 
 def _face(x, y=100, width=120, height=120):
@@ -100,3 +102,36 @@ class TestYoloFallback:
         assert tracker.consider_person_fallback(_person(1200), 2.1, 1920).state == TargetState.HOLD
         assert tracker.consider_person_fallback(_person(500), 3.2, 1920).state == TargetState.HOLD
         assert tracker.consider_person_fallback(_person(505), 3.8, 1920).state == TargetState.HOLD
+
+
+@pytest.mark.parametrize(
+    "fps,stride,expected",
+    [
+        (30, 4, 4),
+        (25, 4, 4),
+        (60, 4, 4),
+        (10, 4, 2),        # capped to 0.25 s of video, never below 2
+        (5, 4, 2),
+        (30, 2, 2),        # legacy stride stays exact
+        (30, 0, 1),
+        (0, 4, 4),         # unknown fps: no cap
+        (None, 4, 4),
+        ("bad", 4, 4),
+    ],
+)
+def test_effective_detect_stride(fps, stride, expected):
+    assert effective_detect_stride(fps, stride) == expected
+
+
+def test_fallback_throttle_runs_at_most_every_interval_and_resets_per_scene():
+    throttle = FallbackThrottle(0.3)
+    assert [throttle.should_run(t) for t in (0.0, 0.1, 0.2, 0.3, 0.5, 0.6)] == [
+        True, False, False, True, False, True,
+    ]
+    throttle.reset()
+    assert throttle.should_run(0.65) is True
+
+
+def test_fallback_throttle_zero_interval_runs_on_every_tick():
+    throttle = FallbackThrottle(0)
+    assert all(throttle.should_run(t / 30) for t in range(10))
