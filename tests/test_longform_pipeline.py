@@ -53,7 +53,15 @@ def _stub_missing_pipeline_dependencies():
             return True
 
     if unavailable("cv2"):
-        sys.modules["cv2"] = MagicMock()
+        cv2_stub = MagicMock()
+        # pytest >= 9.2 undoes monkeypatch.setattr from the instance __dict__
+        # and deletes the attribute when it was not there. A MagicMock keeps
+        # auto-created children outside __dict__, so the first test that
+        # patched cv2.VideoCapture deleted it for every later test. Real
+        # attributes for everything the tests patch keep undo symmetric.
+        for name in ("VideoCapture", "cvtColor", "absdiff"):
+            setattr(cv2_stub, name, MagicMock(name=f"cv2.{name}"))
+        sys.modules["cv2"] = cv2_stub
     if unavailable("numpy"):
         # Every numpy-using renderer boundary must stay mocked in this module.
         numpy_stub = ModuleType("numpy")
