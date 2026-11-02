@@ -99,6 +99,8 @@ def test_prefetcher_reraises_a_decoder_error_on_the_main_thread():
     assert reader.read() == (True, 1)
     with pytest.raises(RuntimeError, match="decode broke"):
         reader.read()
+    with pytest.raises(RuntimeError, match="decode broke"):   # a second read must not hang
+        reader.read()
     assert reader.close() is True
 
 

@@ -359,6 +359,8 @@ def test_complete_model_cache_is_used_offline(backend, tmp_path):
         ({"WHISPER_CPU_MODEL": "base"}, "base"),
         ({"WHISPER_MODEL": "large-v3", "WHISPER_CPU_MODEL": "small"}, "small"),
         ({"WHISPER_MODEL": "medium"}, "medium"),                 # older .env: WHISPER_MODEL was the CPU model
+        ({"WHISPER_MODEL": "large-v3-turbo"}, "small"),          # GPU-class model, but no GPU visible
+        ({"WHISPER_MODEL": "large-v3", "WHISPER_DEVICE": "cpu"}, "large-v3"),   # explicit CPU keeps it
         ({}, "small"),
     ],
 )
@@ -396,28 +398,9 @@ def test_lock_without_file_system_support_runs_ungated(monkeypatch, tmp_path):
     def no_lock_support(_descriptor):
         raise OSError(errno.EINVAL, "Invalid argument")
 
-    monkeypatch.setattr(whisper_runtime, "_try_lock", no_lock_support)
+    monkeypatch.setattr(whisper_runtime.advisory_lock, "try_lock", no_lock_support)
     with whisper_runtime.gpu_slot("t", slots=1, wait_seconds=30, lock_dir=str(tmp_path), poll=0.01) as acquired:
         assert acquired is True
-
-
-@pytest.mark.parametrize("code,busy", [("EACCES", True), ("EAGAIN", True), ("EINVAL", False), ("ENOLCK", False)])
-def test_try_lock_only_reports_busy_for_contention(monkeypatch, code, busy):
-    import errno
-    import os
-
-    def failing(*_args):
-        raise OSError(getattr(errno, code), code)
-
-    if os.name == "nt":
-        monkeypatch.setattr(whisper_runtime.msvcrt, "locking", failing)
-    else:
-        monkeypatch.setattr(whisper_runtime.fcntl, "flock", failing)
-    if busy:
-        assert whisper_runtime._try_lock(0) is False
-    else:
-        with pytest.raises(OSError):
-            whisper_runtime._try_lock(0)
 
 
 def test_bad_slot_settings_fall_back_to_defaults(monkeypatch):
@@ -472,3 +455,16 @@ def test_cpu_run_reports_its_model_download(backend):
     (_segments, _info, cfg), _events = _run()
     assert cfg["model_path"] == "/models/small"
     assert whisper_runtime.LAST_RUN["model_downloaded"] is True
+
+
+def test_per_call_cpu_model_and_short_gpu_wait(backend, monkeypatch, tmp_path):
+    backend.cuda_devices = 0
+    (_segments, _info, cfg), _events = _run(cpu_model="base")
+    assert (cfg["device"], cfg["model_size"]) == ("cpu", "base")
+
+    backend.cuda_devices = 1
+    holder = whisper_runtime.gpu_slot("whisper", slots=1, wait_seconds=1, lock_dir=str(tmp_path))
+    with holder:
+        (_segments, _info, cfg), events = _run(cpu_model="base", gpu_wait_seconds=0)
+    assert (cfg["device"], cfg["model_size"]) == ("cpu", "base")
+    assert events[0][0] == "restart" and "busy" in events[0][1]

@@ -144,6 +144,28 @@ def test_run_encode_treats_exit0_empty_output_as_nvenc_failure(gpu, tmp_path):
     assert encoders == ["nvenc", "x264"]
 
 
+def test_failure_shared_by_x264_does_not_count_against_nvenc(gpu):
+    def runner(command, **_kwargs):
+        raise subprocess.CalledProcessError(1, command, stderr=b"Unable to open font file\nConversion failed!\n")
+
+    for _ in range(3):
+        with pytest.raises(subprocess.CalledProcessError):
+            ve.run_encode(lambda a: ["ffmpeg", *a.video_args], tier=ve.HIGH, label="Burn", runner=runner,
+                          warn=lambda _m: None)
+    assert ve._failures == 0 and ve.select_encoder() == "nvenc"
+
+
+def test_encode_builders_default_to_x264_without_a_fallback_loop(gpu):
+    import longform
+    import subtitles
+
+    assert ve.select_encoder() == "nvenc"
+    cut = longform.segment_cut_command("in.mp4", 1, 2, "out.mp4")
+    burn = subtitles.build_layer_command("in.mp4", "out.mp4", hook_png="hook.png")
+    assert "libx264" in cut and "h264_nvenc" not in cut
+    assert "libx264" in burn and "h264_nvenc" not in burn
+
+
 def test_run_encode_never_retries_timeouts(gpu):
     calls = []
 

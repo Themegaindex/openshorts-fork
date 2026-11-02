@@ -141,5 +141,11 @@ def youtube_failure_message(errors):
         )
         return f'{browser_advice} {sign_in}' if browser_advice else sign_in
     if browser_advice:
-        return browser_advice
+        # Another attempt may have failed for its own reason (private or
+        # removed video); keep that error next to the browser advice.
+        others = [
+            message for message in messages
+            if not any(key in message.lower() for key in ('cookie database', 'decrypt', 'dpapi'))
+        ]
+        return f'{browser_advice} Other attempt: {others[-1]}' if others else browser_advice
     return messages[-1] if messages else 'YouTube returned no downloadable video formats.'

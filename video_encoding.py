@@ -266,11 +266,18 @@ def run_encode(build_command, *, tier, label, output_path=None, source=None, gpu
     never retried.
     """
     attempts = encode_attempts(tier, source=source, gpu_frames=gpu_frames, width=width, height=height)
+    # A failure is held back until a later attempt succeeds: when libx264
+    # fails too, the input or filter was the problem, not the GPU, and it
+    # must not count toward switching NVENC off for every job.
+    pending_failure = None
     for index, attempt in enumerate(attempts):
         run = runner or subprocess.run
         command = build_command(attempt)
         if attempt.encoder == "x264":
-            return run(command, check=True, **run_kwargs)
+            result = run(command, check=True, **run_kwargs)
+            if pending_failure:
+                note_nvenc_failure(pending_failure)
+            return result
         started = time.monotonic()
         try:
             result = run(command, check=True, **run_kwargs)
@@ -283,10 +290,13 @@ def run_encode(build_command, *, tier, label, output_path=None, source=None, gpu
             if attempt.input_args and source:
                 mark_source_cpu_decode(source)
             else:
-                note_nvenc_failure(failure_text(exc))
+                pending_failure = failure_text(exc)
             _emit(warn, f"⚠️ {label}: {attempt.label} failed ({reason}); retrying with {attempts[index + 1].label}.")
             continue
-        note_nvenc_success()
+        if pending_failure:
+            note_nvenc_failure(pending_failure)
+        else:
+            note_nvenc_success()
         print(f"🎞️ {label}: {attempt.label} in {time.monotonic() - started:.1f}s")
         return result
     raise RuntimeError(f"{label}: no encode attempt left")   # unreachable: x264 always returns or raises

@@ -148,6 +148,14 @@ def test_browser_cause_survives_a_later_bot_check(browser_error, expected):
     assert result.index(expected) < result.index('YouTube requires sign-in')
 
 
+def test_browser_advice_keeps_the_other_attempts_error():
+    result = youtube.youtube_failure_message([
+        RuntimeError('ERROR: Could not copy Chrome cookie database. See ...'),
+        RuntimeError('ERROR: [youtube] abc: Video unavailable. This video is private'),
+    ])
+    assert 'Fully close' in result and 'This video is private' in result
+
+
 def test_quality_probe_uses_env_cookies_and_same_js_runtime(monkeypatch, tmp_path, capsys):
     monkeypatch.setenv('YOUTUBE_COOKIES', COOKIES)
     monkeypatch.setenv('YOUTUBE_COOKIES_FILE', str(tmp_path / 'must-not-be-created.txt'))

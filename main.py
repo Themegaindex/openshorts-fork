@@ -52,12 +52,8 @@ from youtube_download import (
     youtube_base_options, youtube_failure_message,
 )
 
-# OS advisory file locks for the shared ETA history (_job_stats_file_lock):
-# msvcrt on Windows, flock everywhere else.
-if os.name == "nt":
-    import msvcrt
-else:
-    import fcntl
+# OS advisory file locks for the shared ETA history (_job_stats_file_lock).
+import advisory_lock
 from pydantic import BaseModel
 from clip_selection import (
     build_transcript_windows,
@@ -246,7 +242,10 @@ LONGFORM_BOUNDARY_PADDING_SECONDS = float(os.environ.get("LONGFORM_BOUNDARY_PADD
 LONGFORM_AUDIO_FADE_SECONDS = float(os.environ.get("LONGFORM_AUDIO_FADE_SECONDS", "0.01"))
 LONGFORM_REVIEW_MIN_OVERALL_SCORE = int(os.environ.get("LONGFORM_REVIEW_MIN_OVERALL_SCORE", "85"))
 LONGFORM_REVIEW_MIN_JOIN_SCORE = int(os.environ.get("LONGFORM_REVIEW_MIN_JOIN_SCORE", "80"))
-LONGFORM_REVIEW_REPAIR_RETRIES = max(0, int(os.environ.get("LONGFORM_REVIEW_REPAIR_RETRIES", "1")))
+# Two repairs by default: the second one is spent only when the fresh
+# read-only review rejects the first repair (an hour of transcription
+# should not be lost to one rejected repair).
+LONGFORM_REVIEW_REPAIR_RETRIES = max(0, int(os.environ.get("LONGFORM_REVIEW_REPAIR_RETRIES", "2")))
 LONGFORM_REVIEW_BOUNDARY_WINDOW_SECONDS = max(
     0.0,
     float(os.environ.get("LONGFORM_REVIEW_BOUNDARY_WINDOW_SECONDS", "75")),
@@ -370,27 +369,17 @@ def _job_stats_file_lock(timeout_seconds=JOB_STATS_LOCK_TIMEOUT_SECONDS):
     try:
         while not acquired:
             try:
-                if os.name == "nt":
-                    os.lseek(descriptor, 0, os.SEEK_SET)
-                    msvcrt.locking(descriptor, msvcrt.LK_NBLCK, 1)
-                else:
-                    fcntl.flock(descriptor, fcntl.LOCK_EX | fcntl.LOCK_NB)
-                acquired = True
+                acquired = advisory_lock.try_lock(descriptor)
             except OSError:
+                acquired = False         # keep the old policy: retry until the deadline
+            if not acquired:
                 if time.monotonic() >= deadline:
                     raise TimeoutError("Timed out waiting for the job-stats lock")
                 time.sleep(0.05)
         yield
     finally:
         if acquired:
-            try:
-                if os.name == "nt":
-                    os.lseek(descriptor, 0, os.SEEK_SET)
-                    msvcrt.locking(descriptor, msvcrt.LK_UNLCK, 1)
-                else:
-                    fcntl.flock(descriptor, fcntl.LOCK_UN)
-            except OSError:
-                pass
+            advisory_lock.unlock(descriptor)
         os.close(descriptor)
 
 
@@ -441,6 +430,10 @@ class JobReporter:
         self.phase = "queued"
         self.phase_label = "Queued"
         self.phase_started_at = self.started_at
+        # Start of the measured pace in the running phase; a restarted phase
+        # (GPU transcription falling back to the CPU) moves it, the recorded
+        # phase duration keeps the full time.
+        self.phase_pace_started_at = self.started_at
         self.phase_progress_percent = 0.0
         self.progress_percent = 0.0
         self.last_heartbeat_at = 0.0
@@ -522,7 +515,7 @@ class JobReporter:
             return None
         percent = max(0.0, min(100.0, self.phase_progress_percent))
         now = time.time()
-        in_phase = max(0.0, now - self.phase_started_at)
+        in_phase = max(0.0, now - getattr(self, "phase_pace_started_at", self.phase_started_at))
 
         with self._state_lock:
             operation_expected_end_at = self.operation_expected_end_at
@@ -743,6 +736,7 @@ class JobReporter:
         self.phase = phase
         self.phase_label = label
         self.phase_started_at = time.time()
+        self.phase_pace_started_at = self.phase_started_at
         with self._state_lock:
             self.operation_name = None
             self.operation_timeout_seconds = None
@@ -762,6 +756,10 @@ class JobReporter:
             },
             **extra,
         )
+
+    def restart_phase_pace(self):
+        """The running phase starts over (e.g. on another device): measure its pace from now."""
+        self.phase_pace_started_at = time.time()
 
     def progress(self, phase_progress_percent: float, *, message: Optional[str] = None, important: bool = False, **extra):
         self.phase_progress_percent = max(0.0, min(100.0, float(phase_progress_percent)))
@@ -2378,18 +2376,26 @@ def _remove_quietly(path):
         print(f"⚠️ Could not remove scratch file {path}: {exc}")
 
 
+def _file_size(path):
+    try:
+        return os.path.getsize(path)
+    except OSError:
+        return 0
+
+
 def _full_render_filename(output_dir, video_title, output_format):
     suffix = normalize_output_format(output_format)
     return os.path.join(output_dir, f"{video_title}_{suffix}.mp4")
 
 
 def process_video_to_vertical(input_video, final_output_video, progress_callback=None, aspect_ratio=ASPECT_RATIO,
-                              layout_style="smart", video_encoder=None):
+                              layout_style="smart", video_encoder=None, _reuse_analysis=None):
     """
     Core logic to convert horizontal video to vertical using scene detection and Active Speaker Tracking (MediaPipe).
 
     video_encoder="x264" forces the CPU encoder; it is used to redo a clip
-    whose GPU encoder died mid-stream.
+    whose GPU encoder died mid-stream. _reuse_analysis (scenes, fps and
+    scene decisions of that first run) skips detection and analysis then.
     """
     script_start_time = time.time()
 
@@ -2420,13 +2426,18 @@ def process_video_to_vertical(input_video, final_output_video, progress_callback
         )
 
     print(f"🎬 Processing clip: {input_video}")
-    print("   Step 1: Detecting scenes...")
-    if progress_callback:
-        progress_callback(2.0, "Detecting scenes...")
-    stage_started = time.perf_counter()
-    scenes, fps = detect_scenes(input_video)
-    scenes_seconds = time.perf_counter() - stage_started
-    
+    if _reuse_analysis:
+        print("   Step 1: Reusing the scenes of the first render...")
+        scenes, fps = _reuse_analysis["scenes"], _reuse_analysis["fps"]
+        scenes_seconds = 0.0
+    else:
+        print("   Step 1: Detecting scenes...")
+        if progress_callback:
+            progress_callback(2.0, "Detecting scenes...")
+        stage_started = time.perf_counter()
+        scenes, fps = detect_scenes(input_video)
+        scenes_seconds = time.perf_counter() - stage_started
+
     if not scenes:
         print("   ℹ️ No cuts detected. Analyzing the full clip as one scene.")
         # A continuous shot is valid input: treat the whole clip as one scene.
@@ -2439,7 +2450,7 @@ def process_video_to_vertical(input_video, final_output_video, progress_callback
     print(f"   ✅ Found {len(scenes)} scenes.")
 
     print("\n   🧠 Step 2: Preparing Active Tracking...")
-    if progress_callback:
+    if progress_callback and not _reuse_analysis:
         progress_callback(8.0, "Preparing active tracking...")
     original_width, original_height = src_width, src_height
 
@@ -2457,11 +2468,15 @@ def process_video_to_vertical(input_video, final_output_video, progress_callback
     
     # --- New Strategy: Per-Scene Analysis ---
     print("\n   🤖 Step 3: Analyzing Scenes for Strategy (Single vs Group)...")
-    if progress_callback:
-        progress_callback(14.0, "Analyzing scene strategy...")
-    stage_started = time.perf_counter()
-    scene_decisions = analyze_scenes_strategy(input_video, scenes, layout_style=layout_style)
-    analysis_seconds = time.perf_counter() - stage_started
+    if _reuse_analysis:
+        scene_decisions = list(_reuse_analysis["scene_decisions"])
+        analysis_seconds = 0.0
+    else:
+        if progress_callback:
+            progress_callback(14.0, "Analyzing scene strategy...")
+        stage_started = time.perf_counter()
+        scene_decisions = analyze_scenes_strategy(input_video, scenes, layout_style=layout_style)
+        analysis_seconds = time.perf_counter() - stage_started
     if len(scene_decisions) != len(scenes):
         # A failed analysis must not guess a tight crop.  GENERAL preserves
         # everyone until a future run can collect valid evidence.
@@ -2725,7 +2740,6 @@ def process_video_to_vertical(input_video, final_output_video, progress_callback
         if encode_attempt.encoder == "nvenc":
             failure = stderr_output or f"exit code {ffmpeg_process.returncode}"
             reason = video_encoding.short_reason(failure)
-            video_encoding.note_nvenc_failure(failure)
             JOB_REPORTER.warning(
                 f"GPU encoder failed after {frame_number} frames ({reason}); "
                 "rendering the clip again with libx264.",
@@ -2734,10 +2748,15 @@ def process_video_to_vertical(input_video, final_output_video, progress_callback
             _remove_quietly(temp_video_output)
             if progress_callback:
                 progress_callback(20.0, "GPU encoder failed - re-rendering on the CPU...")
-            return process_video_to_vertical(
+            rendered = process_video_to_vertical(
                 input_video, final_output_video, progress_callback,
                 aspect_ratio=aspect_ratio, layout_style=layout_style, video_encoder="x264",
+                _reuse_analysis={"scenes": scenes, "fps": fps, "scene_decisions": scene_decisions},
             )
+            if rendered:
+                # Only now is it clear the GPU, not the clip, was the problem.
+                video_encoding.note_nvenc_failure(failure)
+            return rendered
         print("\n   ❌ FFmpeg frame processing failed.")
         print("   Stderr:", stderr_output)
         return False
@@ -2845,6 +2864,14 @@ def transcribe_video(video_path, video_duration=None, allow_gpu_download=True):
     def on_restart(reason, cpu_cfg):
         # A mixed GPU+CPU duration must never be learned as a GPU or CPU rate.
         exclude_from_stats()
+        # The rest of the phase runs on the CPU: use the CPU history and do
+        # not count the failed GPU time into the measured pace.
+        variants = getattr(JOB_REPORTER, "phase_cost_variant", None)
+        if isinstance(variants, dict):
+            variants["transcribe"] = "cpu"
+        restart_pace = getattr(JOB_REPORTER, "restart_phase_pace", None)
+        if restart_pace:
+            restart_pace()
         JOB_REPORTER.warning(
             f"GPU transcription failed ({reason}). Restarting on CPU with Whisper "
             f"{cpu_cfg['model_size']}; this takes longer.",
@@ -4535,7 +4562,36 @@ def _render_longform_video(
         video_encoding.HIGH, source=input_video, gpu_frames=False,
         width=encode_width or None, height=encode_height or None,
     )
-    for attempt_index, attempt in enumerate(attempts):
+    def encode_segment(index, segment, segment_path, attempt):
+        command = longform.segment_cut_command(
+            input_video,
+            segment["start"],
+            segment["end"],
+            segment_path,
+            fade_seconds=LONGFORM_AUDIO_FADE_SECONDS,
+            filter_complex=filter_complex,
+            video_args=attempt.video_args,
+            input_args=attempt.input_args,
+        )
+        with JOB_REPORTER.operation(
+            f"FFmpeg long-form cut {index}/{len(segments)}",
+            timeout_seconds=BLOCKING_OPERATION_STALL_SECONDS,
+            message=f"Encoding long-form segment {index}/{len(segments)}.",
+            category="render",
+        ):
+            _run_checked_ffmpeg(command, label=f"Long-form segment {index}")
+        if attempt.encoder == "nvenc" and _file_size(segment_path) < 1024:
+            # NVENC can exit 0 with nothing written; the join must not get it.
+            raise RuntimeError(f"Long-form segment {index} is empty after {attempt.label}")
+
+    def timed_out(exc):
+        # A file name or a CUDA message can contain "timed out"; only a real
+        # subprocess timeout must skip the remaining attempts.
+        return isinstance(exc.__cause__, subprocess.TimeoutExpired)
+
+    attempt_index = 0
+    while True:
+        attempt = attempts[attempt_index]
         completed = 0.0
         try:
             for index, (segment, segment_path) in enumerate(zip(segments, temp_segments), start=1):
@@ -4547,40 +4603,39 @@ def _render_longform_video(
                     important=True,
                     category="render",
                 )
-                command = longform.segment_cut_command(
-                    input_video,
-                    segment["start"],
-                    segment["end"],
-                    segment_path,
-                    fade_seconds=LONGFORM_AUDIO_FADE_SECONDS,
-                    filter_complex=filter_complex,
-                    video_args=attempt.video_args,
-                    input_args=attempt.input_args,
-                )
-                with JOB_REPORTER.operation(
-                    f"FFmpeg long-form cut {index}/{len(segments)}",
-                    timeout_seconds=BLOCKING_OPERATION_STALL_SECONDS,
-                    message=f"Encoding long-form segment {index}/{len(segments)}.",
-                    category="render",
-                ):
-                    _run_checked_ffmpeg(command, label=f"Long-form segment {index}")
+                encode_segment(index, segment, segment_path, attempt)
                 completed += segment_duration
         except RuntimeError as exc:
-            # A file name or a CUDA message can contain "timed out"; only a real
-            # subprocess timeout must skip the remaining attempts.
-            if attempt_index == len(attempts) - 1 or isinstance(exc.__cause__, subprocess.TimeoutExpired):
+            if attempt_index == len(attempts) - 1 or timed_out(exc):
                 raise
-            if attempt.input_args:
-                video_encoding.mark_source_cpu_decode(input_video)
-            else:
-                video_encoding.note_nvenc_failure(str(exc))
+            # Try the failing segment alone with the next attempts first. If
+            # none can encode it, the source or the disk is the problem, and
+            # re-encoding every segment again would only waste render time.
+            failed = [(attempt, exc)]
+            next_index = None
+            for probe_index in range(attempt_index + 1, len(attempts)):
+                try:
+                    encode_segment(index, segment, segment_path, attempts[probe_index])
+                except RuntimeError as probe_exc:
+                    if probe_index == len(attempts) - 1 or timed_out(probe_exc):
+                        raise
+                    failed.append((attempts[probe_index], probe_exc))
+                    continue
+                next_index = probe_index
+                break
+            for failed_attempt, failed_exc in failed:
+                if failed_attempt.input_args:
+                    video_encoding.mark_source_cpu_decode(input_video)
+                else:
+                    video_encoding.note_nvenc_failure(str(failed_exc))
             JOB_REPORTER.warning(
                 f"Long-form segment {index} failed with {attempt.label} "
                 f"({video_encoding.short_reason(str(exc))}); re-encoding every segment with "
-                f"{attempts[attempt_index + 1].label} so the join stays valid.",
+                f"{attempts[next_index].label} so the join stays valid.",
                 category="render",
             )
             _cleanup_render_temp_files(temp_segments)
+            attempt_index = next_index
             continue
         if attempt.encoder == "nvenc":
             video_encoding.note_nvenc_success()

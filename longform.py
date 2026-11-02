@@ -998,7 +998,8 @@ def segment_cut_command(
     fade = min(max(0.0, float(fade_seconds)), duration / 4.0)
     fade_out_start = max(0.0, duration - fade)
     if video_args is None:
-        video_args = video_encoding.video_encode_args(video_encoding.HIGH)
+        # Without a fallback loop around it, a default must not be NVENC.
+        video_args = video_encoding.video_encode_args(video_encoding.HIGH, encoder="x264")
     command = [
         "ffmpeg", "-y", *input_args, "-ss", f"{start_value:.3f}", "-i", os.fspath(input_video),
         "-t", f"{duration:.3f}",
