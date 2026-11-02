@@ -39,6 +39,12 @@ _PERMANENT_GPU_MARKERS = (
     "is not found or cannot be loaded", "unsupported device",
     "no cuda-capable device", "driver version is insufficient", "compute type",
 )
+# Of those, the ones that survive a settings change are written to the
+# marker file; a bad WHISPER_COMPUTE must not pin later jobs to the CPU.
+_PERSISTENT_GPU_MARKERS = (
+    "is not found or cannot be loaded", "unsupported device",
+    "no cuda-capable device", "driver version is insufficient",
+)
 _DOWNLOAD_SIZE = {
     "large-v3-turbo": "~1.6 GB", "turbo": "~1.6 GB", "small": "~0.5 GB",
     "medium": "~1.5 GB", "large-v3": "~3 GB",
@@ -75,9 +81,12 @@ def _env_number(name, default, cast):
     if not raw:
         return default
     try:
-        return cast(raw)
-    except ValueError:
-        print(f"⚠️ {name}={raw!r} is not a number, using {default}")
+        value = cast(raw)
+        if value != value or value in (float("inf"), float("-inf")):
+            raise ValueError("not finite")
+        return value
+    except (ValueError, OverflowError):
+        print(f"⚠️ {name}={raw!r} is not a usable number, using {default}")
         return default
 
 
@@ -192,7 +201,8 @@ def _note_gpu_failure(exc):
     text = describe_error(exc).lower()
     if any(marker in text for marker in _PERMANENT_GPU_MARKERS):
         _gpu_disabled_reason = describe_error(exc)
-        _persist_gpu_failure(_gpu_disabled_reason)
+        if any(marker in text for marker in _PERSISTENT_GPU_MARKERS):
+            _persist_gpu_failure(_gpu_disabled_reason)
 
 
 def _batch_size():
@@ -202,7 +212,7 @@ def _batch_size():
         return 0
 
 
-def ensure_model(name, on_status=None, report=None):
+def ensure_model(name, on_status=None, report=None, allow_download=True):
     """Local path of a CTranslate2 Whisper model; downloads it on first use.
 
     A cached snapshot counts only when it is complete: an interrupted first
@@ -217,6 +227,8 @@ def ensure_model(name, on_status=None, report=None):
             return path
     except Exception:
         pass
+    if not allow_download:
+        raise FileNotFoundError(f"Whisper model {name} is not cached and downloads are off for this run")
     if report is not None:
         report["downloaded"] = True
     if on_status:
@@ -294,6 +306,7 @@ class gpu_slot:
                 os.close(descriptor)
             now = time.monotonic()
             if now >= deadline:
+                self.waited_seconds = now - started
                 return False
             if self.on_wait and now - announced >= 30:
                 self.on_wait(int(deadline - now))
@@ -385,7 +398,7 @@ def _attempt(media_path, params, cfg, on_segment, on_status, log):
 
 
 def run_whisper(media_path, params, *, on_segment=None, on_restart=None, on_status=None,
-                on_wait=None, log=print):
+                on_wait=None, allow_gpu_download=True, log=print):
     """Transcribe media_path; returns (segments, info, cfg_used).
 
     A GPU failure at load time, in transcribe() or while iterating discards
@@ -393,16 +406,25 @@ def run_whisper(media_path, params, *, on_segment=None, on_restart=None, on_stat
     on the CPU with WHISPER_CPU_MODEL. on_wait(seconds_left) is called while
     another job holds the GPU (default: an on_status message).
     LAST_RUN records gpu_wait_seconds and model_downloaded: that time is not
-    transcription speed.
+    transcription speed. allow_gpu_download=False sends a GPU run whose model
+    is not cached straight to the CPU (the caller's download already failed).
     """
     cfg = resolve_whisper_config()
+    download = {}
     if cfg["device"] != "cuda":
-        return _attempt(media_path, params, cfg, on_segment, on_status, log)
+        try:
+            cfg = {**cfg, "model_path": ensure_model(cfg["model_size"], on_status, report=download)}
+        except Exception:
+            pass                                   # WhisperModel reports the real error
+        result = _attempt(media_path, params, cfg, on_segment, on_status, log)
+        LAST_RUN.update(gpu_wait_seconds=0.0, model_downloaded=bool(download.get("downloaded")))
+        return result
     reason = None
     model_path = None
-    download = {}
     try:
-        model_path = ensure_model(cfg["model_size"], on_status, report=download)   # outside the GPU slot
+        model_path = ensure_model(                  # outside the GPU slot
+            cfg["model_size"], on_status, report=download, allow_download=allow_gpu_download,
+        )
     except Exception as exc:
         reason = f"model download failed ({describe_error(exc)})"
     slot = None

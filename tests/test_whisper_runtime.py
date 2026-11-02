@@ -435,4 +435,40 @@ def test_busy_slot_falls_back_and_records_the_wait(backend, monkeypatch, tmp_pat
         (_segments, _info, cfg), _events = _run(on_wait=waits.append)
     assert cfg["device"] == "cpu"
     assert whisper_runtime.LAST_RUN["fell_back"] is True
-    assert "gpu_wait_seconds" in whisper_runtime.LAST_RUN
+    assert whisper_runtime.LAST_RUN["gpu_wait_seconds"] >= 0.0
+
+
+def test_full_slot_timeout_records_the_wait(tmp_path):
+    holder = whisper_runtime.gpu_slot("t", slots=1, wait_seconds=1, lock_dir=str(tmp_path))
+    waiter = whisper_runtime.gpu_slot("t", slots=1, wait_seconds=0.2, lock_dir=str(tmp_path), poll=0.05)
+    with holder:
+        with waiter as acquired:
+            assert acquired is False
+    assert waiter.waited_seconds >= 0.2
+
+
+@pytest.mark.parametrize("raw", ["inf", "nan", "-inf", "1e400"])
+def test_infinite_wait_setting_falls_back_to_default(monkeypatch, raw):
+    monkeypatch.setenv("WHISPER_GPU_WAIT_SECONDS", raw)
+    assert whisper_runtime.gpu_slot("t").wait_seconds == 900.0
+
+
+def test_bad_compute_type_is_not_persisted_for_later_jobs(backend, tmp_path):
+    backend.load_error["cuda"] = RuntimeError("requested float16 compute type, but the device does not support it")
+    _run()
+    assert whisper_runtime._gpu_disabled_reason            # this process stays on the CPU
+    assert not (tmp_path / whisper_runtime.GPU_DISABLED_MARKER).exists()
+
+
+def test_failed_prefetch_sends_the_gpu_run_straight_to_cpu(backend):
+    (_segments, _info, cfg), events = _run(allow_gpu_download=False)
+    assert cfg["device"] == "cpu"
+    assert ("large-v3-turbo", False) not in backend.downloads    # no second download attempt
+    assert events[0][0] == "restart" and "download" in events[0][1]
+
+
+def test_cpu_run_reports_its_model_download(backend):
+    backend.cuda_devices = 0
+    (_segments, _info, cfg), _events = _run()
+    assert cfg["model_path"] == "/models/small"
+    assert whisper_runtime.LAST_RUN["model_downloaded"] is True

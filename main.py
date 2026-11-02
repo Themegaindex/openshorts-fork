@@ -2791,9 +2791,11 @@ def _prefetch_whisper_model(reporter, model_size):
 
     The first run fetches ~1.6 GB without progress events; on a slow link
     that alone can outlast the transcription deadline. A failure is left to
-    run_whisper, which reports it and transcribes on the CPU.
+    run_whisper, which then skips a second download and transcribes on the
+    CPU. Returns False when the model could not be fetched.
     """
     download = {}
+    ok = True
     try:
         with reporter.operation(
             "whisper model download",
@@ -2807,13 +2809,15 @@ def _prefetch_whisper_model(reporter, model_size):
                 report=download,
             )
     except Exception as exc:
+        ok = False
         print(f"   ⚠️ Whisper model download failed ({exc}); transcription will fall back to the CPU.")
     if download.get("downloaded"):
         excluded = set(getattr(reporter, "stats_excluded_phases", ()) or ())
         reporter.stats_excluded_phases = excluded | {"transcribe"}
+    return ok
 
 
-def transcribe_video(video_path, video_duration=None):
+def transcribe_video(video_path, video_duration=None, allow_gpu_download=True):
     print("🎙️  Transcribing video with Faster-Whisper...")
     from subtitles import WHISPER_TRANSCRIBE_PARAMS, merge_continuation_words
 
@@ -2874,6 +2878,7 @@ def transcribe_video(video_path, video_duration=None):
         on_restart=on_restart,
         on_status=on_status,
         on_wait=on_wait,
+        allow_gpu_download=allow_gpu_download,
     )
     last_run = whisper_runtime.LAST_RUN
     if last_run.get("model_downloaded") or float(last_run.get("gpu_wait_seconds") or 0) > 5.0:
@@ -5606,15 +5611,16 @@ if __name__ == '__main__':
                 whisper_cfg = whisper_runtime.resolve_whisper_config()
                 reporter.phase_cost_variant["transcribe"] = whisper_cfg["device"]
                 reporter.set_phase("transcribe", "Transcribing audio", message="Starting transcription...")
+                gpu_model_ready = True
                 if whisper_cfg["device"] == "cuda":
-                    _prefetch_whisper_model(reporter, whisper_cfg["model_size"])
+                    gpu_model_ready = _prefetch_whisper_model(reporter, whisper_cfg["model_size"])
                 with reporter.operation(
                     "transcription",
                     timeout_seconds=max(BLOCKING_OPERATION_STALL_SECONDS, int(duration * 2.0)),
                     message="Transcription worker started.",
                     category="transcribe",
                 ):
-                    transcript = transcribe_video(input_video, duration)
+                    transcript = transcribe_video(input_video, duration, allow_gpu_download=gpu_model_ready)
                 _save_json_file(transcript_file, transcript)
                 reporter.artifact("transcript", transcript_file)
                 words_payload = {"words": _extract_words_for_analysis(transcript)}

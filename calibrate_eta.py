@@ -92,6 +92,11 @@ def benchmark_transcribe(source, workdir, long_seconds):
         main.transcribe_video(segment, seconds)
         timings[name] = time.perf_counter() - started
         runs.add((whisper_runtime.LAST_RUN.get("device"), bool(whisper_runtime.LAST_RUN.get("fell_back"))))
+        if whisper_runtime.LAST_RUN.get("model_downloaded") or float(
+            whisper_runtime.LAST_RUN.get("gpu_wait_seconds") or 0
+        ) > 5.0:
+            print("   ⚠️ Transcription waited for the GPU or downloaded a model, sample skipped.")
+            return None
     if len(runs) != 1 or any(fell_back for _device, fell_back in runs):
         print("   ⚠️ Transcription changed device between runs (GPU fallback), sample skipped.")
         return None

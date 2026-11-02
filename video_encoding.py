@@ -339,8 +339,11 @@ def _probe_source(path):
         )
         stream = (json.loads(completed.stdout or "{}").get("streams") or [None])[0]
         if stream:
+            # ICC or Dolby Vision side data can come before the display
+            # matrix; ffprobe prints those entries as {}.
             rotation = next(
-                (int(float(entry.get("rotation") or 0)) for entry in stream.get("side_data_list") or []),
+                (int(float(entry["rotation"])) for entry in stream.get("side_data_list") or []
+                 if isinstance(entry, dict) and entry.get("rotation") is not None),
                 0,
             )
             info = {

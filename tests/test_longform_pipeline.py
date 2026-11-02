@@ -1290,7 +1290,7 @@ def test_explicit_long_source_is_rejected_before_transcription():
     early_guard = source.index(
         "_validate_longform_source_duration(video_type, duration)", cli_start,
     )
-    transcription = source.index("transcript = transcribe_video(input_video, duration)", cli_start)
+    transcription = source.index("transcript = transcribe_video(input_video, duration", cli_start)
     assert early_guard < transcription
 
 
@@ -2187,7 +2187,7 @@ def test_transcribe_video_keeps_transcript_contract(monkeypatch):
     calls = []
 
     def fake_run_whisper(media_path, params, *, on_segment=None, on_restart=None, on_status=None,
-                         on_wait=None, log=print):
+                         on_wait=None, allow_gpu_download=True, log=print):
         calls.append((media_path, dict(params)))
         info = SimpleNamespace(language="de", language_probability=0.97)
         segments = _fake_whisper_segments()
@@ -2217,7 +2217,7 @@ def test_transcribe_video_gpu_fallback_resets_progress_and_excludes_stats(monkey
     monkeypatch.setattr(main, "JOB_REPORTER", reporter)
 
     def fake_run_whisper(media_path, params, *, on_segment=None, on_restart=None, on_status=None,
-                         on_wait=None, log=print):
+                         on_wait=None, allow_gpu_download=True, log=print):
         info = SimpleNamespace(language="de", language_probability=0.97)
         on_segment(SimpleNamespace(end=8.0), info)
         on_status("Transcribing on GPU with Whisper large-v3-turbo")   # no heartbeat on the fake

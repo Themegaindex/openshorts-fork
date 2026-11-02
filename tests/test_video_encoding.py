@@ -243,6 +243,22 @@ def test_nvdec_skips_10bit_rotation_and_off_switch(monkeypatch, tmp_path):
     assert ve.nvdec_input_args("s.mp4", gpu_frames=False) == []
 
 
+@pytest.mark.parametrize("side_data", [
+    [{"rotation": 90}],
+    [{}, {"rotation": 90}],                                   # ICC / Dolby Vision entry first
+    [{"side_data_type": "ICC profile"}, {"side_data_type": "Display Matrix", "rotation": -90}],
+])
+def test_rotation_is_found_in_any_side_data_entry(monkeypatch, tmp_path, side_data):
+    import json
+
+    source = tmp_path / "phone.mp4"
+    source.write_bytes(b"x")
+    payload = json.dumps({"streams": [{"codec_name": "h264", "pix_fmt": "yuv420p", "side_data_list": side_data}]})
+    monkeypatch.setattr(ve.subprocess, "run", lambda *_a, **_k: subprocess.CompletedProcess([], 0, stdout=payload))
+    ve.reset_state()
+    assert ve.source_rotation(str(source)) in (90, 270)
+
+
 def test_builders_match_legacy_commands():
     cut = ve.clip_cut_command("src.mp4", 1.5, 9.0, "temp.mp4", video_args=ve._X264_ARGS[ve.HIGH])
     assert cut == [
