@@ -151,6 +151,29 @@ Im Browser **`http://localhost:5175`** aufrufen
 4. **YouTube Studio**: Thumbnails, Titel und Beschreibungen für YouTube generieren
 5. **UGC Gallery**: Alle generierten Videos und Avatare durchstöbern
 
+### YouTube fordert eine Anmeldung oder Bot-Bestätigung
+
+Öffne das Video im Browser, melde dich an und bestätige eine eventuell angezeigte
+Prüfung. Exportiere anschließend frische YouTube-Cookies im Netscape-Format nach
+`www.youtube.com_cookies.txt` im Projektordner. Die
+[yt-dlp-Anleitung](https://github.com/yt-dlp/yt-dlp/wiki/Extractors#exporting-youtube-cookies)
+beschreibt einen Export aus einer privaten Sitzung, deren Cookies anschließend
+nicht durch weitere Browser-Nutzung rotiert werden. Danach den fehlgeschlagenen
+Job erneut starten. Cookies gehören nicht in Git oder Support-Logs.
+
+Für einen anderen Dateipfad gibt es `YOUTUBE_COOKIES_FILE` in `.env`. Bei lokaler
+Ausführung kann alternativ `YOUTUBE_COOKIES_BROWSER=brave` (auch `firefox`,
+`chrome` oder `edge`) und optional `YOUTUBE_COOKIES_PROFILE=Default` gesetzt werden.
+Browser-Cookies werden nur bei dieser ausdrücklichen Konfiguration gelesen.
+Unter Windows muss der Browser dafür gegebenenfalls vollständig geschlossen sein.
+Meldet yt-dlp einen DPAPI-Entschlüsselungsfehler, verwende den Cookie-Export.
+Ein Docker-Backend kann die Browser-Cookies des Hosts nicht direkt lesen.
+
+Nach Änderungen an `.env` das Backend neu starten. Browser, Cookie-Datei und
+anonyme Sitzung werden getrennt versucht; eine Cookie-Datei wird beim Download
+nicht überschrieben. Bleibt YouTube gesperrt, kann eine vorhandene Videodatei
+über den Upload verarbeitet werden.
+
 ---
 
 ## Technische Pipeline
@@ -168,7 +191,7 @@ Im Browser **`http://localhost:5175`** aufrufen
 
 ### Long Video / Smart-Auto V2
 1. **Unit-Planung** — Whisper-Wörter werden an Satzenden und Sprechpausen in stabile IDs zerlegt; Gemini wählt keine frei geschätzten Sekunden mehr.
-2. **Smarter Rohschnitt** — Gemini wählt die stärksten unterschiedlichen Themen chronologisch und bestimmt ohne Füllmaterial eine Dauer von 4–10 Minuten.
+2. **Smarter Rohschnitt** — Gemini wählt die stärksten unterschiedlichen Themen chronologisch und bestimmt ohne Füllmaterial eine Dauer von 8–10 Minuten.
 3. **Final-Cut-Review** — Ein separater Gemini-Pass prüft Einstieg, Kontext, Übergänge, Wiederholungen und Schluss; ein fehlgeschlagenes Gate erhält genau einen Repair-Versuch.
 4. **Natürliche Grenzen** — Schnitte liegen in Sprechpausen; Scene-Snapping dekodiert nur ein kleines lokales Fenster pro Schnitt. Sichtbare Übergangseffekte werden nicht verwendet.
 5. **Sicherer Auto-Modus** — Besteht kein Long Video das Gate, bleiben vorhandene Shorts erhalten. Ein explizit angefordertes Long Video liefert keinen künstlich aufgefüllten Ersatz.
@@ -208,13 +231,15 @@ Im Browser **`http://localhost:5175`** aufrufen
 | `GEMINI_MODEL` / `GEMINI_MODEL_ANALYSIS` / `GEMINI_MODEL_EDITOR` / … | Gemini-Modell pro Aufgabe |
 | `GEMINI_THINKING_SCORE` | Optionales Thinking-Budget fürs Clip-Scoring |
 | `GEMINI_THINKING_LONGFORM` | Thinking-Level für Longform-Planung und -Review (Standard: `low`) |
-| `LONGFORM_MIN_OUTPUT_SECONDS` / `LONGFORM_MAX_OUTPUT_SECONDS` | Adaptive Longform-Grenzen (Standard: 240 / 600 s) |
-| `LONGFORM_MIN_SOURCE_SECONDS` / `LONGFORM_HARD_MIN_SOURCE_SECONDS` | Ab welcher Quelllänge Auto ein Long Video versucht (720 s) bzw. der explizite Long-Modus (240 s) |
+| `LONGFORM_MIN_OUTPUT_SECONDS` / `LONGFORM_MAX_OUTPUT_SECONDS` | Adaptive Longform-Grenzen (Standard: 480 / 600 s) |
+| `LONGFORM_MIN_SOURCE_SECONDS` / `LONGFORM_HARD_MIN_SOURCE_SECONDS` | Ab welcher Quelllänge Auto ein Long Video versucht (720 s) bzw. der explizite Long-Modus (Standard: gleich `LONGFORM_MIN_OUTPUT_SECONDS`, 480 s) |
 | `LONGFORM_MIN_CHAPTERS` / `LONGFORM_MAX_CHAPTERS` | Anzahl unterschiedlicher Themen im Longform-Schnitt (Standard: 2 / 6); 1 erlaubt einthemige Quellen |
 | `LONGFORM_REVIEW_MIN_OVERALL_SCORE` / `LONGFORM_REVIEW_MIN_JOIN_SCORE` | Qualitäts-Gates vor dem Longform-Render |
 | `LONGFORM_REVIEW_BOUNDARY_WINDOW_SECONDS` / `LONGFORM_REVIEW_BOUNDARY_MAX_UNITS` | Lokaler Transkript-Kontext vor/nach jedem Schnitt für vollständige Fragen und Antworten (Standard: 75 s / 24 Units) |
 | `LONGFORM_STRONG_PAUSE_SECONDS` / `LONGFORM_PAUSE_FALLBACK_WINDOW_SECONDS` | Starke Sprechpause und lokaler Fast-Speaker-Fallback (Standard: 0,55 / 24 s) |
-| `WHISPER_MODEL` / `WHISPER_DEVICE` / `WHISPER_COMPUTE` | Transkriptionsqualität/-geschwindigkeit |
+| `WHISPER_DEVICE` / `WHISPER_MODEL` / `WHISPER_COMPUTE` / `WHISPER_CPU_MODEL` | Transkription: `auto` nutzt die NVIDIA-GPU (large-v3-turbo) und fällt bei GPU-Fehlern auf die CPU (small) zurück |
+| `VIDEO_ENCODER` / `VIDEO_HWDECODE` / `VIDEO_NVENC_CQ_OFFSET` | Video-Encoding: `auto` nutzt NVENC/NVDEC der NVIDIA-GPU und rendert bei GPU-Fehlern automatisch mit libx264 neu |
+| `SHORTS_DELIVERY_WIDTH` / `SHORTS_UPSCALE_INTERPOLATION` | Größe der 9:16-/1:1-Clips (Standard: 1080 → 1080x1920 / 1080x1080; 0 = alte Crop-Größe) und Filter zum Hochskalieren kleiner Quellen (Standard: cubic) |
 | `QUALITY_GATE_MIN_HEIGHT` | Rückfrage unterhalb dieser Auflösung (Standard: 720) |
 | `WATERMARK_ENABLED` / `WATERMARK_TEXT` / `WATERMARK_IMAGE` / `WATERMARK_OPACITY` | Wasserzeichen-Konfiguration |
 

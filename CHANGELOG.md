@@ -7,6 +7,9 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 
 ### Added
 
+- **Transkription auf der GPU**: Whisper läuft auf einer NVIDIA-GPU mit `large-v3-turbo` und fällt bei GPU-Fehlern (fehlendes cuBLAS, Speicher voll, Download-Fehler) automatisch auf die CPU zurück. Gemessen: 10 Minuten Audio 126 s → 27 s.
+- **Video-Encoding auf der GPU (NVENC/NVDEC)**: Schneiden, Reframing, Wasserzeichen und Untertitel-Einbrennen nutzen NVENC, wenn ein kurzer Test-Encode klappt. Schlägt ein GPU-Encode fehl, wird derselbe Schritt automatisch mit libx264 wiederholt. Gemessen am 4K-Clip: Schnitt 27,1 → 13,4 s, Einbrennen 7,6 → 4,4 s.
+- **Shorts in Full HD**: 9:16-Clips kommen immer in 1080×1920, 1:1-Clips in 1080×1080, egal wie groß die Quelle ist (vorher z. B. 608×1080 aus 1080p). Original-Format und Langvideo behalten ihre Größe. `SHORTS_DELIVERY_WIDTH=0` stellt die alte Größe wieder her.
 - **Echte Job-Zeitmessung**: Der Status speichert jetzt den geprüften Abschlusszeitpunkt, die tatsächliche Gesamtdauer sowie gemessene Zeiten für Download, Transkription, Gemini-Analyse, Rendering und Abschluss. Restzeiten werden erst angezeigt, wenn der laufende Job selbst genügend Fortschrittsdaten geliefert hat.
 - **Nachvollziehbare Gemini-Abdeckung**: Analyseartefakte und Support-Logs zeigen, wie viele Transkriptfenster erfolgreich verarbeitet wurden und welche einzelnen Fenster trotz Rettungsversuch ausfielen.
 - **Faktenbasierte Smart-Layout-Planung**: Die Szenenanalyse kombiniert jetzt MediaPipe-Gesichter mit YOLO-Personenzählungen und dauerabhängigem Sampling. Stabile Einzelpersonen-Szenen bekommen einen ruhigen Zoom, stabile Zwei-Personen-Szenen den festen Split im Opus-Stil, Gruppen oder unsichere Szenen bleiben in der Weitwinkel-Ansicht. Die Logs zeigen pro Szene Zeitbereich, Personenzahl, Konfidenz und die Zahl künstlicher Kamerawechsel.
@@ -15,6 +18,8 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 
 ### Changed
 
+- **Schnellere Gesichts- und Szenenanalyse**: Prüfbilder werden in einem Durchgang gelesen, die Gesichtserkennung läuft jedes 4. Bild, der YOLO-Fallback höchstens alle 0,3 s, das Dekodieren läuft parallel und der Weichzeichner-Hintergrund wird auf Viertelgröße berechnet. Layout-Entscheidungen und Bildausschnitte bleiben gleich. Gemessen: 4K-Clip 102,6 → 50,3 s, 1440p 51,5 → 30,2 s (mit Full-HD-Ausgabe). `REFRAME_FAST=0` stellt die alten Wege wieder her.
+- **Langvideo erst ab 8 Minuten**: Quellen unter 8 Minuten (480 s) werden für den Langvideo-Schnitt abgelehnt.
 - **Mehr Auswahl nur bei sehr langen Videos**: Unter zwei Stunden bleibt die bisherige Kandidatenauswahl unverändert. Ab zwei Stunden prüft Gemini 15 statt 10 Top-Fenster; ausgegeben werden weiterhin höchstens 10 voneinander verschiedene starke Clips, ohne künstliches Auffüllen.
 - **Ehrliche Restzeit im Dashboard**: Die alte sofortige Gesamtprognose aus gemischten historischen Vollvideo-/Clip-Messwerten wurde durch „Wird berechnet“, eine klar als Phasen-Restzeit bezeichnete Live-Schätzung und die exakte Gesamtdauer nach Abschluss ersetzt.
 - **Klare Ausgabeformate**: 9:16 ist der explizite Standard, Original und 1:1 sind Alternativen. Alte `auto`- und `horizontal`-Werte bleiben kompatibel. Speaker-Zoom und Weitwinkel bleiben unter „Erweitert" verfügbar, Smart ist die empfohlene Voreinstellung.

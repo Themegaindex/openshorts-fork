@@ -43,7 +43,14 @@ from dotenv import load_dotenv
 import json
 import shutil
 from typing import List, Optional
+import frame_sampler
 import longform
+import video_encoding
+import whisper_runtime
+from youtube_download import (
+    YouTubeDownloadError, open_youtube_dl, youtube_auth_attempts,
+    youtube_base_options, youtube_failure_message,
+)
 
 # OS advisory file locks for the shared ETA history (_job_stats_file_lock):
 # msvcrt on Windows, flock everywhere else.
@@ -67,14 +74,21 @@ from render_planning import (
     smooth_scene_strategies,
     split_crop_windows,
 )
-from speaker_tracking import SpeakerTracker, TargetState
+from speaker_tracking import (
+    FallbackThrottle, SpeakerTracker, TargetState, effective_detect_stride, person_fallback_due,
+)
 from video_formats import (
     CANONICAL_OUTPUT_FORMATS,
     EVEN_PAD_FILTER,
     OUTPUT_FORMAT_CHOICES,
+    delivery_dimensions,
+    delivery_scale_filter,
+    delivery_width_from_env,
     fit_even_output_dimensions,
     normalize_output_format,
     output_aspect_ratio,
+    resize_interpolation,
+    upscale_interpolation_from_env,
 )
 
 import warnings
@@ -87,6 +101,59 @@ load_dotenv()
 ASPECT_RATIO = 9 / 16
 OUTPUT_FORMATS = CANONICAL_OUTPUT_FORMATS
 LAYOUT_STYLES = ("smart", "zoom", "wide")
+
+
+def _env_flag(name, default):
+    raw = os.environ.get(name, "").strip().lower()
+    return default if not raw else raw not in ("0", "false", "off", "no")
+
+
+def _env_number(name, default, cast, minimum):
+    raw = os.environ.get(name, "").strip()
+    if not raw:
+        return default
+    try:
+        return max(minimum, cast(raw))
+    except ValueError:
+        print(f"⚠️ {name}={raw!r} is not a number; using {default}.")
+        return default
+
+
+# Reframe speedups. REFRAME_FAST=0 restores every legacy reframe path; each
+# variable below switches off one speedup on its own.
+REFRAME_FAST = _env_flag("REFRAME_FAST", True)
+
+
+def _fast_or_legacy(fast, legacy):
+    return fast if REFRAME_FAST else legacy
+
+
+# Scene-analysis samples are read in one forward pass (0 = one seek each).
+REFRAME_SAMPLE_MAX_FORWARD = _env_number(
+    "REFRAME_SAMPLE_MAX_FORWARD", _fast_or_legacy(frame_sampler.MAX_FORWARD, 0), int, 0)
+# Frames between TRACK face detections (the tracker itself works in seconds).
+REFRAME_DETECT_STRIDE = _env_number("REFRAME_DETECT_STRIDE", _fast_or_legacy(4, 2), int, 1)
+# Minimum video-time gap between YOLO person-fallback runs while LOST.
+REFRAME_YOLO_INTERVAL_SECONDS = _env_number(
+    "REFRAME_YOLO_INTERVAL_SECONDS", _fast_or_legacy(0.3, 0.0), float, 0.0)
+# Blurred backdrops are computed at 1/N size and scaled up (1 = full size).
+REFRAME_BLUR_DOWNSCALE = _env_number("REFRAME_BLUR_DOWNSCALE", _fast_or_legacy(4, 1), int, 1)
+# Frames decoded ahead on a worker thread in the frame loop (0 = off).
+REFRAME_DECODE_PREFETCH = _env_number("REFRAME_DECODE_PREFETCH", _fast_or_legacy(4, 0), int, 0)
+LONGFORM_BLUR_DOWNSCALE = _env_number("LONGFORM_BLUR_DOWNSCALE", _fast_or_legacy(4, 1), int, 1)
+# GaussianBlur((51, 51), 0) derives sigma 0.3*((51-1)*0.5-1)+0.8 = 8.0.
+GENERAL_BLUR_KSIZE = 51
+GENERAL_BLUR_SIGMA = 8.0
+# Vertical/square shorts ship at a fixed platform size (1080x1920 / 1080x1080)
+# instead of the raw crop size. SHORTS_DELIVERY_WIDTH=0 restores the old size.
+SHORTS_DELIVERY_WIDTH = delivery_width_from_env()
+# Resampler when a crop must grow (720p-1440p sources).
+SHORTS_UPSCALE_INTERPOLATION = upscale_interpolation_from_env()
+_CV2_INTERPOLATION_NAMES = {
+    "lanczos": "INTER_LANCZOS4",
+    "cubic": "INTER_CUBIC",
+    "linear": "INTER_LINEAR",
+}
 # Watermark: subtle centered overlay so rendered clips can't be re-uploaded as
 # someone else's work. Configure via env; WATERMARK_TEXT wins over the image.
 WATERMARK_ENABLED = os.environ.get("WATERMARK_ENABLED", "1").strip().lower() not in ("0", "false", "off", "no")
@@ -134,19 +201,24 @@ AUTO_FULL_VIDEO_FALLBACK_MAX_SECONDS = max(
     float(os.environ.get("AUTO_FULL_VIDEO_FALLBACK_MAX_SECONDS", "1800")),
 )
 GEMINI_WORKER_SCRIPT = os.path.join(os.path.dirname(os.path.abspath(__file__)), "gemini_worker.py")
+# A long video runs 8-10 minutes by default.
 LONGFORM_TARGET_MIN_SECONDS = float(
-    os.environ.get("LONGFORM_MIN_OUTPUT_SECONDS", os.environ.get("LONGFORM_TARGET_MIN_SECONDS", "240"))
+    os.environ.get("LONGFORM_MIN_OUTPUT_SECONDS", os.environ.get("LONGFORM_TARGET_MIN_SECONDS", "480"))
 )
 LONGFORM_TARGET_MAX_SECONDS = float(
     os.environ.get("LONGFORM_MAX_OUTPUT_SECONDS", os.environ.get("LONGFORM_TARGET_MAX_SECONDS", "600"))
 )
-# Auto only attempts a long video when the source can plausibly spare the best
-# 4-10 minutes. Below this a "best-of" would be close to the full recording, so
+# Auto only attempts a long video from sources of at least this length.
+# Shorter sources would turn the best-of into nearly the full recording, so
 # Auto stays with Shorts instead of burning a planning pass on it.
 LONGFORM_MIN_SOURCE_SECONDS = float(os.environ.get("LONGFORM_MIN_SOURCE_SECONDS", "720"))
 # The explicit Long mode keeps the lower physical bound: the user asked for a
-# long video, so attempt it and let the quality gate decide.
-LONGFORM_HARD_MIN_SOURCE_SECONDS = float(os.environ.get("LONGFORM_HARD_MIN_SOURCE_SECONDS", "240"))
+# long video, so attempt it and let the quality gate decide. A source shorter
+# than the minimum output can never yield a valid edit, so this bound follows
+# the output minimum unless it is set explicitly.
+LONGFORM_HARD_MIN_SOURCE_SECONDS = float(
+    os.environ.get("LONGFORM_HARD_MIN_SOURCE_SECONDS", str(LONGFORM_TARGET_MIN_SECONDS))
+)
 LONGFORM_MIN_SEGMENT_SECONDS = float(os.environ.get("LONGFORM_MIN_SEGMENT_SECONDS", "20"))
 LONGFORM_MAX_SEGMENT_SECONDS = float(os.environ.get("LONGFORM_MAX_SEGMENT_SECONDS", "240"))
 LONGFORM_MAX_SEGMENTS = int(os.environ.get("LONGFORM_MAX_SEGMENTS", "12"))
@@ -225,6 +297,12 @@ PHASE_COST_PRIORS = {
 }
 # Fixed overhead every phase pays regardless of length (model load, API round
 # trips, container mux), so a 30s video does not get a 1-second estimate.
+# Device-specific seeds. GPU transcription (large-v3-turbo fp16) is roughly an
+# order of magnitude faster than the CPU small model; its learned median
+# replaces this estimate after the first jobs.
+PHASE_COST_PRIORS_BY_VARIANT = {
+    ("transcribe", "cuda"): 0.06,
+}
 PHASE_COST_FLOOR = {
     "download": 5.0,
     "transcribe": 15.0,
@@ -369,6 +447,9 @@ class JobReporter:
         self.video_duration = None
         self.output_seconds = None
         self.phase_durations = {}
+        # Per-phase cost history variant, e.g. {"transcribe": "cuda"}. "cpu"
+        # or no entry keeps the legacy history key.
+        self.phase_cost_variant = {}
         self.job_stats = _load_job_stats()
         self.last_work_activity_at = self.started_at
         self.operation_name = None
@@ -395,18 +476,27 @@ class JobReporter:
         if value > 0:
             self.output_seconds = value
 
+    def _stats_unit(self, phase: str):
+        """(base unit, history key) for a phase; device variants get their own key."""
+        unit = PHASE_COST_UNITS.get(phase)
+        variant = (getattr(self, "phase_cost_variant", None) or {}).get(phase)
+        if unit is None or not variant or variant == "cpu":
+            return unit, unit
+        return unit, f"{unit}@{variant}"
+
     def _phase_cost_prior(self, phase: str) -> Optional[float]:
         """Expected total seconds for a phase, from learned medians when available."""
-        unit = PHASE_COST_UNITS.get(phase)
+        unit, stats_unit = self._stats_unit(phase)
         if unit is None:
             return None
         samples = [
-            value for value in (self.job_stats.get(phase) or {}).get(unit) or []
+            value for value in (self.job_stats.get(phase) or {}).get(stats_unit) or []
             if isinstance(value, (int, float)) and value >= 0
         ]
         rate = _median(samples)
         if rate is None:
-            rate = PHASE_COST_PRIORS[phase]
+            variant = (getattr(self, "phase_cost_variant", None) or {}).get(phase)
+            rate = PHASE_COST_PRIORS_BY_VARIANT.get((phase, variant), PHASE_COST_PRIORS[phase])
         floor = PHASE_COST_FLOOR.get(phase, 0.0)
         if unit == "absolute":
             return max(floor, float(rate))
@@ -475,7 +565,7 @@ class JobReporter:
         for phase, seconds in self.phase_durations.items():
             if phase in getattr(self, "stats_excluded_phases", ()):
                 continue
-            unit = PHASE_COST_UNITS.get(phase)
+            unit, stats_unit = self._stats_unit(phase)
             if unit is None or not seconds or seconds < 1.0:
                 continue
             if unit in {"per_source_second", "per_source_second_after_overhead"}:
@@ -494,7 +584,7 @@ class JobReporter:
                 value = seconds / self.output_seconds
             else:
                 value = seconds
-            samples.setdefault(phase, {}).setdefault(unit, []).append(value)
+            samples.setdefault(phase, {}).setdefault(stats_unit, []).append(value)
         if not samples:
             return
         try:
@@ -1549,40 +1639,97 @@ def detect_person_yolo(frame):
                 
     return best_box
 
-def create_general_frame(frame, output_width, output_height):
+def _shrink_frame(image, width, height):
+    """Shrink without aliasing at single-thread OpenCV speed.
+
+    Below 2x, INTER_LINEAR matches INTER_AREA (measured PSNR 55-57 dB) at a
+    quarter of the cost. From 2x on, a box filter at the whole factor (OpenCV's
+    fast integer INTER_AREA path; the centred trim is under k pixels) removes
+    the detail linear sampling would alias, then linear covers the rest.
+    """
+    src_h, src_w = image.shape[:2]
+    factor = int(min(src_w / width, src_h / height))
+    if factor >= 2:
+        trim_h, trim_w = src_h // factor * factor, src_w // factor * factor
+        y0, x0 = (src_h - trim_h) // 2, (src_w - trim_w) // 2
+        image = cv2.resize(
+            image[y0:y0 + trim_h, x0:x0 + trim_w], (trim_w // factor, trim_h // factor),
+            interpolation=cv2.INTER_AREA,
+        )
+        if image.shape[:2] == (height, width):
+            return image
+    return cv2.resize(image, (int(width), int(height)), interpolation=cv2.INTER_LINEAR)
+
+
+def _resize_frame(image, width, height):
+    """Resample to (width, height): _shrink_frame when shrinking, the
+    configured upscaler (bicubic by default) when enlarging, a contiguous
+    pass-through when the size already matches."""
+    src_h, src_w = image.shape[:2]
+    name = resize_interpolation(src_w, src_h, width, height, SHORTS_UPSCALE_INTERPOLATION)
+    if name is None:
+        return np.ascontiguousarray(image)
+    if name == "shrink":
+        return _shrink_frame(image, width, height)
+    return cv2.resize(
+        image, (int(width), int(height)),
+        interpolation=getattr(cv2, _CV2_INTERPOLATION_NAMES[name]),
+    )
+
+
+def _blurred_backdrop(frame, output_width, output_height, downscale):
+    """Blurred 'cover' backdrop for a general shot.
+
+    downscale <= 1 is the legacy full-size path. Otherwise the visible region
+    is shrunk once to 1/downscale of the output, blurred with a matching
+    sigma and scaled up: a blurred backdrop has no detail to lose, and the
+    sharp foreground is untouched. The sigma follows the output height, so a
+    1080x1920 short keeps the look a 1080 px tall clip always had.
+    """
+    orig_h, orig_w = frame.shape[:2]
+    # Generic "cover" scaling works for landscape, portrait and square
+    # sources without negative slices or distortion.
+    scale = max(output_width / orig_w, output_height / orig_h)
+    if downscale <= 1:
+        bg_w = max(output_width, int(round(orig_w * scale)))
+        bg_h = max(output_height, int(round(orig_h * scale)))
+        bg_resized = cv2.resize(frame, (bg_w, bg_h))
+        start_x = max(0, (bg_w - output_width) // 2)
+        start_y = max(0, (bg_h - output_height) // 2)
+        background = bg_resized[start_y:start_y + output_height, start_x:start_x + output_width]
+        return cv2.GaussianBlur(background, (GENERAL_BLUR_KSIZE, GENERAL_BLUR_KSIZE), 0)
+    crop_w = max(1, min(orig_w, int(round(output_width / scale))))
+    crop_h = max(1, min(orig_h, int(round(output_height / scale))))
+    x0, y0 = (orig_w - crop_w) // 2, (orig_h - crop_h) // 2
+    small_w = max(2, output_width // downscale)
+    small_h = max(2, output_height // downscale)
+    small = _resize_frame(frame[y0:y0 + crop_h, x0:x0 + crop_w], small_w, small_h)
+    sigma = GENERAL_BLUR_SIGMA * output_height / 1080.0 / downscale
+    small = cv2.GaussianBlur(small, (0, 0), max(0.5, sigma))
+    return cv2.resize(small, (output_width, output_height), interpolation=cv2.INTER_LINEAR)
+
+
+def create_general_frame(frame, output_width, output_height, blur_downscale=None):
     """
     Creates a 'General Shot' frame: 
     - Background: Blurred zoom of original
     - Foreground: Original video scaled to fit width, centered vertically.
     """
     orig_h, orig_w = frame.shape[:2]
-    
-    # 1. Background: generic "cover" scaling works for landscape, portrait
-    # and square sources without negative slices or distortion.
-    bg_scale = max(output_width / orig_w, output_height / orig_h)
-    bg_w = max(output_width, int(round(orig_w * bg_scale)))
-    bg_h = max(output_height, int(round(orig_h * bg_scale)))
-    bg_resized = cv2.resize(frame, (bg_w, bg_h))
-    start_x = max(0, (bg_w - output_width) // 2)
-    start_y = max(0, (bg_h - output_height) // 2)
-    background = bg_resized[start_y:start_y + output_height,
-                            start_x:start_x + output_width]
-        
-    # Blur background
-    background = cv2.GaussianBlur(background, (51, 51), 0)
+    downscale = REFRAME_BLUR_DOWNSCALE if blur_downscale is None else int(blur_downscale)
+
+    # 1. Background (a new array, safe to draw into).
+    final_frame = _blurred_backdrop(frame, output_width, output_height, downscale)
     
     # 2. Foreground: generic "contain" scaling preserves the whole source.
     scale = min(output_width / orig_w, output_height / orig_h)
     fg_w = max(1, min(output_width, int(round(orig_w * scale))))
     fg_h = max(1, min(output_height, int(round(orig_h * scale))))
-    foreground = cv2.resize(frame, (fg_w, fg_h))
+    foreground = _resize_frame(frame, fg_w, fg_h)
     
     # 3. Overlay
     y_offset = (output_height - fg_h) // 2
     x_offset = (output_width - fg_w) // 2
-    
-    # Clone background to avoid modifying it
-    final_frame = background.copy()
     final_frame[y_offset:y_offset + fg_h, x_offset:x_offset + fg_w] = foreground
     
     return final_frame
@@ -1607,12 +1754,12 @@ def create_split_frame(frame, output_width, output_height, centers, stacked=True
         crop = frame[y1:y2, x1:x2]
         if crop.size == 0:
             crop = frame
-        panels.append(cv2.resize(crop, (panel_w, panel_h)))
+        panels.append(_resize_frame(crop, panel_w, panel_h))
 
     combined = cv2.vconcat(panels) if stacked else cv2.hconcat(panels)
     if combined.shape[0] != output_height or combined.shape[1] != output_width:
         # Odd output sizes leave a 1px remainder after halving — snap to size.
-        combined = cv2.resize(combined, (output_width, output_height))
+        combined = _resize_frame(combined, output_width, output_height)
     return combined
 
 
@@ -1698,13 +1845,18 @@ def _build_watermark_blender(output_width, output_height):
         return None
     alpha = arr[:, :, 3:4] / 255.0
     bgr = arr[:, :, [2, 1, 0]]
-    return (bgr * alpha, 1.0 - alpha, x, y, w, h)
+    # Contiguous 3-channel float32 planes let OpenCV blend in one pass; the
+    # arithmetic is the same float32 math as roi * (1 - alpha) + premul.
+    premul = np.ascontiguousarray(bgr * alpha, dtype=np.float32)
+    inv_alpha = np.ascontiguousarray(np.repeat(1.0 - alpha, 3, axis=2), dtype=np.float32)
+    return (premul, inv_alpha, x, y, w, h)
 
 
 def _apply_watermark(frame, blender):
     premul, inv_alpha, x, y, w, h = blender
-    roi = frame[y:y + h, x:x + w].astype(np.float32)
-    frame[y:y + h, x:x + w] = (roi * inv_alpha + premul).astype(np.uint8)
+    roi = frame[y:y + h, x:x + w]
+    blended = cv2.add(cv2.multiply(roi, inv_alpha, dtype=cv2.CV_32F), premul)
+    frame[y:y + h, x:x + w] = blended.astype(np.uint8)
     return frame
 
 
@@ -1729,34 +1881,35 @@ def analyze_scenes_strategy(video_path, scenes, layout_style="smart"):
     frame_width = int(cap.get(cv2.CAP_PROP_FRAME_WIDTH) or 0) or 1920
     fps = float(cap.get(cv2.CAP_PROP_FPS) or 0) or 30.0
 
-    for start, end in tqdm(scenes, desc="   Analyzing Scenes"):
-        # Duration-aware coverage: short shots still get five observations;
-        # long shots get up to 24 instead of being judged from five snapshots.
-        frames_to_check = sample_scene_frames(
-            start.get_frames(),
-            end.get_frames(),
-            fps,
-        )
+    # Duration-aware coverage: short shots still get five observations;
+    # long shots get up to 24 instead of being judged from five snapshots.
+    plan = [sample_scene_frames(start.get_frames(), end.get_frames(), fps) for start, end in scenes]
+    # Same indices as before, read in ONE forward pass over the clip.
+    frames = frame_sampler.read_at(
+        cap, [index for indices in plan for index in indices], max_forward=REFRAME_SAMPLE_MAX_FORWARD,
+    )
+    try:
+        for frames_to_check in tqdm(plan, desc="   Analyzing Scenes"):
+            face_samples = []
+            person_samples = []
+            for _index in frames_to_check:
+                frame = next(frames, None)
+                if frame is None:
+                    continue
 
-        face_samples = []
-        person_samples = []
-        for f_idx in frames_to_check:
-            cap.set(cv2.CAP_PROP_POS_FRAMES, f_idx)
-            ret, frame = cap.read()
-            if not ret: continue
+                # Full resolution on purpose: layout evidence stays exact.
+                candidates = detect_face_candidates(frame)
+                face_samples.append([c['box'] for c in candidates])
+                if layout_style != "zoom":
+                    person_samples.append(detect_person_boxes(frame))
 
-            candidates = detect_face_candidates(frame)
-            face_samples.append([c['box'] for c in candidates])
-            if layout_style != "zoom":
-                person_samples.append(detect_person_boxes(frame))
-
-        decision = decide_scene_layout_detailed(
-            face_samples, frame_width, layout_style=layout_style,
-            person_samples=person_samples,
-        )
-        decisions.append(decision)
-
-    cap.release()
+            decision = decide_scene_layout_detailed(
+                face_samples, frame_width, layout_style=layout_style,
+                person_samples=person_samples,
+            )
+            decisions.append(decision)
+    finally:
+        cap.release()
     return decisions
 
 def detect_scenes(video_path):
@@ -1930,102 +2083,27 @@ def download_youtube_video(url, output_dir=".", resume=False):
     step_start_time = time.time()
     download_progress_hook, download_postprocessor_hook = _make_ytdlp_progress_hooks()
 
-    # Look for cookies in the project directory (multiple common filenames)
-    _script_dir = os.path.dirname(os.path.abspath(__file__))
-    _cookie_candidates = [
-        os.path.join(_script_dir, 'www.youtube.com_cookies.txt'),
-        os.path.join(_script_dir, 'cookies.txt'),
-        '/app/cookies.txt',  # Docker fallback
-    ]
-    cookies_path = None
-    for _cp in _cookie_candidates:
-        if os.path.exists(_cp):
-            cookies_path = _cp
-            print(f"🍪 Found cookies file: {cookies_path}")
-            break
-
-    cookies_env = os.environ.get("YOUTUBE_COOKIES")
-    if cookies_env:
-        print("🍪 Found YOUTUBE_COOKIES env var, writing cookies file...")
-        if not cookies_path:
-            cookies_path = os.path.join(_script_dir, 'cookies.txt')
-        try:
-            with open(cookies_path, 'w') as f:
-                f.write(cookies_env)
-            if os.path.exists(cookies_path):
-                # Never echo cookie contents: stdout lands in the job log,
-                # the dashboard and persisted support logs.
-                print(f"   Cookies file created. Size: {os.path.getsize(cookies_path)} bytes")
-        except Exception as e:
-            print(f"⚠️ Failed to write cookies file: {e}")
-            cookies_path = None
-    else:
-        if not cookies_path:
-            print("⚠️ No cookies file found and YOUTUBE_COOKIES env var not set.")
-    
-    js_runtimes = None
-    if shutil.which('deno'):
-        js_runtimes = {'deno': {}}
-        print("🧠 Using Deno for yt-dlp JS challenges")
-    elif shutil.which('node'):
-        js_runtimes = {'node': {}}
-        print("🧠 Using Node.js for yt-dlp JS challenges")
-    else:
-        print("⚠️ No supported JS runtime found for yt-dlp (Deno/Node). Download quality may be limited.")
-
-    # yt-dlp options: adapt based on whether cookies are available
-    # WITH cookies: use 'web' client, DO NOT skip webpage (needed for cookie auth)
-    # WITHOUT cookies: use more reliable non-auth clients and skip webpage
-
-    # Do NOT override player_client: yt-dlp's curated defaults (tv_downgraded/
-    # web_safari with cookies, android_vr/web_safari anonymous) are exactly the
-    # clients that still serve HD without PO tokens. Our old hardcoded list
-    # (web_safari/ios/web/mweb/android) hit PO-token/SABR walls and silently
-    # degraded downloads to the token-free 360p format.
-    _extractor_args = {}
-    if cookies_path:
-        print("🔧 Using cookie-authenticated yt-dlp config (default clients)")
-    else:
-        print("🔧 Using anonymous yt-dlp config (default clients)")
-
+    # The pre-flight quality probe uses the same sessions and JS runtime.
+    auth_attempts = youtube_auth_attempts()
     _COMMON_YDL_OPTS = {
         'quiet': False,
         'verbose': True,
         'no_warnings': False,
-        'cookiefile': cookies_path if cookies_path else None,
         'socket_timeout': 30,
         'retries': 10,
         'fragment_retries': 10,
-        'nocheckcertificate': True,
-        'cachedir': False,
-        'extractor_args': _extractor_args,
-        'http_headers': {
-            'User-Agent': (
-                'Mozilla/5.0 (Windows NT 10.0; Win64; x64) '
-                'AppleWebKit/537.36 (KHTML, like Gecko) '
-                'Chrome/120.0.0.0 Safari/537.36'
-            ),
-        },
+        **youtube_base_options(),
         'progress_hooks': [download_progress_hook],
         'postprocessor_hooks': [download_postprocessor_hook],
     }
-    if js_runtimes:
-        _COMMON_YDL_OPTS['js_runtimes'] = js_runtimes
 
     # --- Smart retry: probe both configs and keep the one offering the best
     # --- quality. YouTube silently limits some clients/cookie states to the
     # --- muxed 360p format; without this check we'd process mush without warning.
     probe_results = []  # (attempt_name, attempt_opts, info, max_height)
-    last_error = None
-    for attempt_name, attempt_opts in [
-        ("cookie-auth", _COMMON_YDL_OPTS),
-        ("anonymous-fallback", {
-            **_COMMON_YDL_OPTS,
-            'cookiefile': None,
-            # Default clients here too (android_vr/web_safari) — see note above.
-            'extractor_args': {},
-        }),
-    ]:
+    errors = []
+    for attempt_name, auth_options in auth_attempts:
+        attempt_opts = {**_COMMON_YDL_OPTS, **auth_options}
         try:
             print(f"🔄 Trying download mode: {attempt_name}...")
             with JOB_REPORTER.operation(
@@ -2034,7 +2112,7 @@ def download_youtube_video(url, output_dir=".", resume=False):
                 message=f"Reading YouTube metadata ({attempt_name}).",
                 category="download",
             ):
-                with yt_dlp.YoutubeDL(attempt_opts) as ydl:
+                with open_youtube_dl(attempt_opts, yt_dlp.YoutubeDL) as ydl:
                     probe = ydl.extract_info(url, download=False)
             # Check if we actually got video formats (not just images/storyboards)
             formats = probe.get('formats') or []
@@ -2054,38 +2132,11 @@ def download_youtube_video(url, output_dir=".", resume=False):
                 break
             print(f"⚠️ {attempt_name}: best offered is only {max_height}p — probing next mode for higher quality...")
         except Exception as e:
-            last_error = e
-            print(f"⚠️ {attempt_name} failed: {e}")
+            errors.append(e)
+            print(f"⚠️ {attempt_name} failed: {youtube_failure_message([e])}")
 
     if not probe_results:
-        if last_error is not None:
-            print("🚨 YOUTUBE DOWNLOAD ERROR 🚨", file=sys.stderr)
-
-            error_msg = f"""
-
-❌ ================================================================= ❌
-❌ FATAL ERROR: YOUTUBE DOWNLOAD FAILED
-❌ ================================================================= ❌
-
-REASON: YouTube has blocked the download request (Error 429/Unavailable).
-        This is likely a temporary IP ban on this server.
-
-👇 SOLUTION FOR USER 👇
----------------------------------------------------------------------
-1. Download the video manually to your computer.
-2. Use the 'Upload Video' tab in this app to process it.
----------------------------------------------------------------------
-
-Technical Details: {str(last_error)}
-            """
-            print(error_msg, file=sys.stdout)
-            print(error_msg, file=sys.stderr)
-            sys.stdout.flush()
-            sys.stderr.flush()
-            time.sleep(0.5)
-            raise last_error
-        print("❌ All download modes failed. No video formats available.")
-        raise SystemExit(1)
+        raise YouTubeDownloadError(youtube_failure_message(errors)) from None
 
     attempt_name, attempt_opts, info, best_height = max(probe_results, key=lambda item: item[3])
     _COMMON_YDL_OPTS.update(attempt_opts)
@@ -2135,9 +2186,9 @@ Technical Details: {str(last_error)}
     download_attempts = [(_COMMON_YDL_OPTS, best_format, f"best available ({best_height}p)")]
     if best_height > 1080:
         download_attempts.append((_COMMON_YDL_OPTS, hd_format, "1080p"))
-    if _COMMON_YDL_OPTS.get('cookiefile'):
+    if _COMMON_YDL_OPTS.get('cookiefile') is not None or _COMMON_YDL_OPTS.get('cookiesfrombrowser'):
         download_attempts.append(
-            ({**_COMMON_YDL_OPTS, 'cookiefile': None}, hd_format, "1080p without cookies"))
+            ({**_COMMON_YDL_OPTS, 'cookiefile': None, 'cookiesfrombrowser': None}, hd_format, "1080p without cookies"))
 
     for index, (attempt_opts, format_spec, attempt_label) in enumerate(download_attempts):
         ydl_opts = {
@@ -2158,12 +2209,15 @@ Technical Details: {str(last_error)}
                 message=f"YouTube download worker started ({attempt_label}).",
                 category="download",
             ):
-                with yt_dlp.YoutubeDL(ydl_opts) as ydl:
+                with open_youtube_dl(ydl_opts, yt_dlp.YoutubeDL) as ydl:
                     ydl.download([url])
             break
         except Exception as e:
             is_last_attempt = index == len(download_attempts) - 1
             if is_last_attempt or not _is_youtube_refusal(e):
+                message = youtube_failure_message([e])
+                if message != str(e):
+                    raise YouTubeDownloadError(message) from None
                 raise
             next_label = download_attempts[index + 1][2]
             JOB_REPORTER.warning(
@@ -2189,41 +2243,85 @@ Technical Details: {str(last_error)}
     
     return downloaded_file, sanitized_title
 
-def _finalize_clip_passthrough(input_video, final_output_video, progress_callback=None):
+def _finalize_clip_passthrough(input_video, final_output_video, progress_callback=None,
+                               target_size=None):
     """Finish a clip without reframing (original output, or source already in
     the target aspect). Applies the watermark via FFmpeg overlay if enabled;
-    otherwise remuxes with faststart only."""
+    otherwise remuxes with faststart only.
+
+    target_size=(w, h) scales an on-aspect vertical/square source to the
+    delivery size (cover scale + centre crop). None keeps the source size:
+    the original format and the long video never pass it."""
     if os.path.exists(final_output_video):
         os.remove(final_output_video)
     if progress_callback:
         progress_callback(5.0, "Finalizing clip without reframing...")
 
+    width = height = None
+    if target_size or WATERMARK_ENABLED:
+        try:
+            width, height = get_video_resolution(input_video)
+        except Exception as e:
+            print(f"⚠️ Could not read the clip size: {e}")
+    scale_filter = None
+    if target_size:
+        scale_filter = delivery_scale_filter(width, height, *target_size, upscale=SHORTS_UPSCALE_INTERPOLATION)
+        if not scale_filter and video_encoding.source_rotation(input_video):
+            # A rotated phone clip is already the right size on screen, but a
+            # stream copy keeps it coded 1920x1080 plus a rotation tag, and
+            # the hook layer sizes itself from the coded size. FFmpeg rotates
+            # the frames upright on any re-encode.
+            scale_filter = "setsar=1"
+        if scale_filter:
+            width, height = target_size
+
     wm_png = None
     if WATERMARK_ENABLED:
         try:
-            width, _height = get_video_resolution(input_video)
             wm_png = f"{os.path.splitext(final_output_video)[0]}_wm.png"
             _render_watermark_rgba(width).save(wm_png)
         except Exception as e:
             print(f"⚠️ Watermark skipped (render failed): {e}")
             wm_png = None
 
-    if wm_png:
-        command = [
-            'ffmpeg', '-y', '-i', input_video, '-i', wm_png,
+    def _build_watermarked(attempt):
+        base = f'[0:v]{scale_filter}[base];[base]' if scale_filter else '[0:v]'
+        return [
+            'ffmpeg', '-y', *attempt.input_args, '-i', input_video, '-i', wm_png,
             '-filter_complex',
-            f'[0:v][1:v]overlay=(W-w)/2:(H-h)/2:format=auto,{EVEN_PAD_FILTER}',
-            '-c:v', 'libx264', '-preset', 'fast', '-crf', '20', '-pix_fmt', 'yuv420p',
+            f'{base}[1:v]overlay=(W-w)/2:(H-h)/2:format=auto,{EVEN_PAD_FILTER}',
+            *attempt.video_args, '-pix_fmt', 'yuv420p',
             '-c:a', 'copy', '-movflags', '+faststart', final_output_video,
         ]
-    else:
-        command = [
-            'ffmpeg', '-y', '-i', input_video,
-            '-c', 'copy', '-movflags', '+faststart', final_output_video,
+
+    def _build_scaled(attempt):
+        return [
+            'ffmpeg', '-y', *attempt.input_args, '-i', input_video,
+            '-vf', f'{scale_filter},{EVEN_PAD_FILTER}',
+            *attempt.video_args, '-pix_fmt', 'yuv420p',
+            '-c:a', 'copy', '-movflags', '+faststart', final_output_video,
         ]
 
     try:
-        subprocess.run(command, check=True, stdout=subprocess.DEVNULL, stderr=subprocess.PIPE, timeout=1800)
+        if wm_png or scale_filter:
+            video_encoding.run_encode(
+                _build_watermarked if wm_png else _build_scaled,
+                tier=video_encoding.FINAL,
+                label="Watermark finalize" if wm_png else "Delivery scale",
+                output_path=final_output_video,
+                source=input_video,
+                width=width,
+                height=height,
+                warn=JOB_REPORTER.warning,
+                stdout=subprocess.DEVNULL,
+                stderr=subprocess.PIPE,
+                timeout=1800,
+            )
+        else:
+            subprocess.run(
+                ['ffmpeg', '-y', '-i', input_video, '-c', 'copy', '-movflags', '+faststart', final_output_video],
+                check=True, stdout=subprocess.DEVNULL, stderr=subprocess.PIPE, timeout=1800,
+            )
     except subprocess.TimeoutExpired:
         print("\n   ❌ Passthrough finalize timed out after 1800s.")
         return False
@@ -2285,9 +2383,13 @@ def _full_render_filename(output_dir, video_title, output_format):
     return os.path.join(output_dir, f"{video_title}_{suffix}.mp4")
 
 
-def process_video_to_vertical(input_video, final_output_video, progress_callback=None, aspect_ratio=ASPECT_RATIO, layout_style="smart"):
+def process_video_to_vertical(input_video, final_output_video, progress_callback=None, aspect_ratio=ASPECT_RATIO,
+                              layout_style="smart", video_encoder=None):
     """
     Core logic to convert horizontal video to vertical using scene detection and Active Speaker Tracking (MediaPipe).
+
+    video_encoder="x264" forces the CPU encoder; it is used to redo a clip
+    whose GPU encoder died mid-stream.
     """
     script_start_time = time.time()
 
@@ -2306,14 +2408,24 @@ def process_video_to_vertical(input_video, final_output_video, progress_callback
     # through untouched instead.
     src_width, src_height = get_video_resolution(input_video)
     if src_width and src_height and abs((src_width / src_height) - aspect_ratio) < 0.02:
-        print(f"🎬 Source already matches target aspect ({src_width}x{src_height}) — skipping reframing.")
-        return _finalize_clip_passthrough(input_video, final_output_video, progress_callback)
+        target_size = (
+            delivery_dimensions(src_width, src_height, aspect_ratio, SHORTS_DELIVERY_WIDTH)
+            if SHORTS_DELIVERY_WIDTH else None
+        )
+        delivery_note = f", delivering {target_size[0]}x{target_size[1]}" if target_size else ""
+        print(f"🎬 Source already matches target aspect ({src_width}x{src_height}) — "
+              f"skipping reframing{delivery_note}.")
+        return _finalize_clip_passthrough(
+            input_video, final_output_video, progress_callback, target_size=target_size,
+        )
 
     print(f"🎬 Processing clip: {input_video}")
     print("   Step 1: Detecting scenes...")
     if progress_callback:
         progress_callback(2.0, "Detecting scenes...")
+    stage_started = time.perf_counter()
     scenes, fps = detect_scenes(input_video)
+    scenes_seconds = time.perf_counter() - stage_started
     
     if not scenes:
         print("   ℹ️ No cuts detected. Analyzing the full clip as one scene.")
@@ -2331,19 +2443,25 @@ def process_video_to_vertical(input_video, final_output_video, progress_callback
         progress_callback(8.0, "Preparing active tracking...")
     original_width, original_height = src_width, src_height
 
-    OUTPUT_WIDTH, OUTPUT_HEIGHT = fit_even_output_dimensions(
-        original_width, original_height, aspect_ratio,
+    OUTPUT_WIDTH, OUTPUT_HEIGHT = delivery_dimensions(
+        original_width, original_height, aspect_ratio, SHORTS_DELIVERY_WIDTH,
     )
 
-    # Initialize Cameraman
+    # The crop window comes from the SOURCE size only (SmoothedCameraman
+    # derives crop_width/height from it); the output pair is just the size
+    # every composed frame is resampled to.
     cameraman = SmoothedCameraman(OUTPUT_WIDTH, OUTPUT_HEIGHT, original_width, original_height, aspect_ratio=aspect_ratio)
+    print(f"   📐 Delivery {OUTPUT_WIDTH}x{OUTPUT_HEIGHT} from {original_width}x{original_height} "
+          f"(crop {cameraman.crop_width}x{cameraman.crop_height}, upscale {SHORTS_UPSCALE_INTERPOLATION})")
     watermark = _build_watermark_blender(OUTPUT_WIDTH, OUTPUT_HEIGHT)
     
     # --- New Strategy: Per-Scene Analysis ---
     print("\n   🤖 Step 3: Analyzing Scenes for Strategy (Single vs Group)...")
     if progress_callback:
         progress_callback(14.0, "Analyzing scene strategy...")
+    stage_started = time.perf_counter()
     scene_decisions = analyze_scenes_strategy(input_video, scenes, layout_style=layout_style)
+    analysis_seconds = time.perf_counter() - stage_started
     if len(scene_decisions) != len(scenes):
         # A failed analysis must not guess a tight crop.  GENERAL preserves
         # everyone until a future run can collect valid evidence.
@@ -2403,14 +2521,15 @@ def process_video_to_vertical(input_video, final_output_video, progress_callback
     if progress_callback:
         progress_callback(20.0, "Processing video frames...")
     
-    command = [
-        'ffmpeg', '-y', '-nostats', '-loglevel', 'error',
-        '-f', 'rawvideo', '-vcodec', 'rawvideo',
-        '-s', f'{OUTPUT_WIDTH}x{OUTPUT_HEIGHT}', '-pix_fmt', 'bgr24',
-        '-r', str(fps), '-i', '-', '-c:v', 'libx264',
-        '-preset', 'fast', '-crf', '23', '-pix_fmt', 'yuv420p',
-        '-an', temp_video_output
-    ]
+    # The size check and the cached NVENC probe run before any frame is made.
+    encode_attempt = video_encoding.encode_attempts(
+        video_encoding.REFRAME, width=OUTPUT_WIDTH, height=OUTPUT_HEIGHT, encoder=video_encoder,
+    )[0]
+    command = video_encoding.reframe_pipe_command(
+        OUTPUT_WIDTH, OUTPUT_HEIGHT, fps, temp_video_output, video_args=encode_attempt.video_args,
+    )
+    encoder_died = False
+    encode_started = time.monotonic()
 
     ffmpeg_process = subprocess.Popen(command, stdin=subprocess.PIPE, stdout=subprocess.DEVNULL, stderr=subprocess.PIPE)
 
@@ -2452,11 +2571,26 @@ def process_video_to_vertical(input_video, final_output_video, progress_callback
     fps_value = max(float(fps or 0), 1.0)
     artificial_switches = 0
     scene_had_target = False
+    # Evidence cadence only: the tracker's thresholds stay in seconds.
+    detect_stride = effective_detect_stride(fps_value, REFRAME_DETECT_STRIDE)
+    yolo_throttle = FallbackThrottle(REFRAME_YOLO_INTERVAL_SECONDS)
+    face_calls = yolo_calls = 0
+    detect_seconds = 0.0
+    reader = (
+        frame_sampler.FramePrefetcher(cap, REFRAME_DECODE_PREFETCH)
+        if REFRAME_DECODE_PREFETCH > 0 and cap.isOpened() else None
+    )
+    loop_started = time.perf_counter()
 
     last_progress_emit = time.time()
     try:
-        while cap.isOpened():
-            ret, frame = cap.read()
+        while True:
+            if reader is not None:
+                ret, frame = reader.read()
+            elif cap.isOpened():
+                ret, frame = cap.read()
+            else:
+                break
             if not ret:
                 break
 
@@ -2475,6 +2609,7 @@ def process_video_to_vertical(input_video, final_output_video, progress_callback
                 # IDs, fallback candidates and camera centers must not cross it.
                 speaker_tracker.reset()
                 cameraman.reset()
+                yolo_throttle.reset()
                 scene_had_target = False
                 previous_scene_index = current_scene_index
 
@@ -2499,9 +2634,11 @@ def process_video_to_vertical(input_video, final_output_video, progress_callback
 
             else:
                 # "Single Speaker" -> Track & Crop
-                if is_scene_start or frame_number % 2 == 0:
+                if is_scene_start or frame_number % detect_stride == 0:
+                    detect_started = time.perf_counter()
                     timestamp_seconds = frame_number / fps_value
                     candidates = detect_face_candidates(frame)
+                    face_calls += 1
                     target_decision = speaker_tracker.get_target(
                         candidates,
                         timestamp_seconds,
@@ -2512,11 +2649,16 @@ def process_video_to_vertical(input_video, final_output_video, progress_callback
                             artificial_switches += 1
                         cameraman.update_target(target_decision.box)
                         scene_had_target = True
-                    elif target_decision.state == TargetState.LOST:
+                    elif (
+                        target_decision.state == TargetState.LOST
+                        and person_fallback_due(speaker_tracker, yolo_throttle, timestamp_seconds)
+                    ):
                         # LOST means the previous subject is genuinely gone.
                         # HOLD intentionally does nothing and can never reach
-                        # this fallback branch.
+                        # this fallback branch. A throttled tick gives the
+                        # tracker no evidence at all.
                         person_box = detect_person_yolo(frame)
+                        yolo_calls += 1
                         fallback_decision = speaker_tracker.consider_person_fallback(
                             person_box,
                             timestamp_seconds,
@@ -2527,28 +2669,41 @@ def process_video_to_vertical(input_video, final_output_video, progress_callback
                                 artificial_switches += 1
                             cameraman.update_target(fallback_decision.box)
                             scene_had_target = True
+                    detect_seconds += time.perf_counter() - detect_started
 
                 x1, y1, x2, y2 = cameraman.get_crop_box(force_snap=is_scene_start)
                 if y2 > y1 and x2 > x1:
-                    cropped = frame[y1:y2, x1:x2]
-                    output_frame = cv2.resize(cropped, (OUTPUT_WIDTH, OUTPUT_HEIGHT))
+                    output_frame = _resize_frame(frame[y1:y2, x1:x2], OUTPUT_WIDTH, OUTPUT_HEIGHT)
                 else:
-                    output_frame = cv2.resize(frame, (OUTPUT_WIDTH, OUTPUT_HEIGHT))
+                    output_frame = _resize_frame(frame, OUTPUT_WIDTH, OUTPUT_HEIGHT)
 
             if watermark is not None:
                 output_frame = _apply_watermark(output_frame, watermark)
 
-            ffmpeg_process.stdin.write(output_frame.tobytes())
+            try:
+                # Hand the frame buffer to the pipe without a tobytes() copy.
+                ffmpeg_process.stdin.write(memoryview(np.ascontiguousarray(output_frame)).cast("B"))
+            except OSError:
+                # POSIX raises BrokenPipeError, Windows EINVAL: the encoder exited.
+                encoder_died = True
+                break
             frame_number += 1
             if progress_callback and (time.time() - last_progress_emit >= 2.0 or frame_number == total_frames):
                 frame_progress = 20.0 + (70.0 * (frame_number / max(total_frames, 1)))
                 progress_callback(frame_progress, f"Processing video frames... {frame_number}/{total_frames}")
                 last_progress_emit = time.time()
 
-        ffmpeg_process.stdin.close()
+        try:
+            ffmpeg_process.stdin.close()
+        except OSError:
+            encoder_died = True
         ffmpeg_process.wait()
     finally:
-        cap.release()
+        released = reader.close() if reader is not None else True
+        if released:
+            cap.release()
+        else:
+            print("   ⚠️ Decode thread did not stop; leaving the capture open.")
         # If the frame loop aborted (exception/cancel), don't leak the encoder subprocess.
         if ffmpeg_process.poll() is None:
             ffmpeg_process.terminate()
@@ -2560,11 +2715,35 @@ def process_video_to_vertical(input_video, final_output_video, progress_callback
         stderr_output = b"".join(stderr_chunks).decode(errors="replace")
 
     print(f"   🎥 Artificial camera switches: {artificial_switches}")
+    print(
+        f"   ⏱️ Reframe: scenes {scenes_seconds:.1f}s, strategy {analysis_seconds:.1f}s, "
+        f"{frame_number} frames {time.perf_counter() - loop_started:.1f}s "
+        f"(detect {detect_seconds:.1f}s: {face_calls} face / {yolo_calls} YOLO calls, stride {detect_stride})"
+    )
 
-    if ffmpeg_process.returncode != 0:
+    if ffmpeg_process.returncode != 0 or encoder_died:
+        if encode_attempt.encoder == "nvenc":
+            failure = stderr_output or f"exit code {ffmpeg_process.returncode}"
+            reason = video_encoding.short_reason(failure)
+            video_encoding.note_nvenc_failure(failure)
+            JOB_REPORTER.warning(
+                f"GPU encoder failed after {frame_number} frames ({reason}); "
+                "rendering the clip again with libx264.",
+                category="render",
+            )
+            _remove_quietly(temp_video_output)
+            if progress_callback:
+                progress_callback(20.0, "GPU encoder failed - re-rendering on the CPU...")
+            return process_video_to_vertical(
+                input_video, final_output_video, progress_callback,
+                aspect_ratio=aspect_ratio, layout_style=layout_style, video_encoder="x264",
+            )
         print("\n   ❌ FFmpeg frame processing failed.")
         print("   Stderr:", stderr_output)
         return False
+    if encode_attempt.encoder == "nvenc":
+        video_encoding.note_nvenc_success()
+    print(f"   🎞️ Reframe encode: {encode_attempt.label}, frames + encode {time.monotonic() - encode_started:.1f}s")
 
     print("\n   🔊 Step 5: Extracting audio...")
     if progress_callback:
@@ -2604,23 +2783,113 @@ def process_video_to_vertical(input_video, final_output_video, progress_callback
     
     return True
 
-def transcribe_video(video_path, video_duration=None):
-    print("🎙️  Transcribing video with Faster-Whisper (CPU Optimized)...")
-    from faster_whisper import WhisperModel
-    from subtitles import get_whisper_config, WHISPER_TRANSCRIBE_PARAMS, merge_continuation_words
+WHISPER_MODEL_DOWNLOAD_TIMEOUT_SECONDS = 4 * 3600
 
-    cfg = get_whisper_config()
-    model = WhisperModel(cfg["model_size"], device=cfg["device"], compute_type=cfg["compute_type"])
 
-    segments, info = model.transcribe(video_path, **WHISPER_TRANSCRIBE_PARAMS)
-    
+def _prefetch_whisper_model(reporter, model_size):
+    """Download the GPU Whisper model under its own deadline.
+
+    The first run fetches ~1.6 GB without progress events; on a slow link
+    that alone can outlast the transcription deadline. A failure is left to
+    run_whisper, which then skips a second download and transcribes on the
+    CPU. Returns False when the model could not be fetched.
+    """
+    download = {}
+    ok = True
+    try:
+        with reporter.operation(
+            "whisper model download",
+            timeout_seconds=WHISPER_MODEL_DOWNLOAD_TIMEOUT_SECONDS,
+            message=f"Checking the Whisper model {model_size}...",
+            category="transcribe",
+        ):
+            whisper_runtime.ensure_model(
+                model_size,
+                on_status=lambda message: reporter.heartbeat(message, force=True, category="transcribe"),
+                report=download,
+            )
+    except Exception as exc:
+        ok = False
+        print(f"   ⚠️ Whisper model download failed ({exc}); transcription will fall back to the CPU.")
+    if download.get("downloaded"):
+        excluded = set(getattr(reporter, "stats_excluded_phases", ()) or ())
+        reporter.stats_excluded_phases = excluded | {"transcribe"}
+    return ok
+
+
+def transcribe_video(video_path, video_duration=None, allow_gpu_download=True):
+    print("🎙️  Transcribing video with Faster-Whisper...")
+    from subtitles import WHISPER_TRANSCRIBE_PARAMS, merge_continuation_words
+
+    state = {"last_emit": time.time(), "last_bucket": -1, "label": "Transcribing audio"}
+
+    def on_segment(segment, _info):
+        if not video_duration:
+            return
+        progress_percent = min(100.0, (float(segment.end) / max(video_duration, 1.0)) * 100.0)
+        bucket = int(progress_percent // 2)
+        if time.time() - state["last_emit"] >= 1.0 or bucket != state["last_bucket"]:
+            JOB_REPORTER.progress(
+                progress_percent,
+                message=f"{state['label']}... {progress_percent:.1f}%",
+                important=bucket % 5 == 0,
+                category="transcribe",
+            )
+            state["last_emit"] = time.time()
+            state["last_bucket"] = bucket
+
+    def exclude_from_stats():
+        excluded = set(getattr(JOB_REPORTER, "stats_excluded_phases", ()) or ())
+        JOB_REPORTER.stats_excluded_phases = excluded | {"transcribe"}
+
+    def on_restart(reason, cpu_cfg):
+        # A mixed GPU+CPU duration must never be learned as a GPU or CPU rate.
+        exclude_from_stats()
+        JOB_REPORTER.warning(
+            f"GPU transcription failed ({reason}). Restarting on CPU with Whisper "
+            f"{cpu_cfg['model_size']}; this takes longer.",
+            category="transcribe",
+        )
+        state.update(last_bucket=-1, label="Transcribing audio on CPU")
+        if video_duration:
+            JOB_REPORTER.progress(
+                0.0, message="Transcribing audio on CPU... 0.0%", important=True, category="transcribe",
+            )
+
+    def on_status(message):
+        print(f"   {message}")
+        heartbeat = getattr(JOB_REPORTER, "heartbeat", None)
+        if heartbeat:
+            heartbeat(message, force=True, category="transcribe")
+
+    def on_wait(seconds_left):
+        # The slot wait is bounded by WHISPER_GPU_WAIT_SECONDS, so it is
+        # progress for the stall monitor, not a frozen transcription.
+        message = f"Waiting for the GPU: another transcription is running (CPU fallback in {seconds_left}s)"
+        print(f"   {message}")
+        heartbeat = getattr(JOB_REPORTER, "heartbeat", None)
+        if heartbeat:
+            heartbeat(message, force=True, counts_as_work=True, category="transcribe")
+
+    segments, info, _cfg = whisper_runtime.run_whisper(
+        video_path,
+        WHISPER_TRANSCRIBE_PARAMS,
+        on_segment=on_segment,
+        on_restart=on_restart,
+        on_status=on_status,
+        on_wait=on_wait,
+        allow_gpu_download=allow_gpu_download,
+    )
+    last_run = whisper_runtime.LAST_RUN
+    if last_run.get("model_downloaded") or float(last_run.get("gpu_wait_seconds") or 0) > 5.0:
+        # Download and slot-wait time are not transcription speed.
+        exclude_from_stats()
+
     print(f"   Detected language '{info.language}' with probability {info.language_probability:.2f}")
-    
+
     # Convert to openai-whisper compatible format
     transcript_segments = []
     full_text = ""
-    last_emit = time.time()
-    last_bucket = -1
 
     for segment in segments:
         seg_dict = {
@@ -2646,19 +2915,7 @@ def transcribe_video(video_path, video_duration=None):
         
         transcript_segments.append(seg_dict)
         full_text += segment.text + " "
-        if video_duration:
-            progress_percent = min(100.0, (float(segment.end) / max(video_duration, 1.0)) * 100.0)
-            bucket = int(progress_percent // 2)
-            if time.time() - last_emit >= 1.0 or bucket != last_bucket:
-                JOB_REPORTER.progress(
-                    progress_percent,
-                    message=f"Transcribing audio... {progress_percent:.1f}%",
-                    important=bucket % 5 == 0,
-                    category="transcribe",
-                )
-                last_emit = time.time()
-                last_bucket = bucket
-        
+
     JOB_REPORTER.progress(100.0, message="Transcription complete.", important=True, category="transcribe")
     return {
         'text': full_text.strip(),
@@ -3290,6 +3547,12 @@ def get_viral_clips(
     }
 
 
+def _plan_without_verdict(plan):
+    if not isinstance(plan, dict):
+        return plan
+    return {key: value for key, value in plan.items() if key != "viable"}
+
+
 def _longform_target_range(video_duration):
     duration = max(0.0, float(video_duration))
     target_max = min(float(LONGFORM_TARGET_MAX_SECONDS), duration)
@@ -3702,7 +3965,9 @@ def get_longform_plan(
         verification_issues = []
         if final_verification:
             reviewed_plan = current_plan
-            if review.get("plan") != current_raw_plan:
+            # The read-only critic may express its verdict via viable=false;
+            # only changed IDs/boundaries/copy count as a mutation.
+            if _plan_without_verdict(review.get("plan")) != _plan_without_verdict(current_raw_plan):
                 verification_issues.append("final_review_mutated_plan")
         else:
             try:
@@ -3764,38 +4029,46 @@ def get_longform_plan(
         )
 
     repair_attempted = False
+    repairs_used = 0
+    final_verification_attempted = False
+    verification_rounds = 0
     current_raw = raw_plan
     current_plan = draft
     if review_state_is_usable(review, final_plan, gate_issues):
         current_raw = review["plan"]
         current_plan = final_plan
-    for repair_index in range(LONGFORM_REVIEW_REPAIR_RETRIES):
-        if not gate_issues:
+    while True:
+        # Spend the repair budget while the gate still reports issues.
+        while gate_issues and repairs_used < LONGFORM_REVIEW_REPAIR_RETRIES:
+            repairs_used += 1
+            repair_attempted = True
+            JOB_REPORTER.warning(
+                "Long-form quality gate requested one focused Gemini repair pass.",
+                category="analyze",
+                gate_issues=gate_issues,
+            )
+            review, final_plan, gate_issues = review_once(
+                current_raw,
+                current_plan,
+                repair_required=True,
+                repair_feedback=gate_issues,
+                suffix=f"repair_{repairs_used}",
+            )
+            _save_json_checkpoint(output_dir, video_title, f"longform_repair_v2_{repairs_used}", {
+                "review": review,
+                "gate_issues": gate_issues,
+            })
+            if review_state_is_usable(review, final_plan, gate_issues):
+                current_raw = review["plan"]
+                current_plan = final_plan
+        if gate_issues or not repair_attempted or not isinstance(final_plan, dict):
             break
-        repair_attempted = True
-        JOB_REPORTER.warning(
-            "Long-form quality gate requested one focused Gemini repair pass.",
-            category="analyze",
-            gate_issues=gate_issues,
-        )
-        review, final_plan, gate_issues = review_once(
-            current_raw,
-            current_plan,
-            repair_required=True,
-            repair_feedback=gate_issues,
-            suffix=f"repair_{repair_index + 1}",
-        )
-        _save_json_checkpoint(output_dir, video_title, f"longform_repair_v2_{repair_index + 1}", {
-            "review": review,
-            "gate_issues": gate_issues,
-        })
-        if review_state_is_usable(review, final_plan, gate_issues):
-            current_raw = review["plan"]
-            current_plan = final_plan
-
-    final_verification_attempted = False
-    if repair_attempted and not gate_issues and isinstance(final_plan, dict):
+        # A repaired plan gets a fresh read-only critic pass. If that critic
+        # rejects it and repair budget is left, its feedback drives one more
+        # repair instead of failing a job that already cost an hour of
+        # transcription.
         final_verification_attempted = True
+        verification_rounds += 1
         JOB_REPORTER.progress(
             99.0 if reused_scoring else 94.0,
             message="Running a fresh read-only review of the repaired Long Video...",
@@ -3807,13 +4080,17 @@ def get_longform_plan(
             current_plan,
             repair_required=False,
             repair_feedback=[],
-            suffix="final_review",
+            suffix="final_review" if verification_rounds == 1 else f"final_review_{verification_rounds}",
             final_verification=True,
         )
-        _save_json_checkpoint(output_dir, video_title, "longform_final_review_v2", {
-            "review": review,
-            "gate_issues": gate_issues,
-        })
+        _save_json_checkpoint(
+            output_dir,
+            video_title,
+            "longform_final_review_v2" if verification_rounds == 1 else f"longform_final_review_v2_{verification_rounds}",
+            {"review": review, "gate_issues": gate_issues},
+        )
+        if not gate_issues or repairs_used >= LONGFORM_REVIEW_REPAIR_RETRIES:
+            break
 
     if gate_issues or not isinstance(final_plan, dict):
         rejected = dict(current_plan) if isinstance(current_plan, dict) else draft
@@ -3921,6 +4198,12 @@ def _render_shorts_clips(
     """Render the legacy Shorts loop with optional combined-job weighting."""
     shorts = clips_data.get("shorts", [])
     total_clips = len(shorts)
+    # A cut keeps the source size; NVENC rejects frames wider or taller than
+    # 4096, and such a source must go straight to libx264.
+    try:
+        cut_width, cut_height = get_video_resolution(input_video)
+    except Exception:
+        cut_width = cut_height = None
     if not shorts:
         return 0.0
     clip_render_weights = [
@@ -3949,15 +4232,12 @@ def _render_shorts_clips(
             important=True,
             category="render",
         )
-        cut_command = [
-            "ffmpeg", "-y",
-            "-ss", str(start),
-            "-to", str(end),
-            "-i", input_video,
-            "-c:v", "libx264", "-crf", "18", "-preset", "fast",
-            "-c:a", "aac",
-            clip_temp_path,
-        ]
+        def _build_cut(attempt, start=start, end=end, output_path=clip_temp_path):
+            return video_encoding.clip_cut_command(
+                input_video, start, end, output_path,
+                video_args=attempt.video_args, input_args=attempt.input_args,
+            )
+
         try:
             with JOB_REPORTER.operation(
                 f"FFmpeg clip cut {i + 1}/{total_clips}",
@@ -3965,11 +4245,19 @@ def _render_shorts_clips(
                 message=f"Cutting clip {i + 1}/{total_clips}.",
                 category="render",
             ):
-                subprocess.run(
-                    cut_command,
+                # GPU decode + GPU encode, then GPU encode only, then libx264.
+                video_encoding.run_encode(
+                    _build_cut,
+                    tier=video_encoding.HIGH,
+                    label=f"Clip cut {i + 1}/{total_clips}",
+                    output_path=clip_temp_path,
+                    source=input_video,
+                    gpu_frames=True,
+                    width=cut_width or None,
+                    height=cut_height or None,
+                    warn=JOB_REPORTER.warning,
                     stdout=subprocess.DEVNULL,
                     stderr=subprocess.PIPE,
-                    check=True,
                     timeout=BLOCKING_OPERATION_STALL_SECONDS,
                 )
         except subprocess.TimeoutExpired:
@@ -4220,7 +4508,7 @@ def _render_longform_video(
     filter_complex = None
     if longform.needs_16_9_canvas(source_width, source_height):
         filter_complex = longform.blurred_16_9_filter(
-            LONGFORM_CANVAS_WIDTH, LONGFORM_CANVAS_HEIGHT,
+            LONGFORM_CANVAS_WIDTH, LONGFORM_CANVAS_HEIGHT, blur_downscale=LONGFORM_BLUR_DOWNSCALE,
         )
         print(
             f"🖼️  Long-form source is {source_width}x{source_height}; "
@@ -4236,33 +4524,68 @@ def _render_longform_video(
     manifest_path = os.path.join(output_dir, f"temp_{video_title}_long_concat.txt")
     joined_path = os.path.join(output_dir, f"temp_{video_title}_long_joined.mp4")
     final_path = os.path.join(output_dir, f"{video_title}_long_1.mp4")
-    completed = 0.0
-
-    for index, (segment, segment_path) in enumerate(zip(segments, temp_segments), start=1):
-        segment_duration = max(0.001, float(segment["end"]) - float(segment["start"]))
-        progress = float(weight_done_before) + (completed * 0.90)
-        JOB_REPORTER.progress(
-            (progress / combined_weight) * 100.0,
-            message=f"Cutting long-form segment {index}/{len(segments)}",
-            important=True,
-            category="render",
-        )
-        command = longform.segment_cut_command(
-            input_video,
-            segment["start"],
-            segment["end"],
-            segment_path,
-            fade_seconds=LONGFORM_AUDIO_FADE_SECONDS,
-            filter_complex=filter_complex,
-        )
-        with JOB_REPORTER.operation(
-            f"FFmpeg long-form cut {index}/{len(segments)}",
-            timeout_seconds=BLOCKING_OPERATION_STALL_SECONDS,
-            message=f"Encoding long-form segment {index}/{len(segments)}.",
-            category="render",
-        ):
-            _run_checked_ffmpeg(command, label=f"Long-form segment {index}")
-        completed += segment_duration
+    # One encoder for every segment: the join stream-copies the video, and
+    # mixed NVENC/libx264 segments (different SPS/PPS) would break the file.
+    # A failure therefore re-encodes ALL segments with the next attempt.
+    # NVENC's size check needs the encoded size: the canvas when one is used.
+    encode_width, encode_height = (
+        (LONGFORM_CANVAS_WIDTH, LONGFORM_CANVAS_HEIGHT) if filter_complex else (source_width, source_height)
+    )
+    attempts = video_encoding.encode_attempts(
+        video_encoding.HIGH, source=input_video, gpu_frames=False,
+        width=encode_width or None, height=encode_height or None,
+    )
+    for attempt_index, attempt in enumerate(attempts):
+        completed = 0.0
+        try:
+            for index, (segment, segment_path) in enumerate(zip(segments, temp_segments), start=1):
+                segment_duration = max(0.001, float(segment["end"]) - float(segment["start"]))
+                progress = float(weight_done_before) + (completed * 0.90)
+                JOB_REPORTER.progress(
+                    (progress / combined_weight) * 100.0,
+                    message=f"Cutting long-form segment {index}/{len(segments)}",
+                    important=True,
+                    category="render",
+                )
+                command = longform.segment_cut_command(
+                    input_video,
+                    segment["start"],
+                    segment["end"],
+                    segment_path,
+                    fade_seconds=LONGFORM_AUDIO_FADE_SECONDS,
+                    filter_complex=filter_complex,
+                    video_args=attempt.video_args,
+                    input_args=attempt.input_args,
+                )
+                with JOB_REPORTER.operation(
+                    f"FFmpeg long-form cut {index}/{len(segments)}",
+                    timeout_seconds=BLOCKING_OPERATION_STALL_SECONDS,
+                    message=f"Encoding long-form segment {index}/{len(segments)}.",
+                    category="render",
+                ):
+                    _run_checked_ffmpeg(command, label=f"Long-form segment {index}")
+                completed += segment_duration
+        except RuntimeError as exc:
+            # A file name or a CUDA message can contain "timed out"; only a real
+            # subprocess timeout must skip the remaining attempts.
+            if attempt_index == len(attempts) - 1 or isinstance(exc.__cause__, subprocess.TimeoutExpired):
+                raise
+            if attempt.input_args:
+                video_encoding.mark_source_cpu_decode(input_video)
+            else:
+                video_encoding.note_nvenc_failure(str(exc))
+            JOB_REPORTER.warning(
+                f"Long-form segment {index} failed with {attempt.label} "
+                f"({video_encoding.short_reason(str(exc))}); re-encoding every segment with "
+                f"{attempts[attempt_index + 1].label} so the join stays valid.",
+                category="render",
+            )
+            _cleanup_render_temp_files(temp_segments)
+            continue
+        if attempt.encoder == "nvenc":
+            video_encoding.note_nvenc_success()
+        print(f"   🎞️ Long-form segments encoded with {attempt.label}")
+        break
 
     _save_text_file(manifest_path, longform.concat_manifest_text(temp_segments))
     JOB_REPORTER.progress(
@@ -4518,7 +4841,9 @@ def _run_video_type_pipeline(
     source_url,
 ):
     del source_url  # Source provenance already lives in analysis_input.json.
-    JOB_REPORTER.stats_excluded_phases = {"analyze", "render"}
+    JOB_REPORTER.stats_excluded_phases = (
+        set(getattr(JOB_REPORTER, "stats_excluded_phases", ()) or ()) | {"analyze", "render"}
+    )
     _validate_longform_source_duration(video_type, duration)
     if video_type == "long":
         # Long-only runs never consume Shorts analysis. Discarding it also
@@ -5149,6 +5474,9 @@ if __name__ == '__main__':
     script_start_time = time.time()
     reporter = JobReporter(job_id=args.job_id)
     set_job_reporter(reporter)
+    # The total ETA already counts transcription while the source downloads,
+    # so it needs the GPU or CPU history from the start.
+    reporter.phase_cost_variant["transcribe"] = whisper_runtime.resolve_whisper_config()["device"]
     _start_keepalive()
     _prevent_windows_sleep()
 
@@ -5279,14 +5607,20 @@ if __name__ == '__main__':
                 raise RuntimeError("Full-video render failed.")
         else:
             if not transcript or args.resume_phase == "transcribe":
+                # Pick the ETA history of the device that will transcribe.
+                whisper_cfg = whisper_runtime.resolve_whisper_config()
+                reporter.phase_cost_variant["transcribe"] = whisper_cfg["device"]
                 reporter.set_phase("transcribe", "Transcribing audio", message="Starting transcription...")
+                gpu_model_ready = True
+                if whisper_cfg["device"] == "cuda":
+                    gpu_model_ready = _prefetch_whisper_model(reporter, whisper_cfg["model_size"])
                 with reporter.operation(
                     "transcription",
                     timeout_seconds=max(BLOCKING_OPERATION_STALL_SECONDS, int(duration * 2.0)),
                     message="Transcription worker started.",
                     category="transcribe",
                 ):
-                    transcript = transcribe_video(input_video, duration)
+                    transcript = transcribe_video(input_video, duration, allow_gpu_download=gpu_model_ready)
                 _save_json_file(transcript_file, transcript)
                 reporter.artifact("transcript", transcript_file)
                 words_payload = {"words": _extract_words_for_analysis(transcript)}

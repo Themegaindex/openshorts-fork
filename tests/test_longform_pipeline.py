@@ -53,7 +53,15 @@ def _stub_missing_pipeline_dependencies():
             return True
 
     if unavailable("cv2"):
-        sys.modules["cv2"] = MagicMock()
+        cv2_stub = MagicMock()
+        # pytest >= 9.2 undoes monkeypatch.setattr from the instance __dict__
+        # and deletes the attribute when it was not there. A MagicMock keeps
+        # auto-created children outside __dict__, so the first test that
+        # patched cv2.VideoCapture deleted it for every later test. Real
+        # attributes for everything the tests patch keep undo symmetric.
+        for name in ("VideoCapture", "cvtColor", "absdiff"):
+            setattr(cv2_stub, name, MagicMock(name=f"cv2.{name}"))
+        sys.modules["cv2"] = cv2_stub
     if unavailable("numpy"):
         # Every numpy-using renderer boundary must stay mocked in this module.
         numpy_stub = ModuleType("numpy")
@@ -283,6 +291,71 @@ def _run_auto_with_both_outputs(
 ])
 def test_youtube_refusal_detection_matches_transfer_blocks(message):
     assert main._is_youtube_refusal(RuntimeError(message)) is True
+
+
+def test_youtube_download_drops_browser_auth_on_transfer_fallback(monkeypatch, tmp_path):
+    monkeypatch.setattr(main, "JOB_REPORTER", _Reporter())
+    monkeypatch.setattr(main.time, "sleep", lambda _: None)
+    monkeypatch.setattr(main, "youtube_auth_attempts", lambda: [
+        ("browser-auth", {"cookiesfrombrowser": ("brave", None), "cookiefile": None}),
+        ("anonymous-fallback", {"cookiesfrombrowser": None, "cookiefile": None}),
+    ])
+    seen = []
+
+    class FakeYDL:
+        def __init__(self, opts):
+            self.opts = opts
+            seen.append(opts)
+
+        def __enter__(self):
+            return self
+
+        def __exit__(self, *args):
+            pass
+
+        def extract_info(self, url, download):
+            return {"title": "test_video", "formats": [{"height": 1080, "vcodec": "h264"}]}
+
+        def download(self, urls):
+            if self.opts.get("cookiesfrombrowser"):
+                raise RuntimeError("HTTP Error 403: Forbidden")
+            (tmp_path / "test_video.mp4").write_bytes(b"merged video")
+
+    monkeypatch.setattr(main.yt_dlp, "YoutubeDL", FakeYDL)
+    path, title = main.download_youtube_video("https://www.youtube.com/watch?v=test", str(tmp_path), resume=True)
+
+    assert Path(path).read_bytes() == b"merged video"
+    assert title == "test_video"
+    assert len(seen) == 3
+    assert seen[1]["cookiesfrombrowser"] == ("brave", None)
+    assert seen[2]["cookiesfrombrowser"] is None
+    assert seen[2]["cookiefile"] is None
+    assert seen[2]["overwrites"] is False
+
+
+def test_youtube_bot_check_surfaces_recovery_instead_of_ip_ban(monkeypatch, tmp_path):
+    monkeypatch.setattr(main, "JOB_REPORTER", _Reporter())
+    monkeypatch.setattr(main, "youtube_auth_attempts", lambda: [
+        ("anonymous-fallback", {"cookiesfrombrowser": None, "cookiefile": None}),
+    ])
+
+    class FakeYDL:
+        def __init__(self, opts):
+            pass
+
+        def __enter__(self):
+            return self
+
+        def __exit__(self, *args):
+            pass
+
+        def extract_info(self, *args, **kwargs):
+            raise RuntimeError("Sign in to confirm you're not a bot")
+
+    monkeypatch.setattr(main.yt_dlp, "YoutubeDL", FakeYDL)
+    with pytest.raises(main.YouTubeDownloadError, match="YouTube requires sign-in") as error:
+        main.download_youtube_video("https://www.youtube.com/watch?v=test", str(tmp_path))
+    assert "IP ban" not in str(error.value)
 
 
 @pytest.mark.parametrize("message", [
@@ -982,6 +1055,138 @@ def test_non_16_9_long_render_uses_canvas_and_duration_cuts(monkeypatch, tmp_pat
     assert commands[-1][commands[-1].index("-c:v") + 1] == "copy"
 
 
+@pytest.mark.parametrize(
+    "source,aspect,width,expected",
+    [((720, 1280), 9 / 16, 1080, (1080, 1920)),
+     ((2160, 3840), 9 / 16, 1080, (1080, 1920)),
+     ((1080, 1080), 1.0, 1080, (1080, 1080)),
+     ((720, 1280), 9 / 16, 0, None)],
+)
+def test_on_aspect_source_passthrough_requests_delivery_size(monkeypatch, tmp_path, source, aspect, width, expected):
+    calls = []
+    monkeypatch.setattr(main, "SHORTS_DELIVERY_WIDTH", width)
+    monkeypatch.setattr(main, "get_video_resolution", lambda _path: source)
+
+    def finalize(*args, **kwargs):
+        calls.append(kwargs)
+        return True
+
+    monkeypatch.setattr(main, "_finalize_clip_passthrough", finalize)
+    assert main.process_video_to_vertical(
+        str(tmp_path / "in.mp4"), str(tmp_path / "out.mp4"), aspect_ratio=aspect,
+    ) is True
+    assert calls == [{"target_size": expected}]
+
+
+class _FakeWatermarkImage:
+    def save(self, path):
+        with open(path, "wb") as handle:
+            handle.write(b"png")
+
+
+def test_passthrough_scales_and_watermarks_at_delivery_width(monkeypatch, tmp_path):
+    commands, widths = [], []
+    monkeypatch.setattr(main, "JOB_REPORTER", _Reporter())
+    monkeypatch.setattr(main, "WATERMARK_ENABLED", True)
+    monkeypatch.setattr(main, "get_video_resolution", lambda _path: (2160, 3840))
+    monkeypatch.setattr(main, "_render_watermark_rgba", lambda width: widths.append(width) or _FakeWatermarkImage())
+    monkeypatch.setattr(main.subprocess, "run", lambda command, **_kwargs: commands.append(command))
+
+    assert main._finalize_clip_passthrough(
+        str(tmp_path / "in.mp4"), str(tmp_path / "out.mp4"), target_size=(1080, 1920),
+    ) is True
+    assert widths == [1080]
+    graph = commands[0][commands[0].index("-filter_complex") + 1]
+    assert graph.startswith(
+        "[0:v]scale=1080:1920:force_original_aspect_ratio=increase:flags=area,"
+        "crop=1080:1920,setsar=1[base];[base][1:v]overlay="
+    )
+    assert main.EVEN_PAD_FILTER in graph
+
+
+def test_passthrough_scale_only_reencodes_and_exact_size_stays_copy(monkeypatch, tmp_path):
+    commands = []
+    source = {"size": (720, 1280)}
+    monkeypatch.setattr(main, "JOB_REPORTER", _Reporter())
+    monkeypatch.setattr(main, "WATERMARK_ENABLED", False)
+    monkeypatch.setattr(main, "get_video_resolution", lambda _path: source["size"])
+    monkeypatch.setattr(main.subprocess, "run", lambda command, **_kwargs: commands.append(command))
+    src, out = str(tmp_path / "in.mp4"), str(tmp_path / "out.mp4")
+
+    assert main._finalize_clip_passthrough(src, out, target_size=(1080, 1920)) is True
+    scaled = commands[-1]
+    vf = scaled[scaled.index("-vf") + 1]
+    assert "flags=bicubic" in vf and vf.endswith(main.EVEN_PAD_FILTER)
+    assert scaled[scaled.index("-c:a") + 1] == "copy"
+    assert "-c" not in scaled
+
+    copy_command = ["ffmpeg", "-y", "-i", src, "-c", "copy", "-movflags", "+faststart", out]
+    source["size"] = (1080, 1920)
+    assert main._finalize_clip_passthrough(src, out, target_size=(1080, 1920)) is True
+    assert commands[-1] == copy_command
+    assert main._finalize_clip_passthrough(src, out) is True
+    assert commands[-1] == copy_command
+
+
+def test_rotated_phone_clip_at_delivery_size_is_reencoded_upright(monkeypatch, tmp_path):
+    commands = []
+    monkeypatch.setattr(main, "JOB_REPORTER", _Reporter())
+    monkeypatch.setattr(main, "WATERMARK_ENABLED", False)
+    monkeypatch.setattr(main, "get_video_resolution", lambda _path: (1080, 1920))   # display size
+    monkeypatch.setattr(main.video_encoding, "source_rotation", lambda _path: 90)
+    monkeypatch.setattr(main.subprocess, "run", lambda command, **_kwargs: commands.append(command))
+    src, out = str(tmp_path / "phone.mp4"), str(tmp_path / "out.mp4")
+
+    assert main._finalize_clip_passthrough(src, out, target_size=(1080, 1920)) is True
+    assert "-vf" in commands[-1] and "-c" not in commands[-1]
+    assert commands[-1][commands[-1].index("-vf") + 1].startswith("setsar=1,")
+    # The original format keeps the file untouched.
+    assert main._finalize_clip_passthrough(src, out) is True
+    assert commands[-1][commands[-1].index("-c") + 1] == "copy"
+
+
+@pytest.mark.parametrize(
+    "last_run,excluded",
+    [({"gpu_wait_seconds": 30.0}, True), ({"model_downloaded": True}, True),
+     ({"gpu_wait_seconds": 0.5, "model_downloaded": False}, False)],
+)
+def test_transcription_wait_and_download_are_not_learned_as_speed(monkeypatch, last_run, excluded):
+    reporter = _Reporter()
+    monkeypatch.setattr(main, "JOB_REPORTER", reporter)
+    info = SimpleNamespace(language="de", language_probability=0.99)
+
+    def fake_run(*_args, **_kwargs):
+        main.whisper_runtime.LAST_RUN.clear()
+        main.whisper_runtime.LAST_RUN.update(device="cuda", fell_back=False, **last_run)
+        return [], info, {"device": "cuda"}
+
+    monkeypatch.setattr(main.whisper_runtime, "run_whisper", fake_run)
+    main.transcribe_video("audio.mp4", 60)
+    assert ("transcribe" in reporter.stats_excluded_phases) is excluded
+
+
+def test_whisper_model_prefetch_marks_download_and_never_raises(monkeypatch):
+    reporter = _Reporter()
+    reporter.operation = lambda *_a, **_k: contextmanager(lambda: (yield))()
+    reporter.heartbeat = lambda *_a, **_k: None
+
+    def downloaded(_name, on_status=None, report=None):
+        report["downloaded"] = True
+
+    monkeypatch.setattr(main.whisper_runtime, "ensure_model", downloaded)
+    main._prefetch_whisper_model(reporter, "large-v3-turbo")
+    assert "transcribe" in reporter.stats_excluded_phases
+
+    def broken(*_args, **_kwargs):
+        raise OSError("network down")
+
+    quiet = _Reporter()
+    quiet.operation = reporter.operation
+    monkeypatch.setattr(main.whisper_runtime, "ensure_model", broken)
+    main._prefetch_whisper_model(quiet, "large-v3-turbo")
+    assert "transcribe" not in quiet.stats_excluded_phases
+
+
 def test_source_discovery_excludes_finished_long_output(monkeypatch, tmp_path):
     source = tmp_path / "source.mp4"
     long_output = tmp_path / "source_long_1.mp4"
@@ -1011,8 +1216,26 @@ def test_auto_skips_nine_minute_sources_but_long_mode_still_scales():
     assert main.LONGFORM_MIN_SOURCE_SECONDS > 9 * 60
     assert main.LONGFORM_HARD_MIN_SOURCE_SECONDS <= 9 * 60
     target_min, target_max, _warnings = main._longform_target_range(9 * 60)
-    assert target_min == 240
+    assert target_min == 480
     assert target_max == 540
+
+
+def test_long_video_minimum_is_eight_minutes_by_default():
+    assert main.LONGFORM_TARGET_MIN_SECONDS == 480
+    assert main.LONGFORM_TARGET_MAX_SECONDS == 600
+    # The explicit Long-mode source bound follows the output minimum, so the
+    # two limits cannot drift apart again.
+    assert main.LONGFORM_HARD_MIN_SOURCE_SECONDS == main.LONGFORM_TARGET_MIN_SECONDS
+    assert main._longform_target_range(60 * 60) == (480, 600, [])
+
+
+def test_explicit_long_mode_rejects_sources_shorter_than_the_minimum():
+    # Fails before the expensive transcription instead of after it.
+    with pytest.raises(RuntimeError, match="at least 480 seconds"):
+        main._validate_longform_source_duration("long", 7 * 60)
+    main._validate_longform_source_duration("long", 8 * 60)
+    # Auto applies its own, higher threshold and never raises here.
+    main._validate_longform_source_duration("auto", 7 * 60)
 
 
 def test_video_duration_falls_back_to_ffprobe_when_opencv_is_unknown(monkeypatch):
@@ -1075,8 +1298,17 @@ def test_explicit_long_source_is_rejected_before_transcription():
     early_guard = source.index(
         "_validate_longform_source_duration(video_type, duration)", cli_start,
     )
-    transcription = source.index("transcript = transcribe_video(input_video, duration)", cli_start)
+    transcription = source.index("transcript = transcribe_video(input_video, duration", cli_start)
     assert early_guard < transcription
+
+
+@pytest.fixture
+def compact_longform_bounds(monkeypatch):
+    """The planner fixtures below are six-minute sources with five-minute
+    plans. Production Long mode rejects sources that short (8-minute minimum),
+    so the review/repair tests pin the compact output bounds they exercise.
+    The real defaults are covered by the duration tests in this module."""
+    monkeypatch.setattr(main, "LONGFORM_TARGET_MIN_SECONDS", 240.0)
 
 
 def _v2_word_transcript():
@@ -1172,7 +1404,7 @@ def _v2_review(plan, *, approved, score, dropped_chapter_ids=None):
     }
 
 
-def test_longform_quality_gate_runs_one_repair_before_accepting(monkeypatch, tmp_path):
+def test_longform_quality_gate_runs_one_repair_before_accepting(monkeypatch, tmp_path, compact_longform_bounds):
     reporter = _Reporter()
     monkeypatch.setattr(main, "JOB_REPORTER", reporter)
     monkeypatch.setenv("GEMINI_API_KEY", "test")
@@ -1215,7 +1447,7 @@ def test_longform_quality_gate_runs_one_repair_before_accepting(monkeypatch, tmp
     assert result["plan_data"]["editorial_review"]["final_verification_attempted"] is True
 
 
-def test_repair_rolls_back_both_plan_views_after_empty_review_plan(monkeypatch, tmp_path):
+def test_repair_rolls_back_both_plan_views_after_empty_review_plan(monkeypatch, tmp_path, compact_longform_bounds):
     reporter = _Reporter()
     monkeypatch.setattr(main, "JOB_REPORTER", reporter)
     monkeypatch.setenv("GEMINI_API_KEY", "test")
@@ -1262,7 +1494,7 @@ def test_repair_rolls_back_both_plan_views_after_empty_review_plan(monkeypatch, 
     assert repair_inputs == [{"viable": True, "chapters": 2, "context_segments": 2}]
 
 
-def test_repair_context_uses_current_boundaries_with_anchor_candidates(monkeypatch, tmp_path):
+def test_repair_context_uses_current_boundaries_with_anchor_candidates(monkeypatch, tmp_path, compact_longform_bounds):
     reporter = _Reporter()
     monkeypatch.setattr(main, "JOB_REPORTER", reporter)
     monkeypatch.setenv("GEMINI_API_KEY", "test")
@@ -1326,7 +1558,7 @@ def test_repair_context_uses_current_boundaries_with_anchor_candidates(monkeypat
     }
 
 
-def test_out_of_order_model_chapters_are_normalized_before_review(monkeypatch, tmp_path):
+def test_out_of_order_model_chapters_are_normalized_before_review(monkeypatch, tmp_path, compact_longform_bounds):
     reporter = _Reporter()
     monkeypatch.setattr(main, "JOB_REPORTER", reporter)
     monkeypatch.setenv("GEMINI_API_KEY", "test")
@@ -1361,7 +1593,7 @@ def test_out_of_order_model_chapters_are_normalized_before_review(monkeypatch, t
     ] == ["chapter_01", "chapter_02"]
 
 
-def test_fresh_final_review_can_reject_a_self_approved_repair(monkeypatch, tmp_path):
+def test_fresh_final_review_can_reject_a_self_approved_repair(monkeypatch, tmp_path, compact_longform_bounds):
     reporter = _Reporter()
     monkeypatch.setattr(main, "JOB_REPORTER", reporter)
     monkeypatch.setenv("GEMINI_API_KEY", "test")
@@ -1397,7 +1629,7 @@ def test_fresh_final_review_can_reject_a_self_approved_repair(monkeypatch, tmp_p
     assert "incomplete_segment_ending:span_02" in result["plan_data"]["editorial_review"]["gate_issues"]
 
 
-def test_repair_cannot_delete_a_strong_chapter_that_sorting_preserved(monkeypatch, tmp_path):
+def test_repair_cannot_delete_a_strong_chapter_that_sorting_preserved(monkeypatch, tmp_path, compact_longform_bounds):
     reporter = _Reporter()
     monkeypatch.setattr(main, "JOB_REPORTER", reporter)
     monkeypatch.setenv("GEMINI_API_KEY", "test")
@@ -1463,7 +1695,7 @@ def test_repair_cannot_delete_a_strong_chapter_that_sorting_preserved(monkeypatc
     } == {"chapter_01", "chapter_02", "chapter_03"}
 
 
-def test_review_can_drop_an_unmoved_chapter_after_chronology_normalization(monkeypatch, tmp_path):
+def test_review_can_drop_an_unmoved_chapter_after_chronology_normalization(monkeypatch, tmp_path, compact_longform_bounds):
     reporter = _Reporter()
     monkeypatch.setattr(main, "JOB_REPORTER", reporter)
     monkeypatch.setenv("GEMINI_API_KEY", "test")
@@ -1524,7 +1756,7 @@ def test_review_can_drop_an_unmoved_chapter_after_chronology_normalization(monke
 
 
 @pytest.mark.parametrize("bad_payload", [[], "text", 42])
-def test_longform_planner_non_object_payload_fails_cleanly(monkeypatch, tmp_path, bad_payload):
+def test_longform_planner_non_object_payload_fails_cleanly(monkeypatch, tmp_path, compact_longform_bounds, bad_payload):
     reporter = _Reporter()
     monkeypatch.setattr(main, "JOB_REPORTER", reporter)
     monkeypatch.setenv("GEMINI_API_KEY", "test")
@@ -1554,6 +1786,7 @@ def test_longform_ignores_malformed_worker_cost_analysis(
     monkeypatch,
     tmp_path,
     malformed_cost_analysis,
+    compact_longform_bounds,
 ):
     reporter = _Reporter()
     monkeypatch.setattr(main, "JOB_REPORTER", reporter)
@@ -1582,7 +1815,7 @@ def test_longform_ignores_malformed_worker_cost_analysis(
     assert result["cost_analysis"] is None
 
 
-def test_malformed_nested_review_payload_rejects_cleanly(monkeypatch, tmp_path):
+def test_malformed_nested_review_payload_rejects_cleanly(monkeypatch, tmp_path, compact_longform_bounds):
     reporter = _Reporter()
     monkeypatch.setattr(main, "JOB_REPORTER", reporter)
     monkeypatch.setenv("GEMINI_API_KEY", "test")
@@ -1624,7 +1857,7 @@ def _v1_style_single_chapter_plan():
     return plan
 
 
-def test_single_chapter_draft_triggers_repair_and_passes_once_regrouped(monkeypatch, tmp_path):
+def test_single_chapter_draft_triggers_repair_and_passes_once_regrouped(monkeypatch, tmp_path, compact_longform_bounds):
     """The chapter minimum must be repairable, not an instant rejection.
 
     The review keeps every span id and its unit boundaries and only splits the
@@ -1675,7 +1908,7 @@ def test_single_chapter_draft_triggers_repair_and_passes_once_regrouped(monkeypa
     assert chapters == {"chapter_01", "chapter_02"}
 
 
-def test_single_chapter_draft_is_rejected_when_the_repair_keeps_one_topic(monkeypatch, tmp_path):
+def test_single_chapter_draft_is_rejected_when_the_repair_keeps_one_topic(monkeypatch, tmp_path, compact_longform_bounds):
     reporter = _Reporter()
     monkeypatch.setattr(main, "JOB_REPORTER", reporter)
     monkeypatch.setenv("GEMINI_API_KEY", "test")
@@ -1701,9 +1934,12 @@ def test_single_chapter_draft_is_rejected_when_the_repair_keeps_one_topic(monkey
     assert "too_few_chapters" in result["plan_data"]["editorial_review"]["gate_issues"]
 
 
-def test_longform_rejects_only_after_failed_repair_retry(monkeypatch, tmp_path):
+def test_longform_rejects_only_after_failed_repair_retry(monkeypatch, tmp_path, compact_longform_bounds):
     reporter = _Reporter()
     monkeypatch.setattr(main, "JOB_REPORTER", reporter)
+    # main.py loads the project .env at import; pin the budget so a local
+    # LONGFORM_REVIEW_REPAIR_RETRIES override cannot change this test.
+    monkeypatch.setattr(main, "LONGFORM_REVIEW_REPAIR_RETRIES", 1)
     monkeypatch.setenv("GEMINI_API_KEY", "test")
     raw_plan = _v2_raw_plan()
     review_calls = 0
@@ -1828,3 +2064,331 @@ def test_scene_alignment_reverts_when_a_segment_would_become_too_short(monkeypat
     assert refined["segments"][0]["start"] == 10.0
     assert refined["segments"][0]["end"] == 30.0
     assert "segment_duration:span_01" in refined["local_scene_alignment"]["revert_reasons"]
+
+
+def test_final_review_verdict_via_viable_flag_is_not_a_plan_mutation(monkeypatch, tmp_path, compact_longform_bounds):
+    """Regression: the read-only critic copied the plan exactly but set
+    viable=false to express its verdict; the gate treated that as a mutation."""
+    reporter = _Reporter()
+    monkeypatch.setattr(main, "JOB_REPORTER", reporter)
+    monkeypatch.setenv("GEMINI_API_KEY", "test")
+    raw_plan = _v2_raw_plan()
+
+    def fake_worker(mode, payload, **_kwargs):
+        if mode == "longform_plan_v2":
+            return {"payload": raw_plan, "cost_analysis": None}
+        if payload.get("final_verification"):
+            review = _v2_review(raw_plan, approved=True, score=93)
+            review["plan"] = {**copy.deepcopy(raw_plan), "viable": False}
+            return {"payload": review, "cost_analysis": None}
+        if payload.get("repair_required"):
+            return {"payload": _v2_review(raw_plan, approved=True, score=92), "cost_analysis": None}
+        return {"payload": _v2_review(raw_plan, approved=False, score=70), "cost_analysis": None}
+
+    monkeypatch.setattr(main, "_call_gemini_worker", fake_worker)
+    result = main.get_longform_plan(
+        _v2_word_transcript(), 360, output_dir=str(tmp_path), video_title="Video",
+        windows=[{"id": "window_001", "start": 0, "end": 360, "text": "text"}],
+        scored_windows=[{"id": "window_001", "start": 0, "end": 360, "score": 90, "reason": "strong"}],
+    )
+
+    assert result["error"] is None
+    assert result["plan_data"]["viable"] is True
+    assert "final_review_mutated_plan" not in (result["plan_data"].get("warnings") or [])
+
+
+def test_failed_final_review_spends_the_remaining_repair_budget(monkeypatch, tmp_path, compact_longform_bounds):
+    """With two repairs allowed, a critic rejection after the first repair
+    drives a second repair instead of failing the job outright."""
+    reporter = _Reporter()
+    monkeypatch.setattr(main, "JOB_REPORTER", reporter)
+    monkeypatch.setattr(main, "LONGFORM_REVIEW_REPAIR_RETRIES", 2)
+    monkeypatch.setenv("GEMINI_API_KEY", "test")
+    raw_plan = _v2_raw_plan()
+    calls = []
+
+    def fake_worker(mode, payload, **_kwargs):
+        calls.append((mode, bool(payload.get("repair_required")), bool(payload.get("final_verification"))))
+        if mode == "longform_plan_v2":
+            return {"payload": raw_plan, "cost_analysis": None}
+        verifications = sum(1 for c in calls if c[2])
+        if payload.get("final_verification"):
+            if verifications == 1:
+                rejected = _v2_review(raw_plan, approved=False, score=72)
+                rejected["critical_issues"] = ["Abrupter Themenwechsel"]
+                return {"payload": rejected, "cost_analysis": None}
+            return {"payload": _v2_review(raw_plan, approved=True, score=95), "cost_analysis": None}
+        if payload.get("repair_required"):
+            assert payload.get("repair_feedback"), "repair must receive the critic's feedback"
+            return {"payload": _v2_review(raw_plan, approved=True, score=92), "cost_analysis": None}
+        return {"payload": _v2_review(raw_plan, approved=False, score=70), "cost_analysis": None}
+
+    monkeypatch.setattr(main, "_call_gemini_worker", fake_worker)
+    result = main.get_longform_plan(
+        _v2_word_transcript(), 360, output_dir=str(tmp_path), video_title="Video",
+        windows=[{"id": "window_001", "start": 0, "end": 360, "text": "text"}],
+        scored_windows=[{"id": "window_001", "start": 0, "end": 360, "score": 90, "reason": "strong"}],
+    )
+
+    assert result["error"] is None
+    assert result["plan_data"]["viable"] is True
+    assert calls == [
+        ("longform_plan_v2", False, False),
+        ("longform_review", False, False),
+        ("longform_review", True, False),
+        ("longform_review", False, True),
+        ("longform_review", True, False),
+        ("longform_review", False, True),
+    ]
+    assert result["plan_data"]["editorial_review"]["final_verification_attempted"] is True
+    names = {p.name for p in tmp_path.glob("*.json")}
+    assert any(n.endswith("_longform_repair_v2_2.json") for n in names)
+    assert any(n.endswith("_longform_final_review_v2_2.json") for n in names)
+
+
+def test_failed_final_review_still_fails_when_no_repair_budget_is_left(monkeypatch, tmp_path, compact_longform_bounds):
+    reporter = _Reporter()
+    monkeypatch.setattr(main, "JOB_REPORTER", reporter)
+    monkeypatch.setattr(main, "LONGFORM_REVIEW_REPAIR_RETRIES", 1)
+    monkeypatch.setenv("GEMINI_API_KEY", "test")
+    raw_plan = _v2_raw_plan()
+    calls = []
+
+    def fake_worker(mode, payload, **_kwargs):
+        calls.append((mode, bool(payload.get("repair_required")), bool(payload.get("final_verification"))))
+        if mode == "longform_plan_v2":
+            return {"payload": raw_plan, "cost_analysis": None}
+        if payload.get("final_verification"):
+            rejected = _v2_review(raw_plan, approved=False, score=40)
+            rejected["critical_issues"] = ["Abrupter Themenwechsel"]
+            return {"payload": rejected, "cost_analysis": None}
+        if payload.get("repair_required"):
+            return {"payload": _v2_review(raw_plan, approved=True, score=92), "cost_analysis": None}
+        return {"payload": _v2_review(raw_plan, approved=False, score=70), "cost_analysis": None}
+
+    monkeypatch.setattr(main, "_call_gemini_worker", fake_worker)
+    result = main.get_longform_plan(
+        _v2_word_transcript(), 360, output_dir=str(tmp_path), video_title="Video",
+        windows=[{"id": "window_001", "start": 0, "end": 360, "text": "text"}],
+        scored_windows=[{"id": "window_001", "start": 0, "end": 360, "score": 90, "reason": "strong"}],
+    )
+
+    assert result["error"] is not None
+    assert len([c for c in calls if c[1]]) == 1
+    assert "critical_review_issue" in result["plan_data"]["editorial_review"]["gate_issues"]
+
+
+def _fake_whisper_segments():
+    words = [
+        SimpleNamespace(word=" Hallo", start=0.0, end=0.4, probability=0.9),
+        SimpleNamespace(word="welt", start=0.4, end=0.8, probability=0.8),
+    ]
+    return [
+        SimpleNamespace(text=" Hallowelt", start=0.0, end=4.0, words=words),
+        SimpleNamespace(text=" Zweiter Satz.", start=4.0, end=10.0, words=[]),
+    ]
+
+
+def test_transcribe_video_keeps_transcript_contract(monkeypatch):
+    reporter = _Reporter()
+    monkeypatch.setattr(main, "JOB_REPORTER", reporter)
+    calls = []
+
+    def fake_run_whisper(media_path, params, *, on_segment=None, on_restart=None, on_status=None,
+                         on_wait=None, allow_gpu_download=True, log=print):
+        calls.append((media_path, dict(params)))
+        info = SimpleNamespace(language="de", language_probability=0.97)
+        segments = _fake_whisper_segments()
+        for segment in segments:
+            on_segment(segment, info)
+        return segments, info, {"device": "cuda"}
+
+    monkeypatch.setattr(main.whisper_runtime, "run_whisper", fake_run_whisper)
+    result = main.transcribe_video("clip.mp4", 10.0)
+
+    import subtitles
+    assert calls == [("clip.mp4", subtitles.WHISPER_TRANSCRIBE_PARAMS)]
+    assert result["language"] == "de"
+    assert result["text"] == "Hallowelt  Zweiter Satz."
+    # Continuation fragments are merged and the word probability is kept.
+    assert result["segments"][0]["words"] == [
+        {"word": " Hallowelt", "start": 0.0, "end": 0.8, "probability": 0.9},
+    ]
+    progress = [event for event in reporter.events if event[0] == "progress"]
+    assert progress[0][2]["message"].startswith("Transcribing audio... 40.0%")
+    assert progress[-1][1] == (100.0,)
+    assert progress[-1][2]["message"] == "Transcription complete."
+
+
+def test_transcribe_video_gpu_fallback_resets_progress_and_excludes_stats(monkeypatch):
+    reporter = _Reporter()
+    monkeypatch.setattr(main, "JOB_REPORTER", reporter)
+
+    def fake_run_whisper(media_path, params, *, on_segment=None, on_restart=None, on_status=None,
+                         on_wait=None, allow_gpu_download=True, log=print):
+        info = SimpleNamespace(language="de", language_probability=0.97)
+        on_segment(SimpleNamespace(end=8.0), info)
+        on_status("Transcribing on GPU with Whisper large-v3-turbo")   # no heartbeat on the fake
+        on_restart("GPU busy: no free transcription slot", {"model_size": "small"})
+        segments = _fake_whisper_segments()
+        for segment in segments:
+            on_segment(segment, info)
+        return segments, info, {"device": "cpu"}
+
+    monkeypatch.setattr(main.whisper_runtime, "run_whisper", fake_run_whisper)
+    main.transcribe_video("clip.mp4", 10.0)
+
+    kinds = [event[0] for event in reporter.events]
+    warning_index = kinds.index("warning")
+    assert "Restarting on CPU" in reporter.events[warning_index][1][0]
+    reset = reporter.events[warning_index + 1]
+    assert reset[0] == "progress" and reset[1] == (0.0,)
+    assert reset[2]["message"] == "Transcribing audio on CPU... 0.0%"
+    later = [e for e in reporter.events[warning_index + 2:] if e[0] == "progress"]
+    assert later[0][2]["message"].startswith("Transcribing audio on CPU...")
+    assert "transcribe" in reporter.stats_excluded_phases
+
+
+def test_gpu_transcribe_eta_uses_its_own_history_and_prior(monkeypatch, tmp_path):
+    monkeypatch.setattr(main, "JOB_STATS_PATH", str(tmp_path / "job_stats.json"))
+    gpu = main.JobReporter()
+    gpu.video_duration = 3600.0
+    gpu.phase_cost_variant["transcribe"] = "cuda"
+    assert gpu._phase_cost_prior("transcribe") == pytest.approx(216.0)
+
+    gpu.phase_durations = {"transcribe": 180.0}
+    gpu._record_job_stats()
+    stats = json.loads((tmp_path / "job_stats.json").read_text(encoding="utf-8"))
+    assert stats["transcribe"] == {"per_source_second@cuda": [0.05]}
+
+    cpu = main.JobReporter()
+    cpu.video_duration = 3600.0
+    assert cpu._phase_cost_prior("transcribe") == pytest.approx(1800.0)
+    gpu_again = main.JobReporter()
+    gpu_again.video_duration = 3600.0
+    gpu_again.phase_cost_variant["transcribe"] = "cuda"
+    assert gpu_again._phase_cost_prior("transcribe") == pytest.approx(180.0)
+
+
+def test_type_pipeline_keeps_earlier_stats_exclusions(monkeypatch, tmp_path):
+    class SeededReporter(_Reporter):
+        def __init__(self):
+            super().__init__()
+            self.stats_excluded_phases = {"transcribe"}
+
+    monkeypatch.setitem(globals(), "_Reporter", SeededReporter)
+
+    def render_shorts(*_args, **_kwargs):
+        return 30.0
+
+    def render_long(*_args, **_kwargs):
+        return str(tmp_path / "Video_long_1.mp4")
+
+    _metadata, reporter = _run_auto_with_both_outputs(monkeypatch, tmp_path, render_shorts, render_long)
+    assert {"transcribe", "analyze", "render"} <= reporter.stats_excluded_phases
+
+
+def test_longform_nvenc_failure_rerenders_all_segments_with_x264(monkeypatch, tmp_path):
+    import video_encoding
+
+    reporter = _Reporter()
+    commands = []
+    monkeypatch.setattr(main, "JOB_REPORTER", reporter)
+    monkeypatch.setattr(main, "get_video_resolution", lambda _path: (640, 480))
+    nvenc = video_encoding.EncodeAttempt("nvenc", ("-c:v", "h264_nvenc", "-cq", "19", "-pix_fmt", "yuv420p"))
+    x264 = video_encoding.EncodeAttempt("x264", tuple(video_encoding._X264_ARGS[video_encoding.HIGH]))
+    monkeypatch.setattr(main.video_encoding, "encode_attempts", lambda *_a, **_k: [nvenc, x264])
+    monkeypatch.setattr(main.video_encoding, "note_nvenc_failure", lambda _reason: None)
+
+    def fake_ffmpeg(command, **kwargs):
+        commands.append(command)
+        if "h264_nvenc" in command and kwargs.get("label") == "Long-form segment 2":
+            raise RuntimeError("Long-form segment 2 failed: OpenEncodeSessionEx failed")
+
+    monkeypatch.setattr(main, "_run_checked_ffmpeg", fake_ffmpeg)
+
+    def finalize(_input, output, _progress):
+        with open(output, "wb") as handle:
+            handle.write(b"video")
+        return True
+
+    monkeypatch.setattr(main, "_finalize_clip_passthrough", finalize)
+    plan = {"total_duration": 90, "segments": [
+        {"start": 10, "end": 40}, {"start": 80, "end": 110}, {"start": 200, "end": 230},
+    ]}
+    main._render_longform_video(plan, "source.mp4", str(tmp_path), "Video", total_weight=90)
+
+    encoders = ["nvenc" if "h264_nvenc" in c else "x264" if "libx264" in c else "copy" for c in commands]
+    assert encoders == ["nvenc", "nvenc", "x264", "x264", "x264", "copy"]
+    assert any(e[0] == "warning" and "re-encoding every segment" in e[1][0] for e in reporter.events)
+
+
+def _longform_attempt_harness(monkeypatch, tmp_path, nvenc_error, sizes):
+    import subprocess
+    import video_encoding
+
+    commands = []
+    monkeypatch.setattr(main, "JOB_REPORTER", _Reporter())
+    monkeypatch.setattr(main, "get_video_resolution", lambda _path: (640, 480))
+    nvenc = video_encoding.EncodeAttempt("nvenc", ("-c:v", "h264_nvenc", "-pix_fmt", "yuv420p"))
+    x264 = video_encoding.EncodeAttempt("x264", tuple(video_encoding._X264_ARGS[video_encoding.HIGH]))
+
+    def attempts(*_args, **kwargs):
+        sizes.append((kwargs.get("width"), kwargs.get("height")))
+        return [nvenc, x264]
+
+    monkeypatch.setattr(main.video_encoding, "encode_attempts", attempts)
+    monkeypatch.setattr(main.video_encoding, "note_nvenc_failure", lambda _reason: None)
+
+    def fake_ffmpeg(command, **_kwargs):
+        commands.append(command)
+        if "h264_nvenc" in command:
+            raise nvenc_error(subprocess)
+
+    monkeypatch.setattr(main, "_run_checked_ffmpeg", fake_ffmpeg)
+
+    def finalize(_input, output, _progress):
+        with open(output, "wb") as handle:
+            handle.write(b"video")
+        return True
+
+    monkeypatch.setattr(main, "_finalize_clip_passthrough", finalize)
+    plan = {"total_duration": 30, "segments": [{"start": 10, "end": 40}]}
+    return commands, lambda: main._render_longform_video(
+        plan, "Server timed out.mp4", str(tmp_path), "Video", total_weight=30,
+    )
+
+
+def test_longform_fallback_ignores_timed_out_inside_ffmpeg_text(monkeypatch, tmp_path):
+    def failure(subprocess):
+        try:
+            raise subprocess.CalledProcessError(1, ["ffmpeg"])
+        except subprocess.CalledProcessError as exc:
+            try:
+                raise RuntimeError(
+                    "Long-form segment 1 failed: Input #0, from 'Server timed out.mp4': Conversion failed!"
+                ) from exc
+            except RuntimeError as wrapped:
+                return wrapped
+
+    sizes = []
+    commands, render = _longform_attempt_harness(monkeypatch, tmp_path, failure, sizes)
+    render()
+    assert ["libx264" in " ".join(c) for c in commands][:2] == [False, True]
+    assert sizes == [(1920, 1080)]          # 640x480 goes on the 16:9 canvas
+
+
+def test_longform_real_timeout_is_not_retried(monkeypatch, tmp_path):
+    def failure(subprocess):
+        try:
+            raise subprocess.TimeoutExpired(["ffmpeg"], 5)
+        except subprocess.TimeoutExpired as exc:
+            try:
+                raise RuntimeError("Long-form segment 1 timed out after 5s") from exc
+            except RuntimeError as wrapped:
+                return wrapped
+
+    commands, render = _longform_attempt_harness(monkeypatch, tmp_path, failure, [])
+    with pytest.raises(RuntimeError, match="timed out"):
+        render()
+    assert len(commands) == 1

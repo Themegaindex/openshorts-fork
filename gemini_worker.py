@@ -376,6 +376,13 @@ REVIEW RULES:
   thematically separable, return `approved:false`.
 - Retain as many strong distinct topics as possible, but drop a topic instead
   of approving a confusing transition.
+- This is a chronological best-of of DISTINCT topics: a change of topic at a
+  chapter boundary is expected and is never a weak join by itself. Score a
+  join on the cut, not on thematic continuity. The left segment must end on a
+  complete thought and the right segment must open with its own question or
+  setup, so a viewer can follow it without the skipped material. Treat
+  "unrelated topics" as a defect only when the right segment depends on
+  context the viewer never saw.
 - The final assembled duration must remain {target_min_seconds}-
   {target_max_seconds} seconds, every body span must remain
   {min_segment_seconds}-{max_segment_seconds} seconds, and the plan may contain
@@ -629,10 +636,12 @@ def _thinking_config_from_env(
     try:
         if raw.isdigit():
             return genai_types.ThinkingConfig(thinking_budget=int(raw))
-        if raw in ("low", "high"):
+        if raw in ("low", "medium", "high"):
             if model_name.startswith("gemini-3"):
                 return genai_types.ThinkingConfig(thinking_level=raw)
-            return genai_types.ThinkingConfig(thinking_budget=2048 if raw == "low" else 8192)
+            return genai_types.ThinkingConfig(
+                thinking_budget={"low": 2048, "medium": 4096, "high": 8192}[raw],
+            )
     except Exception as e:
         _log(f"⚠️ Ignoring {env_name}={raw!r}: {e}")
     return None

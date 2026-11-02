@@ -24,6 +24,11 @@ class _FrameNumber:
         ((1080, 1920, 3), (608, 1080)),   # landscape -> vertical
         ((1280, 720, 3), (720, 720)),     # portrait -> square
         ((1080, 1080, 3), (608, 1080)),   # square -> vertical
+        ((2160, 3840, 3), (1080, 1920)),  # 4K -> delivery vertical
+        ((720, 1280, 3), (1080, 1920)),   # 720p -> delivery vertical
+        ((1080, 1920, 3), (1080, 1080)),  # 1080p -> delivery square
+        ((1280, 720, 3), (1080, 1920)),   # portrait -> delivery vertical
+        ((32, 32, 3), (1080, 1920)),      # tiny source
     ],
 )
 def test_general_frame_handles_every_source_orientation(source_shape, output_size):
@@ -33,8 +38,23 @@ def test_general_frame_handles_every_source_orientation(source_shape, output_siz
     assert rendered.shape == (output_height, output_width, 3)
 
 
+@pytest.mark.parametrize("blur_downscale", [1, 4])
+@pytest.mark.parametrize("source_shape", [(1080, 1920, 3), (1280, 720, 3), (1080, 1080, 3)])
+def test_quarter_size_backdrop_matches_the_full_size_blur(source_shape, blur_downscale):
+    height, width = source_shape[:2]
+    gradient_x = np.tile(np.linspace(0, 255, width, dtype=np.float32), (height, 1))
+    gradient_y = np.tile(np.linspace(0, 255, height, dtype=np.float32)[:, None], (1, width))
+    frame = np.dstack([gradient_x, gradient_y, (gradient_x + gradient_y) / 2]).astype(np.uint8)
+
+    legacy = main.create_general_frame(frame, 608, 1080, blur_downscale=1)
+    rendered = main.create_general_frame(frame, 608, 1080, blur_downscale=blur_downscale)
+    assert rendered.shape == legacy.shape == (1080, 608, 3)
+    diff = np.abs(rendered.astype(np.int16) - legacy.astype(np.int16))
+    assert diff.mean() < 2.0
+
+
 def test_portrait_to_square_crop_tracks_both_axes_without_stretching():
-    camera = main.SmoothedCameraman(720, 720, 720, 1280, aspect_ratio=1.0)
+    camera = main.SmoothedCameraman(1080, 1080, 720, 1280, aspect_ratio=1.0)
     camera.update_target((200, 900, 200, 200))
     x1, y1, x2, y2 = camera.get_crop_box(force_snap=True)
     assert (x2 - x1, y2 - y1) == (720, 720)
@@ -43,9 +63,105 @@ def test_portrait_to_square_crop_tracks_both_axes_without_stretching():
 
 
 def test_landscape_to_vertical_crop_keeps_target_aspect():
-    camera = main.SmoothedCameraman(608, 1080, 1920, 1080, aspect_ratio=9 / 16)
+    camera = main.SmoothedCameraman(1080, 1920, 1920, 1080, aspect_ratio=9 / 16)
     x1, y1, x2, y2 = camera.get_crop_box()
     assert (x2 - x1, y2 - y1) == (608, 1080)
+
+
+@pytest.mark.parametrize(
+    "output,source,aspect,crop",
+    [((1080, 1920), (3840, 2160), 9 / 16, (1214, 2160)),
+     ((1080, 1920), (1280, 720), 9 / 16, (404, 720)),
+     ((1080, 1080), (1280, 720), 1.0, (720, 720))],
+)
+def test_track_crop_ignores_delivery_size(output, source, aspect, crop):
+    camera = main.SmoothedCameraman(*output, *source, aspect_ratio=aspect)
+    assert (camera.crop_width, camera.crop_height) == crop
+    x1, y1, x2, y2 = camera.get_crop_box(force_snap=True)
+    assert (x2 - x1, y2 - y1) == crop
+
+
+def test_split_frame_delivers_exact_size_from_4k_and_720p():
+    big = np.zeros((2160, 3840, 3), dtype=np.uint8)
+    small = np.zeros((720, 1280, 3), dtype=np.uint8)
+    assert main.create_split_frame(big, 1080, 1920, [(960, 1080), (2880, 1080)], stacked=True).shape == (1920, 1080, 3)
+    assert main.create_split_frame(small, 1080, 1920, [(320, 360), (960, 360)], stacked=True).shape == (1920, 1080, 3)
+    assert main.create_split_frame(small, 1080, 1080, [(320, 360), (960, 360)], stacked=False).shape == (1080, 1080, 3)
+
+
+def test_resize_frame_picks_shrink_path_or_configured_upscaler(monkeypatch):
+    used = []
+    real_resize = cv2.resize
+
+    def recording_resize(image, size, interpolation=None):
+        used.append((image.shape[1], image.shape[0], size, interpolation))
+        return real_resize(image, size, interpolation=interpolation)
+
+    monkeypatch.setattr(main.cv2, "resize", recording_resize)
+    # Under 2x: one linear pass (4K track crop).
+    assert main._resize_frame(np.zeros((2160, 1214, 3), np.uint8), 1080, 1920).shape == (1920, 1080, 3)
+    # 3.56x: box filter at 3x on a trimmed frame, then linear for the rest.
+    assert main._resize_frame(np.zeros((2160, 3840, 3), np.uint8), 1080, 608).shape == (608, 1080, 3)
+    # Exactly 2x: the box filter alone lands on the target.
+    assert main._resize_frame(np.zeros((1920, 2160, 3), np.uint8), 1080, 960).shape == (960, 1080, 3)
+    assert main._resize_frame(np.zeros((720, 404, 3), np.uint8), 1080, 1920).shape == (1920, 1080, 3)
+    monkeypatch.setattr(main, "SHORTS_UPSCALE_INTERPOLATION", "lanczos")
+    main._resize_frame(np.zeros((720, 404, 3), np.uint8), 1080, 1920)
+    assert used == [
+        (1214, 2160, (1080, 1920), cv2.INTER_LINEAR),
+        (3840, 2160, (1280, 720), cv2.INTER_AREA),
+        (1280, 720, (1080, 608), cv2.INTER_LINEAR),
+        (2160, 1920, (1080, 960), cv2.INTER_AREA),
+        (404, 720, (1080, 1920), cv2.INTER_CUBIC),
+        (404, 720, (1080, 1920), cv2.INTER_LANCZOS4),
+    ]
+
+    frame = np.arange(40 * 60 * 3, dtype=np.uint32).reshape(40, 60, 3).astype(np.uint8)
+    window = frame[5:25, 10:40]
+    same = main._resize_frame(window, 30, 20)
+    assert len(used) == 6
+    assert same.flags["C_CONTIGUOUS"] and np.array_equal(same, window)
+
+
+def test_shrink_trims_less_than_one_box_and_keeps_the_picture_centred():
+    frame = np.zeros((2161, 3841, 3), np.uint8)
+    frame[:, :1920] = 255                       # left half white
+    small = main._resize_frame(frame, 1080, 608)
+    assert small.shape == (608, 1080, 3)
+    assert abs(int(small[300, 538, 0]) - 255) <= 1 and small[300, 542, 0] <= 1
+
+
+def test_general_frame_backdrop_is_blurred_and_foreground_sharp():
+    tile = np.indices((1080, 1920)).sum(axis=0) // 8 % 2
+    frame = np.repeat((tile * 255).astype(np.uint8)[:, :, None], 3, axis=2)
+    rendered = main.create_general_frame(frame, 1080, 1920)
+    gray = cv2.cvtColor(rendered, cv2.COLOR_BGR2GRAY)
+    backdrop = cv2.Laplacian(gray[0:600], cv2.CV_64F).var()
+    foreground = cv2.Laplacian(gray[700:1200], cv2.CV_64F).var()
+    assert backdrop < 0.05 * foreground
+    expected = main._resize_frame(frame, 1080, 608)
+    assert np.array_equal(rendered[656:656 + 608], expected)
+
+
+def test_watermark_blend_matches_the_float_formula(monkeypatch):
+    from PIL import Image as PILImage
+
+    rng = np.random.default_rng(7)
+    rgba = rng.integers(0, 256, size=(40, 90, 4), dtype=np.uint8)
+    monkeypatch.setattr(main, "WATERMARK_ENABLED", True)
+    monkeypatch.setattr(main, "_render_watermark_rgba", lambda _width: PILImage.fromarray(rgba, "RGBA"))
+    blender = main._build_watermark_blender(200, 120)
+    frame = rng.integers(0, 256, size=(120, 200, 3), dtype=np.uint8)
+
+    arr = rgba.astype(np.float32)
+    alpha = arr[:, :, 3:4] / 255.0
+    premul, inv_alpha = arr[:, :, [2, 1, 0]] * alpha, 1.0 - alpha
+    x, y = (200 - 90) // 2, (120 - 40) // 2
+    expected = frame.copy()
+    roi = expected[y:y + 40, x:x + 90].astype(np.float32)
+    expected[y:y + 40, x:x + 90] = (roi * inv_alpha + premul).astype(np.uint8)
+
+    assert np.array_equal(main._apply_watermark(frame, blender), expected)
 
 
 def _fake_renderer(calls):
@@ -65,6 +181,7 @@ def test_original_and_legacy_horizontal_use_passthrough(monkeypatch, tmp_path, f
     final = tmp_path / "out.mp4"
     assert main._render_clip("in.mp4", str(final), output_format=format_name) is True
     assert len(calls) == 1
+    assert calls[0][3].get("target_size") is None      # the original keeps its size
     assert final.read_bytes() == b"video"
 
 

@@ -10,6 +10,7 @@ from pydantic import BaseModel
 
 from edit_builder import build_filter_string
 from video_formats import with_even_padding
+import video_encoding
 
 
 class EditDecision(BaseModel):
@@ -385,32 +386,29 @@ class VideoEditor:
 
         output_filter = with_even_padding(filter_string)
 
-        cmd = [
-            'ffmpeg', '-y',
-            '-i', input_path,
-            '-vf', output_filter,
-            '-c:v', 'libx264', '-preset', 'fast', '-crf', '22', '-pix_fmt', 'yuv420p',
-            '-c:a', 'copy',
-            '-movflags', '+faststart',
-            output_path
-        ]
-        
+        def _build(attempt):
+            cmd = [
+                'ffmpeg', '-y',
+                '-i', input_path,
+                '-vf', output_filter,
+                *attempt.video_args, '-pix_fmt', 'yuv420p',
+                '-c:a', 'copy',
+                '-movflags', '+faststart',
+                output_path
+            ]
+            # Pass UTF-8 bytes: an ASCII filesystem encoding cannot encode
+            # Unicode paths through os.fsencode().
+            return [arg.encode('utf-8') if isinstance(arg, str) else arg for arg in cmd]
+
         try:
-            # We must encode arguments if filesystem is ascii but we have unicode chars
-            # But subprocess in Python 3 handles unicode args by encoding them with os.fsencode().
-            # If sys.getfilesystemencoding() is ascii, this fails.
-            # We can't change fs encoding at runtime easily.
-            # Workaround: pass bytes directly? subprocess allows bytes in args.
-            
-            # Convert command elements to bytes assuming utf-8 if they are strings
-            cmd_bytes = []
-            for arg in cmd:
-                if isinstance(arg, str):
-                    cmd_bytes.append(arg.encode('utf-8'))
-                else:
-                    cmd_bytes.append(arg)
-            
-            subprocess.run(cmd_bytes, check=True, env=env, timeout=1800)
+            video_encoding.run_encode(
+                _build,
+                tier=video_encoding.STANDARD,
+                label="AI editor render",
+                output_path=output_path,
+                env=env,
+                timeout=1800,
+            )
         except subprocess.TimeoutExpired:
             print("❌ FFmpeg filter timed out after 1800s.")
             raise RuntimeError("FFmpeg filter timed out after 1800s.")

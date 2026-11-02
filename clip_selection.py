@@ -5,8 +5,14 @@ Standard-library only so both main.py and gemini_worker.py can import it and
 the logic stays unit-testable without the heavy video dependencies.
 """
 
+import datetime
+
 # USD per 1M tokens (input, output incl. thinking), from ai.google.dev pricing.
 MODEL_PRICES = {
+    "gemini-3.8-flash": (0.75, 3.75),   # promo price through 2026-12-31, see PROMO_PRICE_ENDS
+    "gemini-3.7-flash": (0.75, 3.75),
+    "gemini-3.6-flash": (0.75, 3.75),
+    "gemini-3.5-flash-lite": (0.30, 2.50),
     "gemini-3.5-flash": (1.50, 9.00),
     "gemini-3.1-flash-lite": (0.25, 1.50),
     "gemini-3-flash-preview": (0.50, 3.00),
@@ -16,14 +22,25 @@ MODEL_PRICES = {
 }
 
 
-def lookup_model_prices(model_name):
+# Promotional prices end on a known date: (last promo day, regular price).
+PROMO_PRICE_ENDS = {
+    "gemini-3.8-flash": (datetime.date(2026, 12, 31), (1.50, 7.50)),
+}
+
+
+def lookup_model_prices(model_name, today=None):
     """Longest-prefix match against MODEL_PRICES; None if unknown."""
     name = str(model_name or "").lower()
     best_key = None
     for key in MODEL_PRICES:
         if name.startswith(key) and (best_key is None or len(key) > len(best_key)):
             best_key = key
-    return MODEL_PRICES[best_key] if best_key else None
+    if best_key is None:
+        return None
+    promo = PROMO_PRICE_ENDS.get(best_key)
+    if promo and (today or datetime.date.today()) > promo[0]:
+        return promo[1]
+    return MODEL_PRICES[best_key]
 
 
 def selection_limits(

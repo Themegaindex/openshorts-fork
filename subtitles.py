@@ -6,23 +6,25 @@ import math
 import colorsys
 from decimal import Decimal, InvalidOperation, ROUND_HALF_UP
 from video_formats import EVEN_PAD_FILTER
+import video_encoding
+import whisper_runtime
 
 
 _STDIO_CONFIGURED = False
 
-# Shared faster-whisper config so both transcription paths (this module and
-# main.transcribe_video) behave identically. "small" is meaningfully better at
-# German than "base" without being much slower on CPU.
-DEFAULT_WHISPER_MODEL = "small"
+# CPU default model; the GPU default is whisper_runtime.DEFAULT_GPU_MODEL.
+# "small" is meaningfully better at German than "base" without being much
+# slower on CPU.
+DEFAULT_WHISPER_MODEL = whisper_runtime.DEFAULT_CPU_MODEL
 
 
 def get_whisper_config():
-    """Return the faster-whisper model config, overridable via env vars."""
-    return {
-        "model_size": os.environ.get("WHISPER_MODEL", DEFAULT_WHISPER_MODEL),
-        "device": os.environ.get("WHISPER_DEVICE", "cpu"),
-        "compute_type": os.environ.get("WHISPER_COMPUTE", "int8"),
-    }
+    """Resolved faster-whisper config shared by every transcription path.
+
+    WHISPER_DEVICE=auto picks CUDA when CTranslate2 sees a GPU;
+    WHISPER_MODEL/WHISPER_COMPUTE override the defaults.
+    """
+    return whisper_runtime.resolve_whisper_config()
 
 
 # Decode params shared by both transcription paths. condition_on_previous_text
@@ -189,14 +191,11 @@ def transcribe_audio(video_path):
     Transcribe audio from a video file using faster-whisper.
     Returns transcript in the same format as main.py for compatibility.
     """
-    from faster_whisper import WhisperModel
-
     _log(f"🎙️  Transcribing audio from: {video_path}")
 
-    cfg = get_whisper_config()
-    model = WhisperModel(cfg["model_size"], device=cfg["device"], compute_type=cfg["compute_type"])
-
-    segments, info = model.transcribe(video_path, **WHISPER_TRANSCRIBE_PARAMS)
+    segments, info, _cfg = whisper_runtime.run_whisper(
+        video_path, WHISPER_TRANSCRIBE_PARAMS, log=_log,
+    )
 
     transcript = {
         "segments": [],
@@ -1161,8 +1160,14 @@ HOOK_ENTRANCE_FADE_SECONDS = 0.35
 HOOK_ENTRANCE_SLIDE_PX = 60
 
 
+def layer_encode_tier(subtitle_filter):
+    """Burned text keeps the high-quality master tier; hook-only uses reframe."""
+    return video_encoding.MASTER if subtitle_filter else video_encoding.REFRAME
+
+
 def build_layer_command(video_path, output_path, subtitle_filter=None,
-                        hook_png=None, hook_x=0, hook_y=0, hook_entrance=False):
+                        hook_png=None, hook_x=0, hook_y=0, hook_entrance=False,
+                        video_args=None):
     """Build ONE FFmpeg command that burns subtitles and/or a hook overlay in
     a single encode pass — chaining separate encodes would double the wait
     and stack generation loss. hook_entrance animates the hook in (slide-up
@@ -1229,17 +1234,15 @@ def build_layer_command(video_path, output_path, subtitle_filter=None,
             f"{subtitle_prefix}{subtitle_filter},{EVEN_PAD_FILTER}{subtitle_suffix}",
         ])
 
-    # The approved neon reference was rendered at CRF 18 / slow. Preserve
-    # those settings whenever text is burned so the production result keeps
-    # the same sharp core and clean glow gradients. Hook-only renders retain
-    # the existing faster path because they do not contain fine neon edges.
-    if subtitle_filter:
-        video_encode_opts = ['-c:v', 'libx264', '-preset', 'slow', '-crf', '18']
-    else:
-        video_encode_opts = ['-c:v', 'libx264', '-preset', 'fast', '-crf', '23']
+    # The approved neon reference was rendered at CRF 18 / slow. Burned text
+    # keeps that master tier (or its VMAF-calibrated NVENC equivalent) so the
+    # result keeps the same sharp core and clean glow gradients. Hook-only
+    # renders retain the faster tier because they do not contain fine edges.
+    if video_args is None:
+        video_args = video_encoding.video_encode_args(layer_encode_tier(subtitle_filter))
 
     cmd.extend([
-        '-c:a', 'copy', *video_encode_opts,
+        '-c:a', 'copy', *video_args,
         '-pix_fmt', 'yuv420p',
         '-movflags', '+faststart',
         output_path
@@ -1254,16 +1257,31 @@ def burn_layers(video_path, output_path, subtitle_path=None, burn_opts=None,
     if subtitle_path:
         subtitle_filter = build_subtitle_filter(subtitle_path, **(burn_opts or {}))
 
-    cmd = build_layer_command(video_path, output_path,
-                              subtitle_filter=subtitle_filter,
-                              hook_png=hook_png, hook_x=hook_x, hook_y=hook_y,
-                              hook_entrance=hook_entrance)
+    def _build(attempt):
+        cmd = build_layer_command(video_path, output_path,
+                                  subtitle_filter=subtitle_filter,
+                                  hook_png=hook_png, hook_x=hook_x, hook_y=hook_y,
+                                  hook_entrance=hook_entrance,
+                                  video_args=attempt.video_args)
+        _log(f"🎬 Burning layers (single pass): {' '.join(cmd)}")
+        return cmd
 
-    _log(f"🎬 Burning layers (single pass): {' '.join(cmd)}")
-    result = subprocess.run(cmd, stdout=subprocess.DEVNULL, stderr=subprocess.PIPE)
-
-    if result.returncode != 0:
-        stderr_text = result.stderr.decode(errors='replace')
+    try:
+        result = video_encoding.run_encode(
+            _build,
+            tier=layer_encode_tier(subtitle_filter),
+            label="Layer burn",
+            output_path=output_path,
+            warn=_log,
+            stdout=subprocess.DEVNULL,
+            stderr=subprocess.PIPE,
+        )
+    except subprocess.CalledProcessError as exc:
+        stderr_text = (exc.stderr or b"").decode(errors='replace')
+        _log(f"❌ FFmpeg Layer Error: {stderr_text}")
+        raise Exception(f"FFmpeg failed: {stderr_text}")
+    if getattr(result, "returncode", 0) not in (0, None):
+        stderr_text = (getattr(result, "stderr", b"") or b"").decode(errors='replace')
         _log(f"❌ FFmpeg Layer Error: {stderr_text}")
         raise Exception(f"FFmpeg failed: {stderr_text}")
 

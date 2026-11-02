@@ -75,3 +75,22 @@ def test_exact_16_9_source_without_audio_still_cuts_successfully(tmp_path):
 
     assert [stream["codec_type"] for stream in streams] == ["video"]
     assert (streams[0]["width"], streams[0]["height"]) == (320, 180)
+
+
+def test_quarter_size_backdrop_filter_renders_a_full_size_frame(tmp_path):
+    source = tmp_path / "portrait.mp4"
+    output = tmp_path / "canvas.mp4"
+    _run([
+        "ffmpeg", "-y", "-f", "lavfi", "-i", "testsrc=size=180x320:rate=25",
+        "-t", "1", "-c:v", "libx264", "-pix_fmt", "yuv420p", str(source),
+    ])
+    _run([
+        "ffmpeg", "-y", "-i", str(source),
+        "-filter_complex", longform.blurred_16_9_filter(320, 180, blur_downscale=4),
+        "-map", "[video]", "-c:v", "libx264", "-pix_fmt", "yuv420p", str(output),
+    ])
+    probe = subprocess.run([
+        "ffprobe", "-v", "error", "-show_streams", "-of", "json", str(output),
+    ], check=True, capture_output=True, text=True, timeout=30)
+    video = json.loads(probe.stdout)["streams"][0]
+    assert (video["width"], video["height"]) == (320, 180)

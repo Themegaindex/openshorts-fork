@@ -78,14 +78,28 @@ def _cut_segment(source, seconds, dest):
 
 def benchmark_transcribe(source, workdir, long_seconds):
     """Measured faster-whisper seconds per source second on this machine."""
+    import whisper_runtime
+    # Download the model before timing; a first-run download would otherwise
+    # land in the short run and make the marginal rate meaningless.
+    whisper_runtime.ensure_model(whisper_runtime.resolve_whisper_config()["model_size"], print)
     short_seconds = max(10.0, float(long_seconds) / 4.0)
     timings = {}
+    runs = set()
     for name, seconds in (("short", short_seconds), ("long", float(long_seconds))):
         segment = os.path.join(workdir, f"transcribe_{name}.mp4")
         _cut_segment(source, seconds, segment)
         started = time.perf_counter()
         main.transcribe_video(segment, seconds)
         timings[name] = time.perf_counter() - started
+        runs.add((whisper_runtime.LAST_RUN.get("device"), bool(whisper_runtime.LAST_RUN.get("fell_back"))))
+        if whisper_runtime.LAST_RUN.get("model_downloaded") or float(
+            whisper_runtime.LAST_RUN.get("gpu_wait_seconds") or 0
+        ) > 5.0:
+            print("   ⚠️ Transcription waited for the GPU or downloaded a model, sample skipped.")
+            return None
+    if len(runs) != 1 or any(fell_back for _device, fell_back in runs):
+        print("   ⚠️ Transcription changed device between runs (GPU fallback), sample skipped.")
+        return None
     return marginal_rate(timings["short"], short_seconds, timings["long"], long_seconds)
 
 
@@ -147,7 +161,11 @@ def run_calibration(argv=None):
             # A near-zero marginal rate means the VAD skipped the audio or the
             # clock resolution was hit — such a sample would poison the median.
             if rate and rate > 0.001:
-                samples["transcribe"] = {"per_source_second": [rate]}
+                import whisper_runtime
+                unit = main.PHASE_COST_UNITS["transcribe"]
+                if whisper_runtime.LAST_RUN.get("device") == "cuda":
+                    unit = f"{unit}@cuda"
+                samples["transcribe"] = {unit: [rate]}
                 print(f"   transcribe: {rate:.3f}s per source second "
                       f"(guessed default: {main.PHASE_COST_PRIORS['transcribe']})")
             else:

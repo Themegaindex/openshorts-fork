@@ -361,6 +361,33 @@ def test_run_job_validates_result_before_completed(monkeypatch, tmp_path):
     assert events.index(("validate", "result")) < events.index(("status", "completed"))
 
 
+@pytest.mark.parametrize("worker_error", [None, "YouTube requires sign-in. Refresh YouTube cookies."])
+def test_failed_worker_keeps_specific_error_summary(monkeypatch, tmp_path, worker_error):
+    job_id = "job-download-error"
+    job = {
+        "job_id": job_id, "cmd": ["fake-worker"], "env": {},
+        "execution_id": "current", "output_dir": str(tmp_path),
+        "status": "queued", "error_summary": "Error from an earlier attempt",
+        "raw_logs": [], "important_logs": [],
+    }
+    process = SimpleNamespace(stdout=io.BytesIO(b""), returncode=1, poll=lambda: 1)
+    monkeypatch.setattr(app, "jobs", {job_id: job})
+    monkeypatch.setattr(app.subprocess, "Popen", lambda *args, **kwargs: process)
+    for name in ("_register_job_process", "_unregister_job_process", "_stop_process"):
+        monkeypatch.setattr(app, name, lambda *args: None)
+    monkeypatch.setattr(app, "_persist_job_state", lambda *args: None)
+
+    def output(_stream, _job_id):
+        if worker_error:
+            app._apply_job_event(_job_id, {"type": "error", "message": worker_error})
+
+    monkeypatch.setattr(app, "enqueue_output", output)
+    asyncio.run(app.run_job(job_id, job))
+
+    assert job["status"] == "failed"
+    assert job["error_summary"] == (worker_error or "Process failed with exit code 1")
+
+
 def test_resume_stops_old_process_and_uses_automatic_phase(monkeypatch, tmp_path):
     job_id = "job-resume"
 

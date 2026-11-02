@@ -16,6 +16,7 @@ import re
 from typing import Iterable, Optional
 
 from clip_selection import snap_clip_to_words
+import video_encoding
 
 
 TARGET_ASPECT_RATIO = 16 / 9
@@ -484,7 +485,7 @@ def resolve_unit_plan(
     payload: dict,
     units: Iterable[dict],
     *,
-    min_output_seconds: float = 240.0,
+    min_output_seconds: float = 480.0,
     max_output_seconds: float = 600.0,
     min_segment_seconds: float = 20.0,
     max_segment_seconds: float = 240.0,
@@ -954,15 +955,30 @@ def needs_16_9_canvas(width: int, height: int, tolerance: float = 0.0) -> bool:
     return (int(width) * 9) != (int(height) * 16)
 
 
-def blurred_16_9_filter(width: int = 1920, height: int = 1080) -> str:
+def blurred_16_9_filter(width: int = 1920, height: int = 1080, blur_downscale: int = 1) -> str:
     width = max(2, int(width) // 2 * 2)
     height = max(2, int(height) // 2 * 2)
+    factor = max(1, int(blur_downscale or 1))
+    if factor == 1:
+        background = (
+            f"[bg]scale={width}:{height}:force_original_aspect_ratio=increase,"
+            f"crop={width}:{height},gblur=sigma=28[bg_blur];"
+        )
+    else:
+        # Blur at 1/factor size, then scale up: the backdrop has no detail to
+        # lose (upstream openshorts blurred_backdrop measured SSIM 0.994-0.998).
+        small_w = max(2, (width // factor) // 2 * 2)
+        small_h = max(2, (height // factor) // 2 * 2)
+        background = (
+            f"[bg]scale={small_w}:{small_h}:force_original_aspect_ratio=increase,"
+            f"crop={small_w}:{small_h},gblur=sigma={28 / factor:g},"
+            f"scale={width}:{height}[bg_blur];"
+        )
     return (
-        f"[0:v]split=2[bg][fg];"
-        f"[bg]scale={width}:{height}:force_original_aspect_ratio=increase,"
-        f"crop={width}:{height},gblur=sigma=28[bg_blur];"
-        f"[fg]scale={width}:{height}:force_original_aspect_ratio=decrease[fg_fit];"
-        f"[bg_blur][fg_fit]overlay=(W-w)/2:(H-h)/2,setsar=1,format=yuv420p[video]"
+        "[0:v]split=2[bg][fg];"
+        + background
+        + f"[fg]scale={width}:{height}:force_original_aspect_ratio=decrease[fg_fit];"
+        "[bg_blur][fg_fit]overlay=(W-w)/2:(H-h)/2,setsar=1,format=yuv420p[video]"
     )
 
 
@@ -974,13 +990,17 @@ def segment_cut_command(
     fade_seconds=0.01,
     *,
     filter_complex: Optional[str] = None,
+    video_args=None,
+    input_args=(),
 ) -> list[str]:
     start_value = max(0.0, float(start))
     duration = max(0.001, float(end) - start_value)
     fade = min(max(0.0, float(fade_seconds)), duration / 4.0)
     fade_out_start = max(0.0, duration - fade)
+    if video_args is None:
+        video_args = video_encoding.video_encode_args(video_encoding.HIGH)
     command = [
-        "ffmpeg", "-y", "-ss", f"{start_value:.3f}", "-i", os.fspath(input_video),
+        "ffmpeg", "-y", *input_args, "-ss", f"{start_value:.3f}", "-i", os.fspath(input_video),
         "-t", f"{duration:.3f}",
     ]
     if filter_complex:
@@ -989,10 +1009,7 @@ def segment_cut_command(
         # An exact 16:9 pixel raster can still carry a non-square sample aspect
         # ratio.  Reset SAR so the delivered display canvas is genuinely 16:9.
         command.extend(["-map", "0:v:0", "-map", "0:a?", "-vf", "setsar=1"])
-    command.extend([
-        "-c:v", "libx264", "-crf", "18", "-preset", "fast", "-pix_fmt", "yuv420p",
-        "-c:a", "aac",
-    ])
+    command.extend([*video_args, "-pix_fmt", "yuv420p", "-c:a", "aac"])
     if fade > 0:
         command.extend([
             "-af", f"afade=t=in:st=0:d={fade:.3f},afade=t=out:st={fade_out_start:.3f}:d={fade:.3f}",

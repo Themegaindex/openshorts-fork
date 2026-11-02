@@ -23,6 +23,8 @@ from urllib.parse import urljoin
 from typing import Optional, List, Dict, Callable
 from concurrent.futures import ThreadPoolExecutor, as_completed
 
+import video_encoding
+
 
 ELEVENLABS_API_BASE = "https://api.elevenlabs.io/v1"
 FAL_QUEUE_BASE = "https://queue.fal.run"
@@ -995,21 +997,25 @@ def generate_broll(
         f"d={total_frames}:s=1080x1920:fps={fps},"
         f"setsar=1"
     )
-    cmd = [
-        "ffmpeg", "-y",
-        "-loop", "1", "-i", img_path,          # Input 0: image
-        "-f", "lavfi", "-i", "anullsrc=r=44100:cl=stereo",  # Input 1: silent audio
-        "-vf", zoompan_filter,
-        "-t", str(dur_secs),
-        "-map", "0:v", "-map", "1:a",
-        "-c:v", "libx264", "-preset", "fast", "-crf", "22",
-        "-pix_fmt", "yuv420p",
-        "-c:a", "aac", "-b:a", "128k",
-        "-shortest",
-        output_path,
-    ]
+    def _build(attempt):
+        return [
+            "ffmpeg", "-y",
+            "-loop", "1", "-i", img_path,          # Input 0: image
+            "-f", "lavfi", "-i", "anullsrc=r=44100:cl=stereo",  # Input 1: silent audio
+            "-vf", zoompan_filter,
+            "-t", str(dur_secs),
+            "-map", "0:v", "-map", "1:a",
+            *attempt.video_args,
+            "-pix_fmt", "yuv420p",
+            "-c:a", "aac", "-b:a", "128k",
+            "-shortest",
+            output_path,
+        ]
 
-    subprocess.run(cmd, check=True, capture_output=True)
+    video_encoding.run_encode(
+        _build, tier=video_encoding.STANDARD, label="SaaS b-roll",
+        output_path=output_path, capture_output=True,
+    )
 
     # Cleanup temp image
     if os.path.exists(img_path):
@@ -1055,11 +1061,12 @@ def transcribe_audio_for_subs(audio_path: str) -> list:
     Transcribe audio with word-level timestamps using faster-whisper.
     Returns list of {"word": str, "start": float, "end": float}.
     """
-    from faster_whisper import WhisperModel
+    import whisper_runtime
 
     print(f"[SaaSShorts] 🎙️ Transcribing audio for subtitles...")
-    model = WhisperModel("base", device="cpu", compute_type="int8")
-    segments, info = model.transcribe(audio_path, word_timestamps=True)
+    # Shared runtime: GPU when available, clean CPU fallback. Narration is
+    # short TTS audio, so only word timestamps are needed (no VAD).
+    segments, _info, _cfg = whisper_runtime.run_whisper(audio_path, {"word_timestamps": True})
 
     words = []
     for segment in segments:
@@ -1183,15 +1190,19 @@ def composite_video(
 
     if not broll_clips:
         # Simple: talking head + subtitles only
-        cmd = [
-            "ffmpeg", "-y",
-            "-i", talking_head_path,
-            "-vf", sub_filter,
-            "-c:v", "libx264", "-preset", "fast", "-crf", "22",
-            "-c:a", "aac", "-b:a", "128k",
-            output_path,
-        ]
-        subprocess.run(cmd, check=True)
+        def _build_simple(attempt):
+            return [
+                "ffmpeg", "-y",
+                "-i", talking_head_path,
+                "-vf", sub_filter,
+                *attempt.video_args,
+                "-c:a", "aac", "-b:a", "128k",
+                output_path,
+            ]
+
+        video_encoding.run_encode(
+            _build_simple, tier=video_encoding.STANDARD, label="SaaS final", output_path=output_path,
+        )
         print(f"[SaaSShorts] ✅ Final video (simple): {output_path}")
         return output_path
 
@@ -1271,18 +1282,21 @@ def composite_video(
 
     filter_str = ";".join(filter_parts)
 
-    cmd = [
-        "ffmpeg", "-y",
-        *inputs,
-        "-filter_complex", filter_str,
-        "-map", "[finalv]",
-        "-map", "[outa]",
-        "-c:v", "libx264", "-preset", "fast", "-crf", "22",
-        "-c:a", "aac", "-b:a", "128k",
-        output_path,
-    ]
+    def _build_composite(attempt):
+        return [
+            "ffmpeg", "-y",
+            *inputs,
+            "-filter_complex", filter_str,
+            "-map", "[finalv]",
+            "-map", "[outa]",
+            *attempt.video_args,
+            "-c:a", "aac", "-b:a", "128k",
+            output_path,
+        ]
 
-    subprocess.run(cmd, check=True)
+    video_encoding.run_encode(
+        _build_composite, tier=video_encoding.STANDARD, label="SaaS final", output_path=output_path,
+    )
     print(f"[SaaSShorts] ✅ Final video (composite): {output_path}")
     return output_path
 

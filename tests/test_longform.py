@@ -45,6 +45,24 @@ def test_timestamp_and_description_formatting():
     assert description == "Watch the full story.\n\n0:00 Intro\n1:10 Reveal"
 
 
+def test_blurred_16_9_filter_default_is_the_legacy_full_size_blur():
+    assert longform.blurred_16_9_filter() == (
+        "[0:v]split=2[bg][fg];"
+        "[bg]scale=1920:1080:force_original_aspect_ratio=increase,"
+        "crop=1920:1080,gblur=sigma=28[bg_blur];"
+        "[fg]scale=1920:1080:force_original_aspect_ratio=decrease[fg_fit];"
+        "[bg_blur][fg_fit]overlay=(W-w)/2:(H-h)/2,setsar=1,format=yuv420p[video]"
+    )
+
+
+def test_blurred_16_9_filter_can_blur_the_backdrop_at_quarter_size():
+    graph = longform.blurred_16_9_filter(1920, 1080, blur_downscale=4)
+    assert "[bg]scale=480:270:force_original_aspect_ratio=increase,crop=480:270,gblur=sigma=7," in graph
+    assert "scale=1920:1080[bg_blur];" in graph
+    assert "[fg]scale=1920:1080:force_original_aspect_ratio=decrease[fg_fit]" in graph
+    assert graph.endswith("format=yuv420p[video]")
+
+
 def test_segment_cut_uses_duration_and_optional_16_9_canvas():
     filter_graph = longform.blurred_16_9_filter()
     command = longform.segment_cut_command(
@@ -227,7 +245,10 @@ def test_v2_plan_resolves_only_stable_unit_ids_and_adaptive_duration():
         _v2_unit(6, 300, 310, "Das ist der starke Hook."),
     ]
 
-    resolved = longform.resolve_unit_plan(_v2_plan(second_chapter=True), units)
+    # Compact five-minute fixture: pin the bound it was written for.
+    resolved = longform.resolve_unit_plan(
+        _v2_plan(second_chapter=True), units, min_output_seconds=240,
+    )
 
     assert resolved["planner_version"] == 2
     assert resolved["total_duration"] == 310
@@ -402,7 +423,9 @@ def test_quality_gate_combines_invariants_and_review_scores():
         _v2_unit(5, 240, 300, "Fünf."),
         _v2_unit(6, 300, 310, "Hook."),
     ]
-    plan = longform.resolve_unit_plan(_v2_plan(second_chapter=True), units)
+    plan = longform.resolve_unit_plan(
+        _v2_plan(second_chapter=True), units, min_output_seconds=240,
+    )
     approved_review = {
         "approved": True,
         "overall_score": 90,
@@ -611,3 +634,31 @@ def test_quality_gate_accepts_questions_and_terminated_connector_endings():
     assert longform._obviously_incomplete_start("dass den Marsch in Berlin.")
     assert longform._obviously_incomplete_end("Weißt du, wo das aufgefallen ist, dass")
     assert longform._obviously_incomplete_end("Das war die Zeit,")
+
+
+def test_plan_shorter_than_eight_minutes_is_flagged_by_default():
+    units = [
+        _v2_unit(1, 0, 60, "Erste vollständige Antwort."),
+        _v2_unit(2, 60, 120, "Zweite vollständige Antwort."),
+        _v2_unit(3, 120, 180, "Dritte vollständige Antwort."),
+        _v2_unit(4, 180, 240, "Vierte vollständige Antwort."),
+        _v2_unit(5, 240, 300, "Weiterer Kontext."),
+        _v2_unit(6, 300, 310, "Das ist der starke Hook."),
+    ]
+
+    # 310 s is below the 8-minute default and must not pass the gate.
+    resolved = longform.resolve_unit_plan(_v2_plan(second_chapter=True), units)
+    assert "result_below_adaptive_minimum" in resolved["validation_issues"]
+    assert resolved["target_min_seconds"] == 480
+
+
+def test_segment_cut_places_input_args_before_input_and_uses_given_video_args():
+    nvenc = ["-c:v", "h264_nvenc", "-cq", "19", "-pix_fmt", "yuv420p"]
+    command = longform.segment_cut_command(
+        "src.mp4", 10, 40, "seg.mp4", video_args=nvenc, input_args=["-hwaccel", "cuda"],
+    )
+    assert command[:4] == ["ffmpeg", "-y", "-hwaccel", "cuda"]
+    assert command.index("-hwaccel") < command.index("-ss") < command.index("-i")
+    assert command[command.index("-t") + 1] == "30.000"
+    assert command.index("-map") < command.index("h264_nvenc")
+    assert "libx264" not in command
