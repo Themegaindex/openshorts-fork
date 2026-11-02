@@ -124,6 +124,13 @@ class TestPricing:
         assert lookup_model_prices("gpt-9-mega") is None
         assert lookup_model_prices(None) is None
 
+    def test_promo_price_ends_on_its_date(self):
+        import datetime
+
+        assert lookup_model_prices("gemini-3.8-flash", today=datetime.date(2026, 12, 31)) == (0.75, 3.75)
+        assert lookup_model_prices("gemini-3.8-flash-001", today=datetime.date(2027, 1, 1)) == (1.50, 7.50)
+        assert lookup_model_prices("gemini-3.7-flash", today=datetime.date(2027, 1, 1)) == (0.75, 3.75)
+
 
 class TestCompactWords:
     def test_rounds_timestamps(self):
