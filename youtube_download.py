@@ -111,24 +111,35 @@ def open_youtube_dl(options, factory):
             cookies.close()
 
 
+_LOCKED_BROWSER_ADVICE = (
+    'The browser cookie database is locked. Fully close the configured browser '
+    'and retry, or export YouTube cookies to a Netscape cookies.txt file.'
+)
+_DECRYPT_ADVICE = (
+    'yt-dlp could not decrypt the browser cookies. Export YouTube cookies '
+    'to a Netscape cookies.txt file and set YOUTUBE_COOKIES_FILE to that file.'
+)
+
+
 def youtube_failure_message(errors):
     messages = [str(error) for error in errors]
     lowered = '\n'.join(messages).lower().replace('’', "'")
+    # The browser session often fails first and the anonymous fallback then
+    # hits the bot check; the browser cause is the one the user can fix.
+    if 'could not copy chrome cookie database' in lowered:
+        browser_advice = _LOCKED_BROWSER_ADVICE
+    elif 'decrypt' in lowered or 'dpapi' in lowered:
+        browser_advice = _DECRYPT_ADVICE
+    else:
+        browser_advice = ''
     if "sign in to confirm you're not a bot" in lowered:
-        return (
+        sign_in = (
             'YouTube requires sign-in or a bot check and rejected the available sessions. '
             'Open the video in your browser and complete any check, then refresh your '
             'YouTube cookies or set YOUTUBE_COOKIES_BROWSER to your signed-in browser '
             '(e.g. brave). You can also upload the video file directly.'
         )
-    if 'could not copy chrome cookie database' in lowered:
-        return (
-            'The browser cookie database is locked. Fully close the configured browser '
-            'and retry, or export YouTube cookies to a Netscape cookies.txt file.'
-        )
-    if 'decrypt' in lowered or 'dpapi' in lowered:
-        return (
-            'yt-dlp could not decrypt the browser cookies. Export YouTube cookies '
-            'to a Netscape cookies.txt file and set YOUTUBE_COOKIES_FILE to that file.'
-        )
+        return f'{browser_advice} {sign_in}' if browser_advice else sign_in
+    if browser_advice:
+        return browser_advice
     return messages[-1] if messages else 'YouTube returned no downloadable video formats.'

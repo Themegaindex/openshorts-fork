@@ -136,6 +136,18 @@ def test_failure_advice_matches_the_actual_cause(message, expected):
     assert 'IP ban' not in result
 
 
+@pytest.mark.parametrize('browser_error,expected', [
+    ('ERROR: Could not copy Chrome cookie database. See ...', 'Fully close'),
+    ('ERROR: Failed to decrypt with DPAPI', 'Netscape'),
+])
+def test_browser_cause_survives_a_later_bot_check(browser_error, expected):
+    result = youtube.youtube_failure_message([
+        RuntimeError(browser_error),
+        RuntimeError("ERROR: [youtube] abc: Sign in to confirm you’re not a bot."),
+    ])
+    assert result.index(expected) < result.index('YouTube requires sign-in')
+
+
 def test_quality_probe_uses_env_cookies_and_same_js_runtime(monkeypatch, tmp_path, capsys):
     monkeypatch.setenv('YOUTUBE_COOKIES', COOKIES)
     monkeypatch.setenv('YOUTUBE_COOKIES_FILE', str(tmp_path / 'must-not-be-created.txt'))
