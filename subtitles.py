@@ -6,23 +6,24 @@ import math
 import colorsys
 from decimal import Decimal, InvalidOperation, ROUND_HALF_UP
 from video_formats import EVEN_PAD_FILTER
+import whisper_runtime
 
 
 _STDIO_CONFIGURED = False
 
-# Shared faster-whisper config so both transcription paths (this module and
-# main.transcribe_video) behave identically. "small" is meaningfully better at
-# German than "base" without being much slower on CPU.
-DEFAULT_WHISPER_MODEL = "small"
+# CPU default model; the GPU default is whisper_runtime.DEFAULT_GPU_MODEL.
+# "small" is meaningfully better at German than "base" without being much
+# slower on CPU.
+DEFAULT_WHISPER_MODEL = whisper_runtime.DEFAULT_CPU_MODEL
 
 
 def get_whisper_config():
-    """Return the faster-whisper model config, overridable via env vars."""
-    return {
-        "model_size": os.environ.get("WHISPER_MODEL", DEFAULT_WHISPER_MODEL),
-        "device": os.environ.get("WHISPER_DEVICE", "cpu"),
-        "compute_type": os.environ.get("WHISPER_COMPUTE", "int8"),
-    }
+    """Resolved faster-whisper config shared by every transcription path.
+
+    WHISPER_DEVICE=auto picks CUDA when CTranslate2 sees a GPU;
+    WHISPER_MODEL/WHISPER_COMPUTE override the defaults.
+    """
+    return whisper_runtime.resolve_whisper_config()
 
 
 # Decode params shared by both transcription paths. condition_on_previous_text
@@ -189,14 +190,11 @@ def transcribe_audio(video_path):
     Transcribe audio from a video file using faster-whisper.
     Returns transcript in the same format as main.py for compatibility.
     """
-    from faster_whisper import WhisperModel
-
     _log(f"🎙️  Transcribing audio from: {video_path}")
 
-    cfg = get_whisper_config()
-    model = WhisperModel(cfg["model_size"], device=cfg["device"], compute_type=cfg["compute_type"])
-
-    segments, info = model.transcribe(video_path, **WHISPER_TRANSCRIBE_PARAMS)
+    segments, info, _cfg = whisper_runtime.run_whisper(
+        video_path, WHISPER_TRANSCRIBE_PARAMS, log=_log,
+    )
 
     transcript = {
         "segments": [],

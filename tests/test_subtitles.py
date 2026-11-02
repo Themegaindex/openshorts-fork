@@ -498,3 +498,36 @@ def test_remapped_transcript_rebuilds_text_from_the_clip_only():
     assert duration == 3.0
     assert remapped["text"] == "one two"
     assert remapped["language"] == "en"
+
+
+def test_transcribe_audio_uses_shared_runtime_and_params(monkeypatch):
+    import types
+    import subtitles
+
+    calls = []
+
+    def fake_run_whisper(media_path, params, **kwargs):
+        calls.append((media_path, dict(params)))
+        words = [types.SimpleNamespace(word=" Groß", start=0.0, end=0.3, probability=0.9),
+                 types.SimpleNamespace(word="stadt", start=0.3, end=0.6, probability=0.9)]
+        segment = types.SimpleNamespace(start=0.0, end=0.6, text=" Großstadt", words=words)
+        return [segment], types.SimpleNamespace(language="de"), {"device": "cpu"}
+
+    monkeypatch.setattr(subtitles.whisper_runtime, "run_whisper", fake_run_whisper)
+    transcript = subtitles.transcribe_audio("dub.mp4")
+
+    assert calls == [("dub.mp4", subtitles.WHISPER_TRANSCRIBE_PARAMS)]
+    assert transcript["language"] == "de"
+    assert transcript["segments"][0]["words"] == [{"word": " Großstadt", "start": 0.0, "end": 0.6}]
+
+
+def test_get_whisper_config_defaults_to_cpu_small_without_gpu(monkeypatch):
+    import sys
+    import subtitles
+
+    monkeypatch.setitem(sys.modules, "ctranslate2", None)
+    for name in ("WHISPER_DEVICE", "WHISPER_MODEL", "WHISPER_COMPUTE"):
+        monkeypatch.delenv(name, raising=False)
+    monkeypatch.setattr(subtitles.whisper_runtime, "_gpu_disabled_reason", None)
+    cfg = subtitles.get_whisper_config()
+    assert (cfg["model_size"], cfg["device"], cfg["compute_type"]) == ("small", "cpu", "int8")

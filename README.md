@@ -237,7 +237,7 @@ nicht überschrieben. Bleibt YouTube gesperrt, kann eine vorhandene Videodatei
 | `LONGFORM_REVIEW_MIN_OVERALL_SCORE` / `LONGFORM_REVIEW_MIN_JOIN_SCORE` | Qualitäts-Gates vor dem Longform-Render |
 | `LONGFORM_REVIEW_BOUNDARY_WINDOW_SECONDS` / `LONGFORM_REVIEW_BOUNDARY_MAX_UNITS` | Lokaler Transkript-Kontext vor/nach jedem Schnitt für vollständige Fragen und Antworten (Standard: 75 s / 24 Units) |
 | `LONGFORM_STRONG_PAUSE_SECONDS` / `LONGFORM_PAUSE_FALLBACK_WINDOW_SECONDS` | Starke Sprechpause und lokaler Fast-Speaker-Fallback (Standard: 0,55 / 24 s) |
-| `WHISPER_MODEL` / `WHISPER_DEVICE` / `WHISPER_COMPUTE` | Transkriptionsqualität/-geschwindigkeit |
+| `WHISPER_DEVICE` / `WHISPER_MODEL` / `WHISPER_COMPUTE` / `WHISPER_CPU_MODEL` | Transkription: `auto` nutzt die NVIDIA-GPU (large-v3-turbo) und fällt bei GPU-Fehlern auf die CPU (small) zurück |
 | `QUALITY_GATE_MIN_HEIGHT` | Rückfrage unterhalb dieser Auflösung (Standard: 720) |
 | `WATERMARK_ENABLED` / `WATERMARK_TEXT` / `WATERMARK_IMAGE` / `WATERMARK_OPACITY` | Wasserzeichen-Konfiguration |
 

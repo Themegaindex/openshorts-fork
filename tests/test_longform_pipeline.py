@@ -2036,3 +2036,111 @@ def test_failed_final_review_still_fails_when_no_repair_budget_is_left(monkeypat
     assert result["error"] is not None
     assert len([c for c in calls if c[1]]) == 1
     assert "critical_review_issue" in result["plan_data"]["editorial_review"]["gate_issues"]
+
+
+def _fake_whisper_segments():
+    words = [
+        SimpleNamespace(word=" Hallo", start=0.0, end=0.4, probability=0.9),
+        SimpleNamespace(word="welt", start=0.4, end=0.8, probability=0.8),
+    ]
+    return [
+        SimpleNamespace(text=" Hallowelt", start=0.0, end=4.0, words=words),
+        SimpleNamespace(text=" Zweiter Satz.", start=4.0, end=10.0, words=[]),
+    ]
+
+
+def test_transcribe_video_keeps_transcript_contract(monkeypatch):
+    reporter = _Reporter()
+    monkeypatch.setattr(main, "JOB_REPORTER", reporter)
+    calls = []
+
+    def fake_run_whisper(media_path, params, *, on_segment=None, on_restart=None, on_status=None, log=print):
+        calls.append((media_path, dict(params)))
+        info = SimpleNamespace(language="de", language_probability=0.97)
+        segments = _fake_whisper_segments()
+        for segment in segments:
+            on_segment(segment, info)
+        return segments, info, {"device": "cuda"}
+
+    monkeypatch.setattr(main.whisper_runtime, "run_whisper", fake_run_whisper)
+    result = main.transcribe_video("clip.mp4", 10.0)
+
+    import subtitles
+    assert calls == [("clip.mp4", subtitles.WHISPER_TRANSCRIBE_PARAMS)]
+    assert result["language"] == "de"
+    assert result["text"] == "Hallowelt  Zweiter Satz."
+    # Continuation fragments are merged and the word probability is kept.
+    assert result["segments"][0]["words"] == [
+        {"word": " Hallowelt", "start": 0.0, "end": 0.8, "probability": 0.9},
+    ]
+    progress = [event for event in reporter.events if event[0] == "progress"]
+    assert progress[0][2]["message"].startswith("Transcribing audio... 40.0%")
+    assert progress[-1][1] == (100.0,)
+    assert progress[-1][2]["message"] == "Transcription complete."
+
+
+def test_transcribe_video_gpu_fallback_resets_progress_and_excludes_stats(monkeypatch):
+    reporter = _Reporter()
+    monkeypatch.setattr(main, "JOB_REPORTER", reporter)
+
+    def fake_run_whisper(media_path, params, *, on_segment=None, on_restart=None, on_status=None, log=print):
+        info = SimpleNamespace(language="de", language_probability=0.97)
+        on_segment(SimpleNamespace(end=8.0), info)
+        on_status("Transcribing on GPU with Whisper large-v3-turbo")   # no heartbeat on the fake
+        on_restart("GPU busy: no free transcription slot", {"model_size": "small"})
+        segments = _fake_whisper_segments()
+        for segment in segments:
+            on_segment(segment, info)
+        return segments, info, {"device": "cpu"}
+
+    monkeypatch.setattr(main.whisper_runtime, "run_whisper", fake_run_whisper)
+    main.transcribe_video("clip.mp4", 10.0)
+
+    kinds = [event[0] for event in reporter.events]
+    warning_index = kinds.index("warning")
+    assert "Restarting on CPU" in reporter.events[warning_index][1][0]
+    reset = reporter.events[warning_index + 1]
+    assert reset[0] == "progress" and reset[1] == (0.0,)
+    assert reset[2]["message"] == "Transcribing audio on CPU... 0.0%"
+    later = [e for e in reporter.events[warning_index + 2:] if e[0] == "progress"]
+    assert later[0][2]["message"].startswith("Transcribing audio on CPU...")
+    assert "transcribe" in reporter.stats_excluded_phases
+
+
+def test_gpu_transcribe_eta_uses_its_own_history_and_prior(monkeypatch, tmp_path):
+    monkeypatch.setattr(main, "JOB_STATS_PATH", str(tmp_path / "job_stats.json"))
+    gpu = main.JobReporter()
+    gpu.video_duration = 3600.0
+    gpu.phase_cost_variant["transcribe"] = "cuda"
+    assert gpu._phase_cost_prior("transcribe") == pytest.approx(216.0)
+
+    gpu.phase_durations = {"transcribe": 180.0}
+    gpu._record_job_stats()
+    stats = json.loads((tmp_path / "job_stats.json").read_text(encoding="utf-8"))
+    assert stats["transcribe"] == {"per_source_second@cuda": [0.05]}
+
+    cpu = main.JobReporter()
+    cpu.video_duration = 3600.0
+    assert cpu._phase_cost_prior("transcribe") == pytest.approx(1800.0)
+    gpu_again = main.JobReporter()
+    gpu_again.video_duration = 3600.0
+    gpu_again.phase_cost_variant["transcribe"] = "cuda"
+    assert gpu_again._phase_cost_prior("transcribe") == pytest.approx(180.0)
+
+
+def test_type_pipeline_keeps_earlier_stats_exclusions(monkeypatch, tmp_path):
+    class SeededReporter(_Reporter):
+        def __init__(self):
+            super().__init__()
+            self.stats_excluded_phases = {"transcribe"}
+
+    monkeypatch.setitem(globals(), "_Reporter", SeededReporter)
+
+    def render_shorts(*_args, **_kwargs):
+        return 30.0
+
+    def render_long(*_args, **_kwargs):
+        return str(tmp_path / "Video_long_1.mp4")
+
+    _metadata, reporter = _run_auto_with_both_outputs(monkeypatch, tmp_path, render_shorts, render_long)
+    assert {"transcribe", "analyze", "render"} <= reporter.stats_excluded_phases

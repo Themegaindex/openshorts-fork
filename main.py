@@ -44,6 +44,7 @@ import json
 import shutil
 from typing import List, Optional
 import longform
+import whisper_runtime
 from youtube_download import (
     YouTubeDownloadError, open_youtube_dl, youtube_auth_attempts,
     youtube_base_options, youtube_failure_message,
@@ -234,6 +235,12 @@ PHASE_COST_PRIORS = {
 }
 # Fixed overhead every phase pays regardless of length (model load, API round
 # trips, container mux), so a 30s video does not get a 1-second estimate.
+# Device-specific seeds. GPU transcription (large-v3-turbo fp16) is roughly an
+# order of magnitude faster than the CPU small model; its learned median
+# replaces this estimate after the first jobs.
+PHASE_COST_PRIORS_BY_VARIANT = {
+    ("transcribe", "cuda"): 0.06,
+}
 PHASE_COST_FLOOR = {
     "download": 5.0,
     "transcribe": 15.0,
@@ -378,6 +385,9 @@ class JobReporter:
         self.video_duration = None
         self.output_seconds = None
         self.phase_durations = {}
+        # Per-phase cost history variant, e.g. {"transcribe": "cuda"}. "cpu"
+        # or no entry keeps the legacy history key.
+        self.phase_cost_variant = {}
         self.job_stats = _load_job_stats()
         self.last_work_activity_at = self.started_at
         self.operation_name = None
@@ -404,18 +414,27 @@ class JobReporter:
         if value > 0:
             self.output_seconds = value
 
+    def _stats_unit(self, phase: str):
+        """(base unit, history key) for a phase; device variants get their own key."""
+        unit = PHASE_COST_UNITS.get(phase)
+        variant = (getattr(self, "phase_cost_variant", None) or {}).get(phase)
+        if unit is None or not variant or variant == "cpu":
+            return unit, unit
+        return unit, f"{unit}@{variant}"
+
     def _phase_cost_prior(self, phase: str) -> Optional[float]:
         """Expected total seconds for a phase, from learned medians when available."""
-        unit = PHASE_COST_UNITS.get(phase)
+        unit, stats_unit = self._stats_unit(phase)
         if unit is None:
             return None
         samples = [
-            value for value in (self.job_stats.get(phase) or {}).get(unit) or []
+            value for value in (self.job_stats.get(phase) or {}).get(stats_unit) or []
             if isinstance(value, (int, float)) and value >= 0
         ]
         rate = _median(samples)
         if rate is None:
-            rate = PHASE_COST_PRIORS[phase]
+            variant = (getattr(self, "phase_cost_variant", None) or {}).get(phase)
+            rate = PHASE_COST_PRIORS_BY_VARIANT.get((phase, variant), PHASE_COST_PRIORS[phase])
         floor = PHASE_COST_FLOOR.get(phase, 0.0)
         if unit == "absolute":
             return max(floor, float(rate))
@@ -484,7 +503,7 @@ class JobReporter:
         for phase, seconds in self.phase_durations.items():
             if phase in getattr(self, "stats_excluded_phases", ()):
                 continue
-            unit = PHASE_COST_UNITS.get(phase)
+            unit, stats_unit = self._stats_unit(phase)
             if unit is None or not seconds or seconds < 1.0:
                 continue
             if unit in {"per_source_second", "per_source_second_after_overhead"}:
@@ -503,7 +522,7 @@ class JobReporter:
                 value = seconds / self.output_seconds
             else:
                 value = seconds
-            samples.setdefault(phase, {}).setdefault(unit, []).append(value)
+            samples.setdefault(phase, {}).setdefault(stats_unit, []).append(value)
         if not samples:
             return
         try:
@@ -2515,22 +2534,60 @@ def process_video_to_vertical(input_video, final_output_video, progress_callback
     return True
 
 def transcribe_video(video_path, video_duration=None):
-    print("🎙️  Transcribing video with Faster-Whisper (CPU Optimized)...")
-    from faster_whisper import WhisperModel
-    from subtitles import get_whisper_config, WHISPER_TRANSCRIBE_PARAMS, merge_continuation_words
+    print("🎙️  Transcribing video with Faster-Whisper...")
+    from subtitles import WHISPER_TRANSCRIBE_PARAMS, merge_continuation_words
 
-    cfg = get_whisper_config()
-    model = WhisperModel(cfg["model_size"], device=cfg["device"], compute_type=cfg["compute_type"])
+    state = {"last_emit": time.time(), "last_bucket": -1, "label": "Transcribing audio"}
 
-    segments, info = model.transcribe(video_path, **WHISPER_TRANSCRIBE_PARAMS)
-    
+    def on_segment(segment, _info):
+        if not video_duration:
+            return
+        progress_percent = min(100.0, (float(segment.end) / max(video_duration, 1.0)) * 100.0)
+        bucket = int(progress_percent // 2)
+        if time.time() - state["last_emit"] >= 1.0 or bucket != state["last_bucket"]:
+            JOB_REPORTER.progress(
+                progress_percent,
+                message=f"{state['label']}... {progress_percent:.1f}%",
+                important=bucket % 5 == 0,
+                category="transcribe",
+            )
+            state["last_emit"] = time.time()
+            state["last_bucket"] = bucket
+
+    def on_restart(reason, cpu_cfg):
+        # A mixed GPU+CPU duration must never be learned as a GPU or CPU rate.
+        excluded = set(getattr(JOB_REPORTER, "stats_excluded_phases", ()) or ())
+        JOB_REPORTER.stats_excluded_phases = excluded | {"transcribe"}
+        JOB_REPORTER.warning(
+            f"GPU transcription failed ({reason}). Restarting on CPU with Whisper "
+            f"{cpu_cfg['model_size']}; this takes longer.",
+            category="transcribe",
+        )
+        state.update(last_bucket=-1, label="Transcribing audio on CPU")
+        if video_duration:
+            JOB_REPORTER.progress(
+                0.0, message="Transcribing audio on CPU... 0.0%", important=True, category="transcribe",
+            )
+
+    def on_status(message):
+        print(f"   {message}")
+        heartbeat = getattr(JOB_REPORTER, "heartbeat", None)
+        if heartbeat:
+            heartbeat(message, force=True, category="transcribe")
+
+    segments, info, _cfg = whisper_runtime.run_whisper(
+        video_path,
+        WHISPER_TRANSCRIBE_PARAMS,
+        on_segment=on_segment,
+        on_restart=on_restart,
+        on_status=on_status,
+    )
+
     print(f"   Detected language '{info.language}' with probability {info.language_probability:.2f}")
-    
+
     # Convert to openai-whisper compatible format
     transcript_segments = []
     full_text = ""
-    last_emit = time.time()
-    last_bucket = -1
 
     for segment in segments:
         seg_dict = {
@@ -2556,19 +2613,7 @@ def transcribe_video(video_path, video_duration=None):
         
         transcript_segments.append(seg_dict)
         full_text += segment.text + " "
-        if video_duration:
-            progress_percent = min(100.0, (float(segment.end) / max(video_duration, 1.0)) * 100.0)
-            bucket = int(progress_percent // 2)
-            if time.time() - last_emit >= 1.0 or bucket != last_bucket:
-                JOB_REPORTER.progress(
-                    progress_percent,
-                    message=f"Transcribing audio... {progress_percent:.1f}%",
-                    important=bucket % 5 == 0,
-                    category="transcribe",
-                )
-                last_emit = time.time()
-                last_bucket = bucket
-        
+
     JOB_REPORTER.progress(100.0, message="Transcription complete.", important=True, category="transcribe")
     return {
         'text': full_text.strip(),
@@ -4448,7 +4493,9 @@ def _run_video_type_pipeline(
     source_url,
 ):
     del source_url  # Source provenance already lives in analysis_input.json.
-    JOB_REPORTER.stats_excluded_phases = {"analyze", "render"}
+    JOB_REPORTER.stats_excluded_phases = (
+        set(getattr(JOB_REPORTER, "stats_excluded_phases", ()) or ()) | {"analyze", "render"}
+    )
     _validate_longform_source_duration(video_type, duration)
     if video_type == "long":
         # Long-only runs never consume Shorts analysis. Discarding it also
@@ -5209,6 +5256,8 @@ if __name__ == '__main__':
                 raise RuntimeError("Full-video render failed.")
         else:
             if not transcript or args.resume_phase == "transcribe":
+                # Pick the ETA history of the device that will transcribe.
+                reporter.phase_cost_variant["transcribe"] = whisper_runtime.resolve_whisper_config()["device"]
                 reporter.set_phase("transcribe", "Transcribing audio", message="Starting transcription...")
                 with reporter.operation(
                     "transcription",

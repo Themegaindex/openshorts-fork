@@ -1055,11 +1055,12 @@ def transcribe_audio_for_subs(audio_path: str) -> list:
     Transcribe audio with word-level timestamps using faster-whisper.
     Returns list of {"word": str, "start": float, "end": float}.
     """
-    from faster_whisper import WhisperModel
+    import whisper_runtime
 
     print(f"[SaaSShorts] 🎙️ Transcribing audio for subtitles...")
-    model = WhisperModel("base", device="cpu", compute_type="int8")
-    segments, info = model.transcribe(audio_path, word_timestamps=True)
+    # Shared runtime: GPU when available, clean CPU fallback. Narration is
+    # short TTS audio, so only word timestamps are needed (no VAD).
+    segments, _info, _cfg = whisper_runtime.run_whisper(audio_path, {"word_timestamps": True})
 
     words = []
     for segment in segments:
