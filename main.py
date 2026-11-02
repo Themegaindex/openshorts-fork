@@ -79,9 +79,14 @@ from video_formats import (
     CANONICAL_OUTPUT_FORMATS,
     EVEN_PAD_FILTER,
     OUTPUT_FORMAT_CHOICES,
+    delivery_dimensions,
+    delivery_scale_filter,
+    delivery_width_from_env,
     fit_even_output_dimensions,
     normalize_output_format,
     output_aspect_ratio,
+    resize_interpolation,
+    upscale_interpolation_from_env,
 )
 
 import warnings
@@ -137,6 +142,16 @@ LONGFORM_BLUR_DOWNSCALE = _env_number("LONGFORM_BLUR_DOWNSCALE", _fast_or_legacy
 # GaussianBlur((51, 51), 0) derives sigma 0.3*((51-1)*0.5-1)+0.8 = 8.0.
 GENERAL_BLUR_KSIZE = 51
 GENERAL_BLUR_SIGMA = 8.0
+# Vertical/square shorts ship at a fixed platform size (1080x1920 / 1080x1080)
+# instead of the raw crop size. SHORTS_DELIVERY_WIDTH=0 restores the old size.
+SHORTS_DELIVERY_WIDTH = delivery_width_from_env()
+# Resampler when a crop must grow (720p-1440p sources).
+SHORTS_UPSCALE_INTERPOLATION = upscale_interpolation_from_env()
+_CV2_INTERPOLATION_NAMES = {
+    "lanczos": "INTER_LANCZOS4",
+    "cubic": "INTER_CUBIC",
+    "linear": "INTER_LINEAR",
+}
 # Watermark: subtle centered overlay so rendered clips can't be re-uploaded as
 # someone else's work. Configure via env; WATERMARK_TEXT wins over the image.
 WATERMARK_ENABLED = os.environ.get("WATERMARK_ENABLED", "1").strip().lower() not in ("0", "false", "off", "no")
@@ -1622,13 +1637,52 @@ def detect_person_yolo(frame):
                 
     return best_box
 
+def _shrink_frame(image, width, height):
+    """Shrink without aliasing at single-thread OpenCV speed.
+
+    Below 2x, INTER_LINEAR matches INTER_AREA (measured PSNR 55-57 dB) at a
+    quarter of the cost. From 2x on, a box filter at the whole factor (OpenCV's
+    fast integer INTER_AREA path; the centred trim is under k pixels) removes
+    the detail linear sampling would alias, then linear covers the rest.
+    """
+    src_h, src_w = image.shape[:2]
+    factor = int(min(src_w / width, src_h / height))
+    if factor >= 2:
+        trim_h, trim_w = src_h // factor * factor, src_w // factor * factor
+        y0, x0 = (src_h - trim_h) // 2, (src_w - trim_w) // 2
+        image = cv2.resize(
+            image[y0:y0 + trim_h, x0:x0 + trim_w], (trim_w // factor, trim_h // factor),
+            interpolation=cv2.INTER_AREA,
+        )
+        if image.shape[:2] == (height, width):
+            return image
+    return cv2.resize(image, (int(width), int(height)), interpolation=cv2.INTER_LINEAR)
+
+
+def _resize_frame(image, width, height):
+    """Resample to (width, height): _shrink_frame when shrinking, the
+    configured upscaler (bicubic by default) when enlarging, a contiguous
+    pass-through when the size already matches."""
+    src_h, src_w = image.shape[:2]
+    name = resize_interpolation(src_w, src_h, width, height, SHORTS_UPSCALE_INTERPOLATION)
+    if name is None:
+        return np.ascontiguousarray(image)
+    if name == "shrink":
+        return _shrink_frame(image, width, height)
+    return cv2.resize(
+        image, (int(width), int(height)),
+        interpolation=getattr(cv2, _CV2_INTERPOLATION_NAMES[name]),
+    )
+
+
 def _blurred_backdrop(frame, output_width, output_height, downscale):
     """Blurred 'cover' backdrop for a general shot.
 
     downscale <= 1 is the legacy full-size path. Otherwise the visible region
     is shrunk once to 1/downscale of the output, blurred with a matching
     sigma and scaled up: a blurred backdrop has no detail to lose, and the
-    sharp foreground is untouched.
+    sharp foreground is untouched. The sigma follows the output height, so a
+    1080x1920 short keeps the look a 1080 px tall clip always had.
     """
     orig_h, orig_w = frame.shape[:2]
     # Generic "cover" scaling works for landscape, portrait and square
@@ -1647,8 +1701,9 @@ def _blurred_backdrop(frame, output_width, output_height, downscale):
     x0, y0 = (orig_w - crop_w) // 2, (orig_h - crop_h) // 2
     small_w = max(2, output_width // downscale)
     small_h = max(2, output_height // downscale)
-    small = cv2.resize(frame[y0:y0 + crop_h, x0:x0 + crop_w], (small_w, small_h), interpolation=cv2.INTER_AREA)
-    small = cv2.GaussianBlur(small, (0, 0), GENERAL_BLUR_SIGMA / downscale)
+    small = _resize_frame(frame[y0:y0 + crop_h, x0:x0 + crop_w], small_w, small_h)
+    sigma = GENERAL_BLUR_SIGMA * output_height / 1080.0 / downscale
+    small = cv2.GaussianBlur(small, (0, 0), max(0.5, sigma))
     return cv2.resize(small, (output_width, output_height), interpolation=cv2.INTER_LINEAR)
 
 
@@ -1668,7 +1723,7 @@ def create_general_frame(frame, output_width, output_height, blur_downscale=None
     scale = min(output_width / orig_w, output_height / orig_h)
     fg_w = max(1, min(output_width, int(round(orig_w * scale))))
     fg_h = max(1, min(output_height, int(round(orig_h * scale))))
-    foreground = cv2.resize(frame, (fg_w, fg_h))
+    foreground = _resize_frame(frame, fg_w, fg_h)
     
     # 3. Overlay
     y_offset = (output_height - fg_h) // 2
@@ -1697,12 +1752,12 @@ def create_split_frame(frame, output_width, output_height, centers, stacked=True
         crop = frame[y1:y2, x1:x2]
         if crop.size == 0:
             crop = frame
-        panels.append(cv2.resize(crop, (panel_w, panel_h)))
+        panels.append(_resize_frame(crop, panel_w, panel_h))
 
     combined = cv2.vconcat(panels) if stacked else cv2.hconcat(panels)
     if combined.shape[0] != output_height or combined.shape[1] != output_width:
         # Odd output sizes leave a 1px remainder after halving — snap to size.
-        combined = cv2.resize(combined, (output_width, output_height))
+        combined = _resize_frame(combined, output_width, output_height)
     return combined
 
 
@@ -1788,13 +1843,18 @@ def _build_watermark_blender(output_width, output_height):
         return None
     alpha = arr[:, :, 3:4] / 255.0
     bgr = arr[:, :, [2, 1, 0]]
-    return (bgr * alpha, 1.0 - alpha, x, y, w, h)
+    # Contiguous 3-channel float32 planes let OpenCV blend in one pass; the
+    # arithmetic is the same float32 math as roi * (1 - alpha) + premul.
+    premul = np.ascontiguousarray(bgr * alpha, dtype=np.float32)
+    inv_alpha = np.ascontiguousarray(np.repeat(1.0 - alpha, 3, axis=2), dtype=np.float32)
+    return (premul, inv_alpha, x, y, w, h)
 
 
 def _apply_watermark(frame, blender):
     premul, inv_alpha, x, y, w, h = blender
-    roi = frame[y:y + h, x:x + w].astype(np.float32)
-    frame[y:y + h, x:x + w] = (roi * inv_alpha + premul).astype(np.uint8)
+    roi = frame[y:y + h, x:x + w]
+    blended = cv2.add(cv2.multiply(roi, inv_alpha, dtype=cv2.CV_32F), premul)
+    frame[y:y + h, x:x + w] = blended.astype(np.uint8)
     return frame
 
 
@@ -2181,20 +2241,35 @@ def download_youtube_video(url, output_dir=".", resume=False):
     
     return downloaded_file, sanitized_title
 
-def _finalize_clip_passthrough(input_video, final_output_video, progress_callback=None):
+def _finalize_clip_passthrough(input_video, final_output_video, progress_callback=None,
+                               target_size=None):
     """Finish a clip without reframing (original output, or source already in
     the target aspect). Applies the watermark via FFmpeg overlay if enabled;
-    otherwise remuxes with faststart only."""
+    otherwise remuxes with faststart only.
+
+    target_size=(w, h) scales an on-aspect vertical/square source to the
+    delivery size (cover scale + centre crop). None keeps the source size:
+    the original format and the long video never pass it."""
     if os.path.exists(final_output_video):
         os.remove(final_output_video)
     if progress_callback:
         progress_callback(5.0, "Finalizing clip without reframing...")
 
-    wm_png = None
     width = height = None
-    if WATERMARK_ENABLED:
+    if target_size or WATERMARK_ENABLED:
         try:
             width, height = get_video_resolution(input_video)
+        except Exception as e:
+            print(f"⚠️ Could not read the clip size: {e}")
+    scale_filter = None
+    if target_size:
+        scale_filter = delivery_scale_filter(width, height, *target_size, upscale=SHORTS_UPSCALE_INTERPOLATION)
+        if scale_filter:
+            width, height = target_size
+
+    wm_png = None
+    if WATERMARK_ENABLED:
+        try:
             wm_png = f"{os.path.splitext(final_output_video)[0]}_wm.png"
             _render_watermark_rgba(width).save(wm_png)
         except Exception as e:
@@ -2202,20 +2277,29 @@ def _finalize_clip_passthrough(input_video, final_output_video, progress_callbac
             wm_png = None
 
     def _build_watermarked(attempt):
+        base = f'[0:v]{scale_filter}[base];[base]' if scale_filter else '[0:v]'
         return [
             'ffmpeg', '-y', *attempt.input_args, '-i', input_video, '-i', wm_png,
             '-filter_complex',
-            f'[0:v][1:v]overlay=(W-w)/2:(H-h)/2:format=auto,{EVEN_PAD_FILTER}',
+            f'{base}[1:v]overlay=(W-w)/2:(H-h)/2:format=auto,{EVEN_PAD_FILTER}',
+            *attempt.video_args, '-pix_fmt', 'yuv420p',
+            '-c:a', 'copy', '-movflags', '+faststart', final_output_video,
+        ]
+
+    def _build_scaled(attempt):
+        return [
+            'ffmpeg', '-y', *attempt.input_args, '-i', input_video,
+            '-vf', f'{scale_filter},{EVEN_PAD_FILTER}',
             *attempt.video_args, '-pix_fmt', 'yuv420p',
             '-c:a', 'copy', '-movflags', '+faststart', final_output_video,
         ]
 
     try:
-        if wm_png:
+        if wm_png or scale_filter:
             video_encoding.run_encode(
-                _build_watermarked,
+                _build_watermarked if wm_png else _build_scaled,
                 tier=video_encoding.FINAL,
-                label="Watermark finalize",
+                label="Watermark finalize" if wm_png else "Delivery scale",
                 output_path=final_output_video,
                 source=input_video,
                 width=width,
@@ -2316,8 +2400,16 @@ def process_video_to_vertical(input_video, final_output_video, progress_callback
     # through untouched instead.
     src_width, src_height = get_video_resolution(input_video)
     if src_width and src_height and abs((src_width / src_height) - aspect_ratio) < 0.02:
-        print(f"🎬 Source already matches target aspect ({src_width}x{src_height}) — skipping reframing.")
-        return _finalize_clip_passthrough(input_video, final_output_video, progress_callback)
+        target_size = (
+            delivery_dimensions(src_width, src_height, aspect_ratio, SHORTS_DELIVERY_WIDTH)
+            if SHORTS_DELIVERY_WIDTH else None
+        )
+        delivery_note = f", delivering {target_size[0]}x{target_size[1]}" if target_size else ""
+        print(f"🎬 Source already matches target aspect ({src_width}x{src_height}) — "
+              f"skipping reframing{delivery_note}.")
+        return _finalize_clip_passthrough(
+            input_video, final_output_video, progress_callback, target_size=target_size,
+        )
 
     print(f"🎬 Processing clip: {input_video}")
     print("   Step 1: Detecting scenes...")
@@ -2343,12 +2435,16 @@ def process_video_to_vertical(input_video, final_output_video, progress_callback
         progress_callback(8.0, "Preparing active tracking...")
     original_width, original_height = src_width, src_height
 
-    OUTPUT_WIDTH, OUTPUT_HEIGHT = fit_even_output_dimensions(
-        original_width, original_height, aspect_ratio,
+    OUTPUT_WIDTH, OUTPUT_HEIGHT = delivery_dimensions(
+        original_width, original_height, aspect_ratio, SHORTS_DELIVERY_WIDTH,
     )
 
-    # Initialize Cameraman
+    # The crop window comes from the SOURCE size only (SmoothedCameraman
+    # derives crop_width/height from it); the output pair is just the size
+    # every composed frame is resampled to.
     cameraman = SmoothedCameraman(OUTPUT_WIDTH, OUTPUT_HEIGHT, original_width, original_height, aspect_ratio=aspect_ratio)
+    print(f"   📐 Delivery {OUTPUT_WIDTH}x{OUTPUT_HEIGHT} from {original_width}x{original_height} "
+          f"(crop {cameraman.crop_width}x{cameraman.crop_height}, upscale {SHORTS_UPSCALE_INTERPOLATION})")
     watermark = _build_watermark_blender(OUTPUT_WIDTH, OUTPUT_HEIGHT)
     
     # --- New Strategy: Per-Scene Analysis ---
@@ -2569,16 +2665,16 @@ def process_video_to_vertical(input_video, final_output_video, progress_callback
 
                 x1, y1, x2, y2 = cameraman.get_crop_box(force_snap=is_scene_start)
                 if y2 > y1 and x2 > x1:
-                    cropped = frame[y1:y2, x1:x2]
-                    output_frame = cv2.resize(cropped, (OUTPUT_WIDTH, OUTPUT_HEIGHT))
+                    output_frame = _resize_frame(frame[y1:y2, x1:x2], OUTPUT_WIDTH, OUTPUT_HEIGHT)
                 else:
-                    output_frame = cv2.resize(frame, (OUTPUT_WIDTH, OUTPUT_HEIGHT))
+                    output_frame = _resize_frame(frame, OUTPUT_WIDTH, OUTPUT_HEIGHT)
 
             if watermark is not None:
                 output_frame = _apply_watermark(output_frame, watermark)
 
             try:
-                ffmpeg_process.stdin.write(output_frame.tobytes())
+                # Hand the frame buffer to the pipe without a tobytes() copy.
+                ffmpeg_process.stdin.write(memoryview(np.ascontiguousarray(output_frame)).cast("B"))
             except OSError:
                 # POSIX raises BrokenPipeError, Windows EINVAL: the encoder exited.
                 encoder_died = True

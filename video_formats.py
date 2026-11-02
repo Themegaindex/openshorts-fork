@@ -3,6 +3,7 @@
 This module intentionally has no OpenCV or application imports so the API,
 worker and tests all use exactly the same compatibility rules.
 """
+import os
 
 CANONICAL_OUTPUT_FORMATS = ("vertical", "original", "square")
 LEGACY_OUTPUT_FORMAT_ALIASES = {
@@ -15,6 +16,17 @@ OUTPUT_FORMAT_CHOICES = CANONICAL_OUTPUT_FORMATS + tuple(LEGACY_OUTPUT_FORMAT_AL
 # this no-op-for-even-sources pad filter makes every re-encode path safe for
 # odd-sized uploads while preserving the complete source image.
 EVEN_PAD_FILTER = "pad=ceil(iw/2)*2:ceil(ih/2)*2"
+
+# Vertical and square shorts ship at a fixed platform size: 1080x1920 (9:16)
+# and 1080x1080 (1:1). 2160 keeps 2160x3840 inside NVENC's 4096 limit.
+DEFAULT_DELIVERY_WIDTH = 1080
+MIN_DELIVERY_WIDTH = 360
+MAX_DELIVERY_WIDTH = 2160
+# Bicubic: OpenCV runs single-threaded here (ultralytics turns its threads
+# off) and Lanczos4 measured 22-36 ms per 1080x1920 frame against 3-5 ms.
+UPSCALE_INTERPOLATIONS = ("cubic", "lanczos", "linear")
+DEFAULT_UPSCALE_INTERPOLATION = "cubic"
+_FFMPEG_SCALE_FLAGS = {"cubic": "bicubic", "lanczos": "lanczos", "linear": "bilinear"}
 
 
 def with_even_padding(filter_chain):
@@ -47,9 +59,9 @@ def output_aspect_ratio(output_format):
 def fit_even_output_dimensions(source_width, source_height, aspect_ratio):
     """Largest even target rectangle that fits inside the source dimensions.
 
-    Keeping both axes at or below the source avoids accidental upscaling. It
-    also handles portrait-to-square and unusually narrow portrait sources,
-    where the old width-only crop could stretch the image vertically.
+    This is the crop window taken from the source (and the legacy output
+    size). It also handles portrait-to-square and unusually narrow portrait
+    sources, where the old width-only crop could stretch the image vertically.
     """
     source_width = int(source_width or 0)
     source_height = int(source_height or 0)
@@ -69,3 +81,74 @@ def fit_even_output_dimensions(source_width, source_height, aspect_ratio):
     width = max(2, min(source_width, width) // 2 * 2)
     height = max(2, min(source_height, height) // 2 * 2)
     return width, height
+
+
+def delivery_width_from_env(raw=None):
+    """SHORTS_DELIVERY_WIDTH as an even width, or 0 for the legacy crop size."""
+    if raw is None:
+        raw = os.environ.get("SHORTS_DELIVERY_WIDTH", "")
+    text = str(raw).strip().lower()
+    if text in ("", "default"):
+        return DEFAULT_DELIVERY_WIDTH
+    if text in ("native", "source", "off", "legacy"):
+        return 0
+    try:
+        value = int(float(text))
+    except ValueError:
+        return DEFAULT_DELIVERY_WIDTH
+    if value <= 0:
+        return 0
+    return max(MIN_DELIVERY_WIDTH, min(MAX_DELIVERY_WIDTH, value)) // 2 * 2
+
+
+def upscale_interpolation_from_env(raw=None):
+    """SHORTS_UPSCALE_INTERPOLATION; unknown values mean the default."""
+    if raw is None:
+        raw = os.environ.get("SHORTS_UPSCALE_INTERPOLATION", "")
+    text = str(raw).strip().lower()
+    return text if text in UPSCALE_INTERPOLATIONS else DEFAULT_UPSCALE_INTERPOLATION
+
+
+def delivery_dimensions(source_width, source_height, aspect_ratio,
+                        delivery_width=DEFAULT_DELIVERY_WIDTH):
+    """Final pixel size of a vertical or square short.
+
+    delivery_width > 0 gives exactly (W, even(W / aspect)) for every source:
+    a 720p crop is enlarged, a 4K crop shrunk. 0 keeps the legacy crop size.
+    """
+    if not delivery_width:
+        return fit_even_output_dimensions(source_width, source_height, aspect_ratio)
+    if int(source_width or 0) <= 0 or int(source_height or 0) <= 0 or float(aspect_ratio or 0) <= 0:
+        raise ValueError("source dimensions and aspect ratio must be positive")
+    width = max(2, int(delivery_width) // 2 * 2)
+    height = max(2, int(round(width / float(aspect_ratio))) // 2 * 2)
+    return width, height
+
+
+def resize_interpolation(source_width, source_height, target_width, target_height,
+                         upscale=DEFAULT_UPSCALE_INTERPOLATION):
+    """None for the same size, 'shrink' when shrinking on both axes, else the upscaler."""
+    if (int(source_width), int(source_height)) == (int(target_width), int(target_height)):
+        return None
+    if target_width <= source_width and target_height <= source_height:
+        return "shrink"
+    return upscale if upscale in UPSCALE_INTERPOLATIONS else DEFAULT_UPSCALE_INTERPOLATION
+
+
+def delivery_scale_filter(source_width, source_height, target_width, target_height,
+                          upscale=DEFAULT_UPSCALE_INTERPOLATION):
+    """FFmpeg chain that brings an on-aspect source to the delivery size.
+
+    None when it is already there. Cover scale + centre crop: a source inside
+    the passthrough tolerance loses a few percent at the edges, never stretched.
+    """
+    sw, sh = int(source_width or 0), int(source_height or 0)
+    tw, th = int(target_width), int(target_height)
+    if (sw, sh) == (tw, th):
+        return None
+    if 0 < tw <= sw and 0 < th <= sh:
+        flags = "area"
+    else:
+        flags = _FFMPEG_SCALE_FLAGS.get(upscale, _FFMPEG_SCALE_FLAGS[DEFAULT_UPSCALE_INTERPOLATION])
+    return (f"scale={tw}:{th}:force_original_aspect_ratio=increase:flags={flags},"
+            f"crop={tw}:{th},setsar=1")

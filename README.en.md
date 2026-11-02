@@ -202,6 +202,7 @@ Navigate to **`http://localhost:5175`**
 | `GEMINI_THINKING_SCORE` | Optional thinking budget for clip scoring |
 | `WHISPER_DEVICE` / `WHISPER_MODEL` / `WHISPER_COMPUTE` / `WHISPER_CPU_MODEL` | Transcription: `auto` uses the NVIDIA GPU (large-v3-turbo) and falls back to the CPU (small) on GPU errors |
 | `VIDEO_ENCODER` / `VIDEO_HWDECODE` / `VIDEO_NVENC_CQ_OFFSET` | Video encoding: `auto` uses the NVIDIA GPU (NVENC/NVDEC) and re-encodes with libx264 on GPU errors |
+| `SHORTS_DELIVERY_WIDTH` / `SHORTS_UPSCALE_INTERPOLATION` | Size of 9:16 / 1:1 clips (default: 1080 → 1080x1920 / 1080x1080; 0 = old crop size) and the filter that enlarges small sources (default: cubic) |
 | `QUALITY_GATE_MIN_HEIGHT` | Ask before processing below this height (default: 720) |
 | `WATERMARK_ENABLED` / `WATERMARK_TEXT` / `WATERMARK_IMAGE` / `WATERMARK_OPACITY` | Watermark configuration |
 

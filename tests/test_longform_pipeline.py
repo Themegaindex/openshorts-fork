@@ -1047,6 +1047,79 @@ def test_non_16_9_long_render_uses_canvas_and_duration_cuts(monkeypatch, tmp_pat
     assert commands[-1][commands[-1].index("-c:v") + 1] == "copy"
 
 
+@pytest.mark.parametrize(
+    "source,aspect,width,expected",
+    [((720, 1280), 9 / 16, 1080, (1080, 1920)),
+     ((2160, 3840), 9 / 16, 1080, (1080, 1920)),
+     ((1080, 1080), 1.0, 1080, (1080, 1080)),
+     ((720, 1280), 9 / 16, 0, None)],
+)
+def test_on_aspect_source_passthrough_requests_delivery_size(monkeypatch, tmp_path, source, aspect, width, expected):
+    calls = []
+    monkeypatch.setattr(main, "SHORTS_DELIVERY_WIDTH", width)
+    monkeypatch.setattr(main, "get_video_resolution", lambda _path: source)
+
+    def finalize(*args, **kwargs):
+        calls.append(kwargs)
+        return True
+
+    monkeypatch.setattr(main, "_finalize_clip_passthrough", finalize)
+    assert main.process_video_to_vertical(
+        str(tmp_path / "in.mp4"), str(tmp_path / "out.mp4"), aspect_ratio=aspect,
+    ) is True
+    assert calls == [{"target_size": expected}]
+
+
+class _FakeWatermarkImage:
+    def save(self, path):
+        with open(path, "wb") as handle:
+            handle.write(b"png")
+
+
+def test_passthrough_scales_and_watermarks_at_delivery_width(monkeypatch, tmp_path):
+    commands, widths = [], []
+    monkeypatch.setattr(main, "JOB_REPORTER", _Reporter())
+    monkeypatch.setattr(main, "WATERMARK_ENABLED", True)
+    monkeypatch.setattr(main, "get_video_resolution", lambda _path: (2160, 3840))
+    monkeypatch.setattr(main, "_render_watermark_rgba", lambda width: widths.append(width) or _FakeWatermarkImage())
+    monkeypatch.setattr(main.subprocess, "run", lambda command, **_kwargs: commands.append(command))
+
+    assert main._finalize_clip_passthrough(
+        str(tmp_path / "in.mp4"), str(tmp_path / "out.mp4"), target_size=(1080, 1920),
+    ) is True
+    assert widths == [1080]
+    graph = commands[0][commands[0].index("-filter_complex") + 1]
+    assert graph.startswith(
+        "[0:v]scale=1080:1920:force_original_aspect_ratio=increase:flags=area,"
+        "crop=1080:1920,setsar=1[base];[base][1:v]overlay="
+    )
+    assert main.EVEN_PAD_FILTER in graph
+
+
+def test_passthrough_scale_only_reencodes_and_exact_size_stays_copy(monkeypatch, tmp_path):
+    commands = []
+    source = {"size": (720, 1280)}
+    monkeypatch.setattr(main, "JOB_REPORTER", _Reporter())
+    monkeypatch.setattr(main, "WATERMARK_ENABLED", False)
+    monkeypatch.setattr(main, "get_video_resolution", lambda _path: source["size"])
+    monkeypatch.setattr(main.subprocess, "run", lambda command, **_kwargs: commands.append(command))
+    src, out = str(tmp_path / "in.mp4"), str(tmp_path / "out.mp4")
+
+    assert main._finalize_clip_passthrough(src, out, target_size=(1080, 1920)) is True
+    scaled = commands[-1]
+    vf = scaled[scaled.index("-vf") + 1]
+    assert "flags=bicubic" in vf and vf.endswith(main.EVEN_PAD_FILTER)
+    assert scaled[scaled.index("-c:a") + 1] == "copy"
+    assert "-c" not in scaled
+
+    copy_command = ["ffmpeg", "-y", "-i", src, "-c", "copy", "-movflags", "+faststart", out]
+    source["size"] = (1080, 1920)
+    assert main._finalize_clip_passthrough(src, out, target_size=(1080, 1920)) is True
+    assert commands[-1] == copy_command
+    assert main._finalize_clip_passthrough(src, out) is True
+    assert commands[-1] == copy_command
+
+
 def test_source_discovery_excludes_finished_long_output(monkeypatch, tmp_path):
     source = tmp_path / "source.mp4"
     long_output = tmp_path / "source_long_1.mp4"

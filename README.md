@@ -239,6 +239,7 @@ nicht überschrieben. Bleibt YouTube gesperrt, kann eine vorhandene Videodatei
 | `LONGFORM_STRONG_PAUSE_SECONDS` / `LONGFORM_PAUSE_FALLBACK_WINDOW_SECONDS` | Starke Sprechpause und lokaler Fast-Speaker-Fallback (Standard: 0,55 / 24 s) |
 | `WHISPER_DEVICE` / `WHISPER_MODEL` / `WHISPER_COMPUTE` / `WHISPER_CPU_MODEL` | Transkription: `auto` nutzt die NVIDIA-GPU (large-v3-turbo) und fällt bei GPU-Fehlern auf die CPU (small) zurück |
 | `VIDEO_ENCODER` / `VIDEO_HWDECODE` / `VIDEO_NVENC_CQ_OFFSET` | Video-Encoding: `auto` nutzt NVENC/NVDEC der NVIDIA-GPU und rendert bei GPU-Fehlern automatisch mit libx264 neu |
+| `SHORTS_DELIVERY_WIDTH` / `SHORTS_UPSCALE_INTERPOLATION` | Größe der 9:16-/1:1-Clips (Standard: 1080 → 1080x1920 / 1080x1080; 0 = alte Crop-Größe) und Filter zum Hochskalieren kleiner Quellen (Standard: cubic) |
 | `QUALITY_GATE_MIN_HEIGHT` | Rückfrage unterhalb dieser Auflösung (Standard: 720) |
 | `WATERMARK_ENABLED` / `WATERMARK_TEXT` / `WATERMARK_IMAGE` / `WATERMARK_OPACITY` | Wasserzeichen-Konfiguration |
 
