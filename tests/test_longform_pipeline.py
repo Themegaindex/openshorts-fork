@@ -1011,8 +1011,26 @@ def test_auto_skips_nine_minute_sources_but_long_mode_still_scales():
     assert main.LONGFORM_MIN_SOURCE_SECONDS > 9 * 60
     assert main.LONGFORM_HARD_MIN_SOURCE_SECONDS <= 9 * 60
     target_min, target_max, _warnings = main._longform_target_range(9 * 60)
-    assert target_min == 240
+    assert target_min == 480
     assert target_max == 540
+
+
+def test_long_video_minimum_is_eight_minutes_by_default():
+    assert main.LONGFORM_TARGET_MIN_SECONDS == 480
+    assert main.LONGFORM_TARGET_MAX_SECONDS == 600
+    # The explicit Long-mode source bound follows the output minimum, so the
+    # two limits cannot drift apart again.
+    assert main.LONGFORM_HARD_MIN_SOURCE_SECONDS == main.LONGFORM_TARGET_MIN_SECONDS
+    assert main._longform_target_range(60 * 60) == (480, 600, [])
+
+
+def test_explicit_long_mode_rejects_sources_shorter_than_the_minimum():
+    # Fails before the expensive transcription instead of after it.
+    with pytest.raises(RuntimeError, match="at least 480 seconds"):
+        main._validate_longform_source_duration("long", 7 * 60)
+    main._validate_longform_source_duration("long", 8 * 60)
+    # Auto applies its own, higher threshold and never raises here.
+    main._validate_longform_source_duration("auto", 7 * 60)
 
 
 def test_video_duration_falls_back_to_ffprobe_when_opencv_is_unknown(monkeypatch):
@@ -1077,6 +1095,15 @@ def test_explicit_long_source_is_rejected_before_transcription():
     )
     transcription = source.index("transcript = transcribe_video(input_video, duration)", cli_start)
     assert early_guard < transcription
+
+
+@pytest.fixture
+def compact_longform_bounds(monkeypatch):
+    """The planner fixtures below are six-minute sources with five-minute
+    plans. Production Long mode rejects sources that short (8-minute minimum),
+    so the review/repair tests pin the compact output bounds they exercise.
+    The real defaults are covered by the duration tests in this module."""
+    monkeypatch.setattr(main, "LONGFORM_TARGET_MIN_SECONDS", 240.0)
 
 
 def _v2_word_transcript():
@@ -1172,7 +1199,7 @@ def _v2_review(plan, *, approved, score, dropped_chapter_ids=None):
     }
 
 
-def test_longform_quality_gate_runs_one_repair_before_accepting(monkeypatch, tmp_path):
+def test_longform_quality_gate_runs_one_repair_before_accepting(monkeypatch, tmp_path, compact_longform_bounds):
     reporter = _Reporter()
     monkeypatch.setattr(main, "JOB_REPORTER", reporter)
     monkeypatch.setenv("GEMINI_API_KEY", "test")
@@ -1215,7 +1242,7 @@ def test_longform_quality_gate_runs_one_repair_before_accepting(monkeypatch, tmp
     assert result["plan_data"]["editorial_review"]["final_verification_attempted"] is True
 
 
-def test_repair_rolls_back_both_plan_views_after_empty_review_plan(monkeypatch, tmp_path):
+def test_repair_rolls_back_both_plan_views_after_empty_review_plan(monkeypatch, tmp_path, compact_longform_bounds):
     reporter = _Reporter()
     monkeypatch.setattr(main, "JOB_REPORTER", reporter)
     monkeypatch.setenv("GEMINI_API_KEY", "test")
@@ -1262,7 +1289,7 @@ def test_repair_rolls_back_both_plan_views_after_empty_review_plan(monkeypatch, 
     assert repair_inputs == [{"viable": True, "chapters": 2, "context_segments": 2}]
 
 
-def test_repair_context_uses_current_boundaries_with_anchor_candidates(monkeypatch, tmp_path):
+def test_repair_context_uses_current_boundaries_with_anchor_candidates(monkeypatch, tmp_path, compact_longform_bounds):
     reporter = _Reporter()
     monkeypatch.setattr(main, "JOB_REPORTER", reporter)
     monkeypatch.setenv("GEMINI_API_KEY", "test")
@@ -1326,7 +1353,7 @@ def test_repair_context_uses_current_boundaries_with_anchor_candidates(monkeypat
     }
 
 
-def test_out_of_order_model_chapters_are_normalized_before_review(monkeypatch, tmp_path):
+def test_out_of_order_model_chapters_are_normalized_before_review(monkeypatch, tmp_path, compact_longform_bounds):
     reporter = _Reporter()
     monkeypatch.setattr(main, "JOB_REPORTER", reporter)
     monkeypatch.setenv("GEMINI_API_KEY", "test")
@@ -1361,7 +1388,7 @@ def test_out_of_order_model_chapters_are_normalized_before_review(monkeypatch, t
     ] == ["chapter_01", "chapter_02"]
 
 
-def test_fresh_final_review_can_reject_a_self_approved_repair(monkeypatch, tmp_path):
+def test_fresh_final_review_can_reject_a_self_approved_repair(monkeypatch, tmp_path, compact_longform_bounds):
     reporter = _Reporter()
     monkeypatch.setattr(main, "JOB_REPORTER", reporter)
     monkeypatch.setenv("GEMINI_API_KEY", "test")
@@ -1397,7 +1424,7 @@ def test_fresh_final_review_can_reject_a_self_approved_repair(monkeypatch, tmp_p
     assert "incomplete_segment_ending:span_02" in result["plan_data"]["editorial_review"]["gate_issues"]
 
 
-def test_repair_cannot_delete_a_strong_chapter_that_sorting_preserved(monkeypatch, tmp_path):
+def test_repair_cannot_delete_a_strong_chapter_that_sorting_preserved(monkeypatch, tmp_path, compact_longform_bounds):
     reporter = _Reporter()
     monkeypatch.setattr(main, "JOB_REPORTER", reporter)
     monkeypatch.setenv("GEMINI_API_KEY", "test")
@@ -1463,7 +1490,7 @@ def test_repair_cannot_delete_a_strong_chapter_that_sorting_preserved(monkeypatc
     } == {"chapter_01", "chapter_02", "chapter_03"}
 
 
-def test_review_can_drop_an_unmoved_chapter_after_chronology_normalization(monkeypatch, tmp_path):
+def test_review_can_drop_an_unmoved_chapter_after_chronology_normalization(monkeypatch, tmp_path, compact_longform_bounds):
     reporter = _Reporter()
     monkeypatch.setattr(main, "JOB_REPORTER", reporter)
     monkeypatch.setenv("GEMINI_API_KEY", "test")
@@ -1524,7 +1551,7 @@ def test_review_can_drop_an_unmoved_chapter_after_chronology_normalization(monke
 
 
 @pytest.mark.parametrize("bad_payload", [[], "text", 42])
-def test_longform_planner_non_object_payload_fails_cleanly(monkeypatch, tmp_path, bad_payload):
+def test_longform_planner_non_object_payload_fails_cleanly(monkeypatch, tmp_path, compact_longform_bounds, bad_payload):
     reporter = _Reporter()
     monkeypatch.setattr(main, "JOB_REPORTER", reporter)
     monkeypatch.setenv("GEMINI_API_KEY", "test")
@@ -1554,6 +1581,7 @@ def test_longform_ignores_malformed_worker_cost_analysis(
     monkeypatch,
     tmp_path,
     malformed_cost_analysis,
+    compact_longform_bounds,
 ):
     reporter = _Reporter()
     monkeypatch.setattr(main, "JOB_REPORTER", reporter)
@@ -1582,7 +1610,7 @@ def test_longform_ignores_malformed_worker_cost_analysis(
     assert result["cost_analysis"] is None
 
 
-def test_malformed_nested_review_payload_rejects_cleanly(monkeypatch, tmp_path):
+def test_malformed_nested_review_payload_rejects_cleanly(monkeypatch, tmp_path, compact_longform_bounds):
     reporter = _Reporter()
     monkeypatch.setattr(main, "JOB_REPORTER", reporter)
     monkeypatch.setenv("GEMINI_API_KEY", "test")
@@ -1624,7 +1652,7 @@ def _v1_style_single_chapter_plan():
     return plan
 
 
-def test_single_chapter_draft_triggers_repair_and_passes_once_regrouped(monkeypatch, tmp_path):
+def test_single_chapter_draft_triggers_repair_and_passes_once_regrouped(monkeypatch, tmp_path, compact_longform_bounds):
     """The chapter minimum must be repairable, not an instant rejection.
 
     The review keeps every span id and its unit boundaries and only splits the
@@ -1675,7 +1703,7 @@ def test_single_chapter_draft_triggers_repair_and_passes_once_regrouped(monkeypa
     assert chapters == {"chapter_01", "chapter_02"}
 
 
-def test_single_chapter_draft_is_rejected_when_the_repair_keeps_one_topic(monkeypatch, tmp_path):
+def test_single_chapter_draft_is_rejected_when_the_repair_keeps_one_topic(monkeypatch, tmp_path, compact_longform_bounds):
     reporter = _Reporter()
     monkeypatch.setattr(main, "JOB_REPORTER", reporter)
     monkeypatch.setenv("GEMINI_API_KEY", "test")
@@ -1701,7 +1729,7 @@ def test_single_chapter_draft_is_rejected_when_the_repair_keeps_one_topic(monkey
     assert "too_few_chapters" in result["plan_data"]["editorial_review"]["gate_issues"]
 
 
-def test_longform_rejects_only_after_failed_repair_retry(monkeypatch, tmp_path):
+def test_longform_rejects_only_after_failed_repair_retry(monkeypatch, tmp_path, compact_longform_bounds):
     reporter = _Reporter()
     monkeypatch.setattr(main, "JOB_REPORTER", reporter)
     # main.py loads the project .env at import; pin the budget so a local
@@ -1833,7 +1861,7 @@ def test_scene_alignment_reverts_when_a_segment_would_become_too_short(monkeypat
     assert "segment_duration:span_01" in refined["local_scene_alignment"]["revert_reasons"]
 
 
-def test_final_review_verdict_via_viable_flag_is_not_a_plan_mutation(monkeypatch, tmp_path):
+def test_final_review_verdict_via_viable_flag_is_not_a_plan_mutation(monkeypatch, tmp_path, compact_longform_bounds):
     """Regression: the read-only critic copied the plan exactly but set
     viable=false to express its verdict; the gate treated that as a mutation."""
     reporter = _Reporter()
@@ -1864,7 +1892,7 @@ def test_final_review_verdict_via_viable_flag_is_not_a_plan_mutation(monkeypatch
     assert "final_review_mutated_plan" not in (result["plan_data"].get("warnings") or [])
 
 
-def test_failed_final_review_spends_the_remaining_repair_budget(monkeypatch, tmp_path):
+def test_failed_final_review_spends_the_remaining_repair_budget(monkeypatch, tmp_path, compact_longform_bounds):
     """With two repairs allowed, a critic rejection after the first repair
     drives a second repair instead of failing the job outright."""
     reporter = _Reporter()
@@ -1913,7 +1941,7 @@ def test_failed_final_review_spends_the_remaining_repair_budget(monkeypatch, tmp
     assert any(n.endswith("_longform_final_review_v2_2.json") for n in names)
 
 
-def test_failed_final_review_still_fails_when_no_repair_budget_is_left(monkeypatch, tmp_path):
+def test_failed_final_review_still_fails_when_no_repair_budget_is_left(monkeypatch, tmp_path, compact_longform_bounds):
     reporter = _Reporter()
     monkeypatch.setattr(main, "JOB_REPORTER", reporter)
     monkeypatch.setattr(main, "LONGFORM_REVIEW_REPAIR_RETRIES", 1)

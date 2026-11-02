@@ -134,19 +134,24 @@ AUTO_FULL_VIDEO_FALLBACK_MAX_SECONDS = max(
     float(os.environ.get("AUTO_FULL_VIDEO_FALLBACK_MAX_SECONDS", "1800")),
 )
 GEMINI_WORKER_SCRIPT = os.path.join(os.path.dirname(os.path.abspath(__file__)), "gemini_worker.py")
+# A long video runs 8-10 minutes by default.
 LONGFORM_TARGET_MIN_SECONDS = float(
-    os.environ.get("LONGFORM_MIN_OUTPUT_SECONDS", os.environ.get("LONGFORM_TARGET_MIN_SECONDS", "240"))
+    os.environ.get("LONGFORM_MIN_OUTPUT_SECONDS", os.environ.get("LONGFORM_TARGET_MIN_SECONDS", "480"))
 )
 LONGFORM_TARGET_MAX_SECONDS = float(
     os.environ.get("LONGFORM_MAX_OUTPUT_SECONDS", os.environ.get("LONGFORM_TARGET_MAX_SECONDS", "600"))
 )
-# Auto only attempts a long video when the source can plausibly spare the best
-# 4-10 minutes. Below this a "best-of" would be close to the full recording, so
+# Auto only attempts a long video from sources of at least this length.
+# Shorter sources would turn the best-of into nearly the full recording, so
 # Auto stays with Shorts instead of burning a planning pass on it.
 LONGFORM_MIN_SOURCE_SECONDS = float(os.environ.get("LONGFORM_MIN_SOURCE_SECONDS", "720"))
 # The explicit Long mode keeps the lower physical bound: the user asked for a
-# long video, so attempt it and let the quality gate decide.
-LONGFORM_HARD_MIN_SOURCE_SECONDS = float(os.environ.get("LONGFORM_HARD_MIN_SOURCE_SECONDS", "240"))
+# long video, so attempt it and let the quality gate decide. A source shorter
+# than the minimum output can never yield a valid edit, so this bound follows
+# the output minimum unless it is set explicitly.
+LONGFORM_HARD_MIN_SOURCE_SECONDS = float(
+    os.environ.get("LONGFORM_HARD_MIN_SOURCE_SECONDS", str(LONGFORM_TARGET_MIN_SECONDS))
+)
 LONGFORM_MIN_SEGMENT_SECONDS = float(os.environ.get("LONGFORM_MIN_SEGMENT_SECONDS", "20"))
 LONGFORM_MAX_SEGMENT_SECONDS = float(os.environ.get("LONGFORM_MAX_SEGMENT_SECONDS", "240"))
 LONGFORM_MAX_SEGMENTS = int(os.environ.get("LONGFORM_MAX_SEGMENTS", "12"))

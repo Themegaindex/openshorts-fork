@@ -484,7 +484,7 @@ def resolve_unit_plan(
     payload: dict,
     units: Iterable[dict],
     *,
-    min_output_seconds: float = 240.0,
+    min_output_seconds: float = 480.0,
     max_output_seconds: float = 600.0,
     min_segment_seconds: float = 20.0,
     max_segment_seconds: float = 240.0,

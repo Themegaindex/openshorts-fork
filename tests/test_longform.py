@@ -227,7 +227,10 @@ def test_v2_plan_resolves_only_stable_unit_ids_and_adaptive_duration():
         _v2_unit(6, 300, 310, "Das ist der starke Hook."),
     ]
 
-    resolved = longform.resolve_unit_plan(_v2_plan(second_chapter=True), units)
+    # Compact five-minute fixture: pin the bound it was written for.
+    resolved = longform.resolve_unit_plan(
+        _v2_plan(second_chapter=True), units, min_output_seconds=240,
+    )
 
     assert resolved["planner_version"] == 2
     assert resolved["total_duration"] == 310
@@ -402,7 +405,9 @@ def test_quality_gate_combines_invariants_and_review_scores():
         _v2_unit(5, 240, 300, "Fünf."),
         _v2_unit(6, 300, 310, "Hook."),
     ]
-    plan = longform.resolve_unit_plan(_v2_plan(second_chapter=True), units)
+    plan = longform.resolve_unit_plan(
+        _v2_plan(second_chapter=True), units, min_output_seconds=240,
+    )
     approved_review = {
         "approved": True,
         "overall_score": 90,
@@ -611,3 +616,19 @@ def test_quality_gate_accepts_questions_and_terminated_connector_endings():
     assert longform._obviously_incomplete_start("dass den Marsch in Berlin.")
     assert longform._obviously_incomplete_end("Weißt du, wo das aufgefallen ist, dass")
     assert longform._obviously_incomplete_end("Das war die Zeit,")
+
+
+def test_plan_shorter_than_eight_minutes_is_flagged_by_default():
+    units = [
+        _v2_unit(1, 0, 60, "Erste vollständige Antwort."),
+        _v2_unit(2, 60, 120, "Zweite vollständige Antwort."),
+        _v2_unit(3, 120, 180, "Dritte vollständige Antwort."),
+        _v2_unit(4, 180, 240, "Vierte vollständige Antwort."),
+        _v2_unit(5, 240, 300, "Weiterer Kontext."),
+        _v2_unit(6, 300, 310, "Das ist der starke Hook."),
+    ]
+
+    # 310 s is below the 8-minute default and must not pass the gate.
+    resolved = longform.resolve_unit_plan(_v2_plan(second_chapter=True), units)
+    assert "result_below_adaptive_minimum" in resolved["validation_issues"]
+    assert resolved["target_min_seconds"] == 480
