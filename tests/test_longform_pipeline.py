@@ -1120,6 +1120,48 @@ def test_passthrough_scale_only_reencodes_and_exact_size_stays_copy(monkeypatch,
     assert commands[-1] == copy_command
 
 
+@pytest.mark.parametrize(
+    "last_run,excluded",
+    [({"gpu_wait_seconds": 30.0}, True), ({"model_downloaded": True}, True),
+     ({"gpu_wait_seconds": 0.5, "model_downloaded": False}, False)],
+)
+def test_transcription_wait_and_download_are_not_learned_as_speed(monkeypatch, last_run, excluded):
+    reporter = _Reporter()
+    monkeypatch.setattr(main, "JOB_REPORTER", reporter)
+    info = SimpleNamespace(language="de", language_probability=0.99)
+
+    def fake_run(*_args, **_kwargs):
+        main.whisper_runtime.LAST_RUN.clear()
+        main.whisper_runtime.LAST_RUN.update(device="cuda", fell_back=False, **last_run)
+        return [], info, {"device": "cuda"}
+
+    monkeypatch.setattr(main.whisper_runtime, "run_whisper", fake_run)
+    main.transcribe_video("audio.mp4", 60)
+    assert ("transcribe" in reporter.stats_excluded_phases) is excluded
+
+
+def test_whisper_model_prefetch_marks_download_and_never_raises(monkeypatch):
+    reporter = _Reporter()
+    reporter.operation = lambda *_a, **_k: contextmanager(lambda: (yield))()
+    reporter.heartbeat = lambda *_a, **_k: None
+
+    def downloaded(_name, on_status=None, report=None):
+        report["downloaded"] = True
+
+    monkeypatch.setattr(main.whisper_runtime, "ensure_model", downloaded)
+    main._prefetch_whisper_model(reporter, "large-v3-turbo")
+    assert "transcribe" in reporter.stats_excluded_phases
+
+    def broken(*_args, **_kwargs):
+        raise OSError("network down")
+
+    quiet = _Reporter()
+    quiet.operation = reporter.operation
+    monkeypatch.setattr(main.whisper_runtime, "ensure_model", broken)
+    main._prefetch_whisper_model(quiet, "large-v3-turbo")
+    assert "transcribe" not in quiet.stats_excluded_phases
+
+
 def test_source_discovery_excludes_finished_long_output(monkeypatch, tmp_path):
     source = tmp_path / "source.mp4"
     long_output = tmp_path / "source_long_1.mp4"
@@ -2127,7 +2169,8 @@ def test_transcribe_video_keeps_transcript_contract(monkeypatch):
     monkeypatch.setattr(main, "JOB_REPORTER", reporter)
     calls = []
 
-    def fake_run_whisper(media_path, params, *, on_segment=None, on_restart=None, on_status=None, log=print):
+    def fake_run_whisper(media_path, params, *, on_segment=None, on_restart=None, on_status=None,
+                         on_wait=None, log=print):
         calls.append((media_path, dict(params)))
         info = SimpleNamespace(language="de", language_probability=0.97)
         segments = _fake_whisper_segments()
@@ -2156,7 +2199,8 @@ def test_transcribe_video_gpu_fallback_resets_progress_and_excludes_stats(monkey
     reporter = _Reporter()
     monkeypatch.setattr(main, "JOB_REPORTER", reporter)
 
-    def fake_run_whisper(media_path, params, *, on_segment=None, on_restart=None, on_status=None, log=print):
+    def fake_run_whisper(media_path, params, *, on_segment=None, on_restart=None, on_status=None,
+                         on_wait=None, log=print):
         info = SimpleNamespace(language="de", language_probability=0.97)
         on_segment(SimpleNamespace(end=8.0), info)
         on_status("Transcribing on GPU with Whisper large-v3-turbo")   # no heartbeat on the fake

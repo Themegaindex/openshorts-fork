@@ -29,6 +29,7 @@ class _Backend:
         self.transcribe_calls = []
         self.downloads = []
         self.download_error = None
+        self.local_cache = None       # path download_model(local_files_only=True) returns
         self.batched = []
 
     def install(self, monkeypatch):
@@ -71,6 +72,8 @@ class _Backend:
         def download_model(name, local_files_only=False):
             backend.downloads.append((name, local_files_only))
             if local_files_only:
+                if backend.local_cache:
+                    return backend.local_cache
                 raise FileNotFoundError("not cached")
             if backend.download_error:
                 raise backend.download_error
@@ -218,13 +221,20 @@ def test_mid_iteration_gpu_error_discards_partial_segments_and_restarts(backend)
     assert whisper_runtime._gpu_disabled_reason   # missing library is permanent
 
 
-def test_permanent_failure_pins_cpu_but_oom_does_not(backend):
+def test_permanent_failure_pins_cpu_but_oom_does_not(backend, tmp_path):
     backend.load_error["cuda"] = RuntimeError("Library cublas64_12.dll is not found or cannot be loaded")
     _run()
     backend.models.clear()
     _run()
     assert [m.device for m in backend.models] == ["cpu"]
 
+    # The next job is a new process: the marker file still pins the CPU.
+    whisper_runtime._gpu_disabled_reason = None
+    backend.models.clear()
+    _run()
+    assert [m.device for m in backend.models] == ["cpu"]
+
+    (tmp_path / whisper_runtime.GPU_DISABLED_MARKER).unlink()
     whisper_runtime._gpu_disabled_reason = None
     backend.load_error["cuda"] = RuntimeError("CUDA failed with error out of memory")
     _run()
@@ -253,8 +263,11 @@ def test_model_is_unloaded_after_success(backend):
     (_segments, _info, cfg), _events = _run()
     assert cfg["device"] == "cuda"
     assert backend.models[0].model.unloaded is True
-    assert whisper_runtime.LAST_RUN == {
+    last_run = dict(whisper_runtime.LAST_RUN)
+    assert last_run.pop("gpu_wait_seconds") < 1.0
+    assert last_run == {
         "device": "cuda", "model_size": "large-v3-turbo", "compute_type": "float16", "fell_back": False,
+        "model_downloaded": True,
     }
 
 
@@ -316,3 +329,110 @@ def test_module_imports_without_heavy_deps(monkeypatch):
         assert reloaded.resolve_whisper_config()["device"] == "cpu"
     finally:
         importlib.reload(whisper_runtime)
+
+
+def test_partial_model_cache_is_downloaded_again(backend, tmp_path):
+    snapshot = tmp_path / "snapshot"
+    snapshot.mkdir()
+    (snapshot / "config.json").write_text("{}")          # model.bin never arrived
+    backend.local_cache = str(snapshot)
+    report = {}
+    assert whisper_runtime.ensure_model("large-v3-turbo", report=report) == "/models/large-v3-turbo"
+    assert backend.downloads == [("large-v3-turbo", True), ("large-v3-turbo", False)]
+    assert report == {"downloaded": True}
+
+
+def test_complete_model_cache_is_used_offline(backend, tmp_path):
+    snapshot = tmp_path / "snapshot"
+    snapshot.mkdir()
+    for name in ("config.json", "model.bin"):
+        (snapshot / name).write_text("x")
+    backend.local_cache = str(snapshot)
+    report = {}
+    assert whisper_runtime.ensure_model("large-v3-turbo", report=report) == str(snapshot)
+    assert backend.downloads == [("large-v3-turbo", True)] and report == {}
+
+
+@pytest.mark.parametrize(
+    "env,expected",
+    [
+        ({"WHISPER_CPU_MODEL": "base"}, "base"),
+        ({"WHISPER_MODEL": "large-v3", "WHISPER_CPU_MODEL": "small"}, "small"),
+        ({"WHISPER_MODEL": "medium"}, "medium"),                 # older .env: WHISPER_MODEL was the CPU model
+        ({}, "small"),
+    ],
+)
+def test_cpu_runs_use_the_cpu_model(backend, monkeypatch, env, expected):
+    backend.cuda_devices = 0
+    for name, value in env.items():
+        monkeypatch.setenv(name, value)
+    cfg = whisper_runtime.resolve_whisper_config()
+    assert (cfg["device"], cfg["model_size"]) == ("cpu", expected)
+
+
+def test_gpu_fallback_never_takes_the_gpu_sized_model(backend, monkeypatch):
+    monkeypatch.setenv("WHISPER_MODEL", "large-v3")
+    backend.load_error["cuda"] = RuntimeError("CUDA failed with error out of memory")
+    (_segments, _info, cfg), _events = _run()
+    assert (cfg["device"], cfg["model_size"]) == ("cpu", "small")
+
+
+def test_stale_or_foreign_gpu_marker_is_ignored(backend, tmp_path, monkeypatch):
+    import json
+    import time
+
+    marker = tmp_path / whisper_runtime.GPU_DISABLED_MARKER
+    marker.write_text(json.dumps({"reason": "old", "ctranslate2": "", "at": time.time() - 7 * 3600}))
+    assert whisper_runtime.resolve_whisper_config()["device"] == "cuda"
+    marker.write_text(json.dumps({"reason": "other build", "ctranslate2": "0.0.1", "at": time.time()}))
+    assert whisper_runtime.resolve_whisper_config()["device"] == "cuda"
+    marker.write_text("not json")
+    assert whisper_runtime.resolve_whisper_config()["device"] == "cuda"
+
+
+def test_lock_without_file_system_support_runs_ungated(monkeypatch, tmp_path):
+    import errno
+
+    def no_lock_support(_descriptor):
+        raise OSError(errno.EINVAL, "Invalid argument")
+
+    monkeypatch.setattr(whisper_runtime, "_try_lock", no_lock_support)
+    with whisper_runtime.gpu_slot("t", slots=1, wait_seconds=30, lock_dir=str(tmp_path), poll=0.01) as acquired:
+        assert acquired is True
+
+
+@pytest.mark.parametrize("code,busy", [("EACCES", True), ("EAGAIN", True), ("EINVAL", False), ("ENOLCK", False)])
+def test_try_lock_only_reports_busy_for_contention(monkeypatch, code, busy):
+    import errno
+    import os
+
+    def failing(*_args):
+        raise OSError(getattr(errno, code), code)
+
+    if os.name == "nt":
+        monkeypatch.setattr(whisper_runtime.msvcrt, "locking", failing)
+    else:
+        monkeypatch.setattr(whisper_runtime.fcntl, "flock", failing)
+    if busy:
+        assert whisper_runtime._try_lock(0) is False
+    else:
+        with pytest.raises(OSError):
+            whisper_runtime._try_lock(0)
+
+
+def test_bad_slot_settings_fall_back_to_defaults(monkeypatch):
+    monkeypatch.setenv("WHISPER_GPU_SLOTS", "1.5")
+    monkeypatch.setenv("WHISPER_GPU_WAIT_SECONDS", "15m")
+    slot = whisper_runtime.gpu_slot("t")
+    assert (slot.slots, slot.wait_seconds) == (1, 900.0)
+
+
+def test_busy_slot_falls_back_and_records_the_wait(backend, monkeypatch, tmp_path):
+    waits = []
+    holder = whisper_runtime.gpu_slot("whisper", slots=1, wait_seconds=1, lock_dir=str(tmp_path))
+    monkeypatch.setenv("WHISPER_GPU_WAIT_SECONDS", "0")
+    with holder:
+        (_segments, _info, cfg), _events = _run(on_wait=waits.append)
+    assert cfg["device"] == "cpu"
+    assert whisper_runtime.LAST_RUN["fell_back"] is True
+    assert "gpu_wait_seconds" in whisper_runtime.LAST_RUN

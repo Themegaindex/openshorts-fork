@@ -7,7 +7,9 @@ error texts, a CPU-sized fallback model and explicit VRAM release.
 
 Stdlib-only at import time: CI has neither ctranslate2 nor faster-whisper.
 """
+import errno
 import gc
+import json
 import os
 import time
 
@@ -42,8 +44,21 @@ _DOWNLOAD_SIZE = {
     "medium": "~1.5 GB", "large-v3": "~3 GB",
 }
 LOCK_DIR = os.path.join(os.path.dirname(os.path.abspath(__file__)), "output")
+# Every job is its own process, so a permanent GPU failure is also written to
+# a marker file; later jobs skip the doomed GPU attempt until it expires.
+GPU_DISABLED_MARKER = ".whisper-gpu-disabled.json"
+GPU_DISABLED_TTL_SECONDS = 6 * 3600
+# Files a complete CTranslate2 Whisper model folder always has.
+_MODEL_FILES = ("model.bin", "config.json")
+# Lock errors that mean "someone else holds the slot". Any other errno (a file
+# system without byte-range locks) must not look like a busy GPU.
+_BUSY_ERRNOS = {
+    errno.EACCES, errno.EAGAIN, errno.EWOULDBLOCK,
+    getattr(errno, "EDEADLK", -1), getattr(errno, "EDEADLOCK", -1),
+}
 
 _gpu_disabled_reason = None   # permanent GPU failure seen in this process
+_announced_disabled = None    # last "GPU is off" reason printed in this process
 LAST_RUN = {}                 # device/model/fell_back of the last run (logs, calibration)
 
 
@@ -53,6 +68,55 @@ class GpuTranscriptionError(Exception):
 
 def _env(name, default=""):
     return (os.environ.get(name) or default).strip()
+
+
+def _env_number(name, default, cast):
+    raw = _env(name)
+    if not raw:
+        return default
+    try:
+        return cast(raw)
+    except ValueError:
+        print(f"⚠️ {name}={raw!r} is not a number, using {default}")
+        return default
+
+
+def _ctranslate2_version():
+    try:
+        import ctranslate2
+        return str(getattr(ctranslate2, "__version__", ""))
+    except Exception:
+        return ""
+
+
+def _marker_path():
+    return os.path.join(LOCK_DIR, GPU_DISABLED_MARKER)
+
+
+def _persisted_gpu_failure():
+    """Reason from a fresh marker of an earlier job, else None.
+
+    A marker older than GPU_DISABLED_TTL_SECONDS or written by another
+    CTranslate2 version is ignored, so a fixed driver or cuBLAS gets probed
+    again. Delete the file to retry at once."""
+    try:
+        with open(_marker_path(), encoding="utf-8") as handle:
+            marker = json.load(handle)
+        age = time.time() - float(marker.get("at", 0))
+        if 0 <= age < GPU_DISABLED_TTL_SECONDS and marker.get("ctranslate2") == _ctranslate2_version():
+            return str(marker.get("reason") or "GPU disabled by an earlier job")
+    except (OSError, ValueError, TypeError, AttributeError):
+        pass
+    return None
+
+
+def _persist_gpu_failure(reason):
+    try:
+        os.makedirs(LOCK_DIR, exist_ok=True)
+        with open(_marker_path(), "w", encoding="utf-8") as handle:
+            json.dump({"reason": reason, "ctranslate2": _ctranslate2_version(), "at": time.time()}, handle)
+    except OSError:
+        pass
 
 
 def _cuda_device_count():
@@ -81,10 +145,23 @@ def resolve_whisper_config():
     device = requested if requested != "auto" else (
         "cuda" if _cuda_device_count() > 0 else "cpu"
     )
-    base = {"cpu_model": _env("WHISPER_CPU_MODEL", DEFAULT_CPU_MODEL), "requested_device": requested}
-    if device == "cuda" and _gpu_disabled_reason:
-        return cpu_config(base)
-    model = _env("WHISPER_MODEL") or (DEFAULT_GPU_MODEL if device == "cuda" else DEFAULT_CPU_MODEL)
+    # The GPU-failure fallback always takes a CPU-sized model. A plain CPU run
+    # prefers WHISPER_CPU_MODEL; a WHISPER_MODEL from an older .env (where it
+    # was the CPU model) still applies when no CPU model is set.
+    fallback_model = _env("WHISPER_CPU_MODEL") or DEFAULT_CPU_MODEL
+    base = {"cpu_model": fallback_model, "requested_device": requested}
+    if device == "cuda":
+        disabled = _gpu_disabled_reason or _persisted_gpu_failure()
+        if disabled:
+            global _announced_disabled
+            if disabled != _announced_disabled:
+                _announced_disabled = disabled
+                print(f"ℹ️ GPU transcription is off ({disabled}); using the CPU. "
+                      f"Delete output/{GPU_DISABLED_MARKER} to retry the GPU now.")
+            return cpu_config(base)
+        model = _env("WHISPER_MODEL") or DEFAULT_GPU_MODEL
+    else:
+        model = _env("WHISPER_CPU_MODEL") or _env("WHISPER_MODEL") or DEFAULT_CPU_MODEL
     compute = _env("WHISPER_COMPUTE")
     supported = _supported_compute_types(device)
     if device == "cuda":
@@ -115,6 +192,7 @@ def _note_gpu_failure(exc):
     text = describe_error(exc).lower()
     if any(marker in text for marker in _PERMANENT_GPU_MARKERS):
         _gpu_disabled_reason = describe_error(exc)
+        _persist_gpu_failure(_gpu_disabled_reason)
 
 
 def _batch_size():
@@ -124,15 +202,23 @@ def _batch_size():
         return 0
 
 
-def ensure_model(name, on_status=None):
-    """Local path of a CTranslate2 Whisper model; downloads it on first use."""
+def ensure_model(name, on_status=None, report=None):
+    """Local path of a CTranslate2 Whisper model; downloads it on first use.
+
+    A cached snapshot counts only when it is complete: an interrupted first
+    download leaves the folder without model.bin, and only the online call
+    resumes it. report["downloaded"] is set when the network was used."""
     if os.path.isdir(name):
         return name
     from faster_whisper.utils import download_model
     try:
-        return download_model(name, local_files_only=True)
+        path = download_model(name, local_files_only=True)
+        if all(os.path.isfile(os.path.join(path, file)) for file in _MODEL_FILES):
+            return path
     except Exception:
         pass
+    if report is not None:
+        report["downloaded"] = True
     if on_status:
         on_status(
             f"Downloading Whisper model {name} "
@@ -142,6 +228,8 @@ def ensure_model(name, on_status=None):
 
 
 def _try_lock(descriptor):
+    """True when locked, False when another holder has it. Other lock errors
+    (no lock support on this file system) raise OSError."""
     try:
         if os.name == "nt":
             os.lseek(descriptor, 0, os.SEEK_SET)
@@ -149,8 +237,10 @@ def _try_lock(descriptor):
         else:
             fcntl.flock(descriptor, fcntl.LOCK_EX | fcntl.LOCK_NB)
         return True
-    except OSError:
-        return False
+    except OSError as exc:
+        if exc.errno in _BUSY_ERRNOS:
+            return False
+        raise
 
 
 class gpu_slot:
@@ -165,9 +255,9 @@ class gpu_slot:
 
     def __init__(self, name, slots=None, wait_seconds=None, lock_dir=None, on_wait=None, poll=1.0):
         self.name = name
-        self.slots = int(_env("WHISPER_GPU_SLOTS", "1")) if slots is None else int(slots)
+        self.slots = _env_number("WHISPER_GPU_SLOTS", 1, int) if slots is None else int(slots)
         self.wait_seconds = (
-            float(_env("WHISPER_GPU_WAIT_SECONDS", "900")) if wait_seconds is None else float(wait_seconds)
+            _env_number("WHISPER_GPU_WAIT_SECONDS", 900.0, float) if wait_seconds is None else float(wait_seconds)
         )
         self.lock_dir = lock_dir or LOCK_DIR
         self.on_wait = on_wait
@@ -192,7 +282,12 @@ class gpu_slot:
                     descriptor = os.open(path, os.O_CREAT | os.O_RDWR)
                 except OSError:
                     return True
-                if _try_lock(descriptor):
+                try:
+                    locked = _try_lock(descriptor)
+                except OSError:
+                    os.close(descriptor)
+                    return True                  # no lock support: degrade to ungated
+                if locked:
                     self._descriptor = descriptor
                     self.waited_seconds = time.monotonic() - started
                     return True
@@ -289,37 +384,49 @@ def _attempt(media_path, params, cfg, on_segment, on_status, log):
         model = None
 
 
-def run_whisper(media_path, params, *, on_segment=None, on_restart=None, on_status=None, log=print):
+def run_whisper(media_path, params, *, on_segment=None, on_restart=None, on_status=None,
+                on_wait=None, log=print):
     """Transcribe media_path; returns (segments, info, cfg_used).
 
     A GPU failure at load time, in transcribe() or while iterating discards
     the partial result, frees the VRAM and restarts once from the beginning
-    on the CPU with WHISPER_CPU_MODEL.
+    on the CPU with WHISPER_CPU_MODEL. on_wait(seconds_left) is called while
+    another job holds the GPU (default: an on_status message).
+    LAST_RUN records gpu_wait_seconds and model_downloaded: that time is not
+    transcription speed.
     """
     cfg = resolve_whisper_config()
     if cfg["device"] != "cuda":
         return _attempt(media_path, params, cfg, on_segment, on_status, log)
     reason = None
     model_path = None
+    download = {}
     try:
-        model_path = ensure_model(cfg["model_size"], on_status)   # outside the GPU slot
+        model_path = ensure_model(cfg["model_size"], on_status, report=download)   # outside the GPU slot
     except Exception as exc:
         reason = f"model download failed ({describe_error(exc)})"
+    slot = None
     if reason is None:
         def waiting(seconds_left):
-            if on_status:
+            if on_wait:
+                on_wait(seconds_left)
+            elif on_status:
                 on_status(
                     "Waiting for the GPU: another transcription is running "
                     f"(CPU fallback in {seconds_left}s)"
                 )
 
-        with gpu_slot("whisper", on_wait=waiting) as acquired:
+        slot = gpu_slot("whisper", on_wait=waiting)
+        with slot as acquired:
             if acquired:
                 try:
-                    return _attempt(
+                    result = _attempt(
                         media_path, params, {**cfg, "model_path": model_path},
                         on_segment, on_status, log,
                     )
+                    LAST_RUN.update(gpu_wait_seconds=slot.waited_seconds,
+                                    model_downloaded=bool(download.get("downloaded")))
+                    return result
                 except GpuTranscriptionError as failure:
                     reason = str(failure)
             else:
@@ -332,5 +439,7 @@ def run_whisper(media_path, params, *, on_segment=None, on_restart=None, on_stat
     if on_restart:
         on_restart(reason, fallback)
     result = _attempt(media_path, params, fallback, on_segment, on_status, log)
-    LAST_RUN.update(fell_back=True, fallback_reason=reason)
+    LAST_RUN.update(fell_back=True, fallback_reason=reason,
+                    gpu_wait_seconds=slot.waited_seconds if slot else 0.0,
+                    model_downloaded=bool(download.get("downloaded")))
     return result

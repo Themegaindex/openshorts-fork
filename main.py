@@ -2777,6 +2777,36 @@ def process_video_to_vertical(input_video, final_output_video, progress_callback
     
     return True
 
+WHISPER_MODEL_DOWNLOAD_TIMEOUT_SECONDS = 4 * 3600
+
+
+def _prefetch_whisper_model(reporter, model_size):
+    """Download the GPU Whisper model under its own deadline.
+
+    The first run fetches ~1.6 GB without progress events; on a slow link
+    that alone can outlast the transcription deadline. A failure is left to
+    run_whisper, which reports it and transcribes on the CPU.
+    """
+    download = {}
+    try:
+        with reporter.operation(
+            "whisper model download",
+            timeout_seconds=WHISPER_MODEL_DOWNLOAD_TIMEOUT_SECONDS,
+            message=f"Checking the Whisper model {model_size}...",
+            category="transcribe",
+        ):
+            whisper_runtime.ensure_model(
+                model_size,
+                on_status=lambda message: reporter.heartbeat(message, force=True, category="transcribe"),
+                report=download,
+            )
+    except Exception as exc:
+        print(f"   ⚠️ Whisper model download failed ({exc}); transcription will fall back to the CPU.")
+    if download.get("downloaded"):
+        excluded = set(getattr(reporter, "stats_excluded_phases", ()) or ())
+        reporter.stats_excluded_phases = excluded | {"transcribe"}
+
+
 def transcribe_video(video_path, video_duration=None):
     print("🎙️  Transcribing video with Faster-Whisper...")
     from subtitles import WHISPER_TRANSCRIBE_PARAMS, merge_continuation_words
@@ -2798,10 +2828,13 @@ def transcribe_video(video_path, video_duration=None):
             state["last_emit"] = time.time()
             state["last_bucket"] = bucket
 
-    def on_restart(reason, cpu_cfg):
-        # A mixed GPU+CPU duration must never be learned as a GPU or CPU rate.
+    def exclude_from_stats():
         excluded = set(getattr(JOB_REPORTER, "stats_excluded_phases", ()) or ())
         JOB_REPORTER.stats_excluded_phases = excluded | {"transcribe"}
+
+    def on_restart(reason, cpu_cfg):
+        # A mixed GPU+CPU duration must never be learned as a GPU or CPU rate.
+        exclude_from_stats()
         JOB_REPORTER.warning(
             f"GPU transcription failed ({reason}). Restarting on CPU with Whisper "
             f"{cpu_cfg['model_size']}; this takes longer.",
@@ -2819,13 +2852,27 @@ def transcribe_video(video_path, video_duration=None):
         if heartbeat:
             heartbeat(message, force=True, category="transcribe")
 
+    def on_wait(seconds_left):
+        # The slot wait is bounded by WHISPER_GPU_WAIT_SECONDS, so it is
+        # progress for the stall monitor, not a frozen transcription.
+        message = f"Waiting for the GPU: another transcription is running (CPU fallback in {seconds_left}s)"
+        print(f"   {message}")
+        heartbeat = getattr(JOB_REPORTER, "heartbeat", None)
+        if heartbeat:
+            heartbeat(message, force=True, counts_as_work=True, category="transcribe")
+
     segments, info, _cfg = whisper_runtime.run_whisper(
         video_path,
         WHISPER_TRANSCRIBE_PARAMS,
         on_segment=on_segment,
         on_restart=on_restart,
         on_status=on_status,
+        on_wait=on_wait,
     )
+    last_run = whisper_runtime.LAST_RUN
+    if last_run.get("model_downloaded") or float(last_run.get("gpu_wait_seconds") or 0) > 5.0:
+        # Download and slot-wait time are not transcription speed.
+        exclude_from_stats()
 
     print(f"   Detected language '{info.language}' with probability {info.language_probability:.2f}")
 
@@ -5416,6 +5463,9 @@ if __name__ == '__main__':
     script_start_time = time.time()
     reporter = JobReporter(job_id=args.job_id)
     set_job_reporter(reporter)
+    # The total ETA already counts transcription while the source downloads,
+    # so it needs the GPU or CPU history from the start.
+    reporter.phase_cost_variant["transcribe"] = whisper_runtime.resolve_whisper_config()["device"]
     _start_keepalive()
     _prevent_windows_sleep()
 
@@ -5547,8 +5597,11 @@ if __name__ == '__main__':
         else:
             if not transcript or args.resume_phase == "transcribe":
                 # Pick the ETA history of the device that will transcribe.
-                reporter.phase_cost_variant["transcribe"] = whisper_runtime.resolve_whisper_config()["device"]
+                whisper_cfg = whisper_runtime.resolve_whisper_config()
+                reporter.phase_cost_variant["transcribe"] = whisper_cfg["device"]
                 reporter.set_phase("transcribe", "Transcribing audio", message="Starting transcription...")
+                if whisper_cfg["device"] == "cuda":
+                    _prefetch_whisper_model(reporter, whisper_cfg["model_size"])
                 with reporter.operation(
                     "transcription",
                     timeout_seconds=max(BLOCKING_OPERATION_STALL_SECONDS, int(duration * 2.0)),
