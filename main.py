@@ -74,7 +74,9 @@ from render_planning import (
     smooth_scene_strategies,
     split_crop_windows,
 )
-from speaker_tracking import FallbackThrottle, SpeakerTracker, TargetState, effective_detect_stride
+from speaker_tracking import (
+    FallbackThrottle, SpeakerTracker, TargetState, effective_detect_stride, person_fallback_due,
+)
 from video_formats import (
     CANONICAL_OUTPUT_FORMATS,
     EVEN_PAD_FILTER,
@@ -2643,7 +2645,7 @@ def process_video_to_vertical(input_video, final_output_video, progress_callback
                         scene_had_target = True
                     elif (
                         target_decision.state == TargetState.LOST
-                        and yolo_throttle.should_run(timestamp_seconds)
+                        and person_fallback_due(speaker_tracker, yolo_throttle, timestamp_seconds)
                     ):
                         # LOST means the previous subject is genuinely gone.
                         # HOLD intentionally does nothing and can never reach

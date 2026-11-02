@@ -304,3 +304,17 @@ class FallbackThrottle:
             self.last_run_at = now
             return True
         return False
+
+
+def person_fallback_due(tracker, throttle, timestamp_seconds):
+    """Gate for the YOLO person fallback while the tracker is LOST.
+
+    A candidate under confirmation is checked on every detection tick:
+    consider_person_fallback's 10%-of-width consistency radius applies per
+    observation, so spacing observations out would stop it from ever
+    confirming a walking subject. Only the search for a new person is
+    throttled.
+    """
+    if tracker.fallback_candidate_center is not None:
+        return True
+    return throttle.should_run(timestamp_seconds)
