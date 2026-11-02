@@ -1153,6 +1153,7 @@ def test_rotated_phone_clip_at_delivery_size_is_reencoded_upright(monkeypatch, t
 def test_transcription_wait_and_download_are_not_learned_as_speed(monkeypatch, last_run, excluded):
     reporter = _Reporter()
     monkeypatch.setattr(main, "JOB_REPORTER", reporter)
+    monkeypatch.setattr(main.whisper_runtime, "LAST_RUN", {})       # never leak into later tests
     info = SimpleNamespace(language="de", language_probability=0.99)
 
     def fake_run(*_args, **_kwargs):
@@ -2222,6 +2223,9 @@ def test_transcribe_video_keeps_transcript_contract(monkeypatch):
 
 def test_transcribe_video_gpu_fallback_resets_progress_and_excludes_stats(monkeypatch):
     reporter = _Reporter()
+    reporter.phase_cost_variant = {"transcribe": "cuda"}
+    pace_restarts = []
+    reporter.restart_phase_pace = lambda: pace_restarts.append(True)
     monkeypatch.setattr(main, "JOB_REPORTER", reporter)
 
     def fake_run_whisper(media_path, params, *, on_segment=None, on_restart=None, on_status=None,
@@ -2247,7 +2251,26 @@ def test_transcribe_video_gpu_fallback_resets_progress_and_excludes_stats(monkey
     later = [e for e in reporter.events[warning_index + 2:] if e[0] == "progress"]
     assert later[0][2]["message"].startswith("Transcribing audio on CPU...")
     assert "transcribe" in reporter.stats_excluded_phases
+    assert reporter.phase_cost_variant["transcribe"] == "cpu"
+    assert pace_restarts == [True]
 
+
+def test_restarted_phase_measures_its_pace_from_the_restart(monkeypatch, tmp_path):
+    monkeypatch.setattr(main, "JOB_STATS_PATH", str(tmp_path / "job_stats.json"))
+    clock = [1000.0]
+    monkeypatch.setattr(main.time, "time", lambda: clock[0])
+    reporter = main.JobReporter()
+    reporter.video_duration = 600.0
+    reporter.phase = "transcribe"
+    reporter.phase_started_at = reporter.phase_pace_started_at = clock[0]
+    clock[0] += 300.0                     # 5 minutes lost on the GPU
+    reporter.restart_phase_pace()
+    clock[0] += 60.0
+    reporter.phase_progress_percent = 50.0
+    remaining = reporter._estimate_phase_remaining()
+    # The CPU did half the work in 60 s; the failed GPU minutes must not
+    # make the rest look six times slower.
+    assert remaining < 200.0
 
 def test_gpu_transcribe_eta_uses_its_own_history_and_prior(monkeypatch, tmp_path):
     monkeypatch.setattr(main, "JOB_STATS_PATH", str(tmp_path / "job_stats.json"))
@@ -2304,6 +2327,8 @@ def test_longform_nvenc_failure_rerenders_all_segments_with_x264(monkeypatch, tm
         commands.append(command)
         if "h264_nvenc" in command and kwargs.get("label") == "Long-form segment 2":
             raise RuntimeError("Long-form segment 2 failed: OpenEncodeSessionEx failed")
+        with open(command[-1], "wb") as handle:        # a real encode writes the segment
+            handle.write(b"x" * 2048)
 
     monkeypatch.setattr(main, "_run_checked_ffmpeg", fake_ffmpeg)
 
@@ -2319,7 +2344,8 @@ def test_longform_nvenc_failure_rerenders_all_segments_with_x264(monkeypatch, tm
     main._render_longform_video(plan, "source.mp4", str(tmp_path), "Video", total_weight=90)
 
     encoders = ["nvenc" if "h264_nvenc" in c else "x264" if "libx264" in c else "copy" for c in commands]
-    assert encoders == ["nvenc", "nvenc", "x264", "x264", "x264", "copy"]
+    # Segment 2 is first re-tried alone with libx264, then every segment is redone.
+    assert encoders == ["nvenc", "nvenc", "x264", "x264", "x264", "x264", "copy"]
     assert any(e[0] == "warning" and "re-encoding every segment" in e[1][0] for e in reporter.events)
 
 
@@ -2376,6 +2402,61 @@ def test_longform_fallback_ignores_timed_out_inside_ffmpeg_text(monkeypatch, tmp
     render()
     assert ["libx264" in " ".join(c) for c in commands][:2] == [False, True]
     assert sizes == [(1920, 1080)]          # 640x480 goes on the 16:9 canvas
+
+
+def _segment_harness(monkeypatch, tmp_path, behaviour):
+    import video_encoding
+
+    commands, failures = [], []
+    monkeypatch.setattr(main, "JOB_REPORTER", _Reporter())
+    monkeypatch.setattr(main, "get_video_resolution", lambda _path: (1920, 1080))
+    nvenc = video_encoding.EncodeAttempt("nvenc", ("-c:v", "h264_nvenc", "-pix_fmt", "yuv420p"))
+    x264 = video_encoding.EncodeAttempt("x264", tuple(video_encoding._X264_ARGS[video_encoding.HIGH]))
+    monkeypatch.setattr(main.video_encoding, "encode_attempts", lambda *_a, **_k: [nvenc, x264])
+    monkeypatch.setattr(main.video_encoding, "note_nvenc_failure", failures.append)
+    monkeypatch.setattr(main.video_encoding, "note_nvenc_success", lambda: None)
+
+    def fake_ffmpeg(command, **kwargs):
+        commands.append((kwargs.get("label"), "nvenc" if "h264_nvenc" in command else "x264"))
+        behaviour(command, kwargs.get("label"))
+
+    monkeypatch.setattr(main, "_run_checked_ffmpeg", fake_ffmpeg)
+    monkeypatch.setattr(main, "_finalize_clip_passthrough", lambda _i, output, _p: Path(output).write_bytes(b"v") or True)
+    plan = {"total_duration": 90, "segments": [
+        {"start": 10, "end": 40}, {"start": 80, "end": 110}, {"start": 200, "end": 230},
+    ]}
+    return commands, failures, lambda: main._render_longform_video(
+        plan, "source.mp4", str(tmp_path), "Video", total_weight=90,
+    )
+
+
+def test_broken_segment_fails_fast_instead_of_reencoding_everything(monkeypatch, tmp_path):
+    def behaviour(command, label):
+        if label == "Long-form segment 2":
+            raise RuntimeError("Long-form segment 2 failed: No space left on device")
+        Path(command[-1]).write_bytes(b"x" * 2048)
+
+    commands, failures, render = _segment_harness(monkeypatch, tmp_path, behaviour)
+    with pytest.raises(RuntimeError, match="No space left"):
+        render()
+    assert commands == [
+        ("Long-form segment 1", "nvenc"), ("Long-form segment 2", "nvenc"), ("Long-form segment 2", "x264"),
+    ]
+    assert failures == []                      # not the GPU's fault
+
+
+def test_empty_nvenc_segment_falls_back_to_x264(monkeypatch, tmp_path):
+    def behaviour(command, _label):
+        if "h264_nvenc" in command:
+            Path(command[-1]).write_bytes(b"")  # exit 0, nothing written
+        else:
+            Path(command[-1]).write_bytes(b"x" * 2048)
+
+    commands, failures, render = _segment_harness(monkeypatch, tmp_path, behaviour)
+    render()
+    assert commands[0] == ("Long-form segment 1", "nvenc")
+    assert all(encoder == "x264" for label, encoder in commands[1:] if label and label.startswith("Long-form segment"))
+    assert len(failures) == 1
 
 
 def test_longform_real_timeout_is_not_retried(monkeypatch, tmp_path):

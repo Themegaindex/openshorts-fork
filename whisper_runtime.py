@@ -7,19 +7,17 @@ error texts, a CPU-sized fallback model and explicit VRAM release.
 
 Stdlib-only at import time: CI has neither ctranslate2 nor faster-whisper.
 """
-import errno
 import gc
 import json
 import os
 import time
 
+import advisory_lock
+
 if os.name == "nt":
-    import msvcrt
     # Windows without Developer Mode cannot symlink in the Hugging Face cache;
     # files are stored as copies and the warning is cosmetic.
     os.environ.setdefault("HF_HUB_DISABLE_SYMLINKS_WARNING", "1")
-else:
-    import fcntl
 
 DEFAULT_CPU_MODEL = "small"
 DEFAULT_GPU_MODEL = "large-v3-turbo"
@@ -56,15 +54,10 @@ GPU_DISABLED_MARKER = ".whisper-gpu-disabled.json"
 GPU_DISABLED_TTL_SECONDS = 6 * 3600
 # Files a complete CTranslate2 Whisper model folder always has.
 _MODEL_FILES = ("model.bin", "config.json")
-# Lock errors that mean "someone else holds the slot". Any other errno (a file
-# system without byte-range locks) must not look like a busy GPU.
-_BUSY_ERRNOS = {
-    errno.EACCES, errno.EAGAIN, errno.EWOULDBLOCK,
-    getattr(errno, "EDEADLK", -1), getattr(errno, "EDEADLOCK", -1),
-}
 
 _gpu_disabled_reason = None   # permanent GPU failure seen in this process
 _announced_disabled = None    # last "GPU is off" reason printed in this process
+_announced_cpu_sized = set()  # GPU-class models already reported as skipped on the CPU
 LAST_RUN = {}                 # device/model/fell_back of the last run (logs, calibration)
 
 
@@ -170,7 +163,7 @@ def resolve_whisper_config():
             return cpu_config(base)
         model = _env("WHISPER_MODEL") or DEFAULT_GPU_MODEL
     else:
-        model = _env("WHISPER_CPU_MODEL") or _env("WHISPER_MODEL") or DEFAULT_CPU_MODEL
+        model = _env("WHISPER_CPU_MODEL") or _cpu_sized(_env("WHISPER_MODEL"), requested) or DEFAULT_CPU_MODEL
     compute = _env("WHISPER_COMPUTE")
     supported = _supported_compute_types(device)
     if device == "cuda":
@@ -181,6 +174,22 @@ def resolve_whisper_config():
             print(f"⚠️ WHISPER_COMPUTE={compute} is not supported on CPU, using int8")
         compute = CPU_COMPUTE_TYPE
     return {**base, "model_size": model, "device": device, "compute_type": compute}
+
+
+def _cpu_sized(model, requested):
+    """WHISPER_MODEL for a CPU run, or "" when it is a GPU-class model.
+
+    With WHISPER_DEVICE=auto a large/turbo WHISPER_MODEL was chosen for the
+    GPU; when no GPU is visible it would run several times slower on the CPU.
+    An explicit WHISPER_DEVICE=cpu keeps whatever the user set."""
+    name = (model or "").lower()
+    if requested != "cpu" and ("large" in name or "turbo" in name):
+        if name not in _announced_cpu_sized:
+            _announced_cpu_sized.add(name)
+            print(f"ℹ️ No GPU for WHISPER_MODEL={model}; transcribing on the CPU with "
+                  f"{_env('WHISPER_CPU_MODEL') or DEFAULT_CPU_MODEL} (set WHISPER_CPU_MODEL to choose).")
+        return ""
+    return model
 
 
 def cpu_config(cfg):
@@ -239,22 +248,6 @@ def ensure_model(name, on_status=None, report=None, allow_download=True):
     return download_model(name)
 
 
-def _try_lock(descriptor):
-    """True when locked, False when another holder has it. Other lock errors
-    (no lock support on this file system) raise OSError."""
-    try:
-        if os.name == "nt":
-            os.lseek(descriptor, 0, os.SEEK_SET)
-            msvcrt.locking(descriptor, msvcrt.LK_NBLCK, 1)
-        else:
-            fcntl.flock(descriptor, fcntl.LOCK_EX | fcntl.LOCK_NB)
-        return True
-    except OSError as exc:
-        if exc.errno in _BUSY_ERRNOS:
-            return False
-        raise
-
-
 class gpu_slot:
     """`with gpu_slot("whisper") as acquired:` caps GPU work across processes.
 
@@ -295,7 +288,7 @@ class gpu_slot:
                 except OSError:
                     return True
                 try:
-                    locked = _try_lock(descriptor)
+                    locked = advisory_lock.try_lock(descriptor)
                 except OSError:
                     os.close(descriptor)
                     return True                  # no lock support: degrade to ungated
@@ -315,14 +308,7 @@ class gpu_slot:
 
     def __exit__(self, *_exc):
         if self._descriptor is not None:
-            try:
-                if os.name == "nt":
-                    os.lseek(self._descriptor, 0, os.SEEK_SET)
-                    msvcrt.locking(self._descriptor, msvcrt.LK_UNLCK, 1)
-                else:
-                    fcntl.flock(self._descriptor, fcntl.LOCK_UN)
-            except OSError:
-                pass
+            advisory_lock.unlock(self._descriptor)
             os.close(self._descriptor)
             self._descriptor = None
         return False
@@ -398,7 +384,8 @@ def _attempt(media_path, params, cfg, on_segment, on_status, log):
 
 
 def run_whisper(media_path, params, *, on_segment=None, on_restart=None, on_status=None,
-                on_wait=None, allow_gpu_download=True, log=print):
+                on_wait=None, allow_gpu_download=True, gpu_wait_seconds=None, cpu_model=None,
+                log=print):
     """Transcribe media_path; returns (segments, info, cfg_used).
 
     A GPU failure at load time, in transcribe() or while iterating discards
@@ -408,8 +395,14 @@ def run_whisper(media_path, params, *, on_segment=None, on_restart=None, on_stat
     LAST_RUN records gpu_wait_seconds and model_downloaded: that time is not
     transcription speed. allow_gpu_download=False sends a GPU run whose model
     is not cached straight to the CPU (the caller's download already failed).
+    gpu_wait_seconds caps the wait for a busy GPU (default WHISPER_GPU_WAIT_SECONDS);
+    cpu_model replaces the CPU model for this call (plain CPU run and fallback).
     """
     cfg = resolve_whisper_config()
+    if cpu_model:
+        cfg = {**cfg, "cpu_model": cpu_model}
+        if cfg["device"] == "cpu":
+            cfg = cpu_config(cfg)
     download = {}
     if cfg["device"] != "cuda":
         try:
@@ -438,7 +431,7 @@ def run_whisper(media_path, params, *, on_segment=None, on_restart=None, on_stat
                     f"(CPU fallback in {seconds_left}s)"
                 )
 
-        slot = gpu_slot("whisper", on_wait=waiting)
+        slot = gpu_slot("whisper", on_wait=waiting, wait_seconds=gpu_wait_seconds)
         with slot as acquired:
             if acquired:
                 try:

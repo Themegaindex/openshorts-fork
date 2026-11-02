@@ -104,6 +104,7 @@ class FramePrefetcher:
             self._queue.put(item)          # stay at the end for repeated calls
             return False, None
         if isinstance(item, BaseException):
+            self._queue.put(item)          # every later read() raises it too
             raise item
         return True, item
 

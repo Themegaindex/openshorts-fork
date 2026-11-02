@@ -1065,8 +1065,12 @@ def transcribe_audio_for_subs(audio_path: str) -> list:
 
     print(f"[SaaSShorts] 🎙️ Transcribing audio for subtitles...")
     # Shared runtime: GPU when available, clean CPU fallback. Narration is
-    # short TTS audio, so only word timestamps are needed (no VAD).
-    segments, _info, _cfg = whisper_runtime.run_whisper(audio_path, {"word_timestamps": True})
+    # short TTS audio, so only word timestamps are needed (no VAD). It never
+    # queues behind a long job's GPU transcription, and on the CPU it keeps
+    # the fast "base" model it always used.
+    segments, _info, _cfg = whisper_runtime.run_whisper(
+        audio_path, {"word_timestamps": True}, gpu_wait_seconds=5, cpu_model="base",
+    )
 
     words = []
     for segment in segments:

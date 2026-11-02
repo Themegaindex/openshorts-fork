@@ -780,3 +780,55 @@ def test_detail_clip_spanning_two_overlapping_windows_is_kept(monkeypatch):
     kept = main._drop_clips_outside_windows(clips, windows, label="test")
     assert kept == [clips[0]]
     assert len(warnings) == 1
+
+
+@pytest.mark.skipif(
+    not (__import__("shutil").which("ffmpeg") and __import__("shutil").which("ffprobe")),
+    reason="needs ffmpeg and ffprobe",
+)
+def test_dead_gpu_encoder_rerenders_with_x264_and_reuses_the_scene_analysis(monkeypatch, tmp_path):
+    import subprocess
+
+    import video_encoding
+
+    source = tmp_path / "wide.mp4"
+    subprocess.run([
+        "ffmpeg", "-y", "-loglevel", "error",
+        "-f", "lavfi", "-i", "testsrc2=size=640x360:rate=25",
+        "-f", "lavfi", "-i", "sine=frequency=440:sample_rate=48000",
+        "-t", "2", "-c:v", "libx264", "-pix_fmt", "yuv420p", "-c:a", "aac", str(source),
+    ], check=True)
+    calls = {"detect": 0, "analyze": 0, "failures": []}
+    real_detect, real_analyze = main.detect_scenes, main.analyze_scenes_strategy
+
+    def counted_detect(*args, **kwargs):
+        calls["detect"] += 1
+        return real_detect(*args, **kwargs)
+
+    def counted_analyze(*args, **kwargs):
+        calls["analyze"] += 1
+        return real_analyze(*args, **kwargs)
+
+    real_attempts = video_encoding.encode_attempts
+
+    def attempts(tier, **kwargs):
+        if kwargs.get("encoder") == "x264":
+            return real_attempts(tier, **kwargs)
+        # A GPU encoder that dies at once: ffmpeg rejects the option.
+        return [video_encoding.EncodeAttempt("nvenc", ("-c:v", "libx264", "-no_such_option", "1"))]
+
+    monkeypatch.setattr(main, "detect_scenes", counted_detect)
+    monkeypatch.setattr(main, "analyze_scenes_strategy", counted_analyze)
+    monkeypatch.setattr(main.video_encoding, "encode_attempts", attempts)
+    monkeypatch.setattr(main.video_encoding, "note_nvenc_failure", calls["failures"].append)
+    monkeypatch.setattr(main, "WATERMARK_ENABLED", False)
+
+    output = tmp_path / "vertical.mp4"
+    assert main.process_video_to_vertical(str(source), str(output), layout_style="wide") is True
+    assert (calls["detect"], calls["analyze"]) == (1, 1)     # the CPU re-render reused them
+    assert len(calls["failures"]) == 1                        # counted once the CPU render worked
+    probe = subprocess.run(
+        ["ffprobe", "-v", "error", "-select_streams", "v:0", "-show_entries", "stream=width,height",
+         "-of", "csv=p=0", str(output)], capture_output=True, text=True, check=True,
+    )
+    assert probe.stdout.strip() == "1080,1920"

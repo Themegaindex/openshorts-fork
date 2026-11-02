@@ -1239,7 +1239,8 @@ def build_layer_command(video_path, output_path, subtitle_filter=None,
     # result keeps the same sharp core and clean glow gradients. Hook-only
     # renders retain the faster tier because they do not contain fine edges.
     if video_args is None:
-        video_args = video_encoding.video_encode_args(layer_encode_tier(subtitle_filter))
+        # Without run_encode there is no GPU fallback, so default to libx264.
+        video_args = video_encoding.video_encode_args(layer_encode_tier(subtitle_filter), encoder="x264")
 
     cmd.extend([
         '-c:a', 'copy', *video_args,
@@ -1278,10 +1279,6 @@ def burn_layers(video_path, output_path, subtitle_path=None, burn_opts=None,
         )
     except subprocess.CalledProcessError as exc:
         stderr_text = (exc.stderr or b"").decode(errors='replace')
-        _log(f"❌ FFmpeg Layer Error: {stderr_text}")
-        raise Exception(f"FFmpeg failed: {stderr_text}")
-    if getattr(result, "returncode", 0) not in (0, None):
-        stderr_text = (getattr(result, "stderr", b"") or b"").decode(errors='replace')
         _log(f"❌ FFmpeg Layer Error: {stderr_text}")
         raise Exception(f"FFmpeg failed: {stderr_text}")
 
