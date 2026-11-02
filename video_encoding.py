@@ -218,8 +218,8 @@ def encode_attempts(tier, *, source=None, gpu_frames=False, width=None, height=N
     return attempts + [EncodeAttempt("nvenc", nvenc), x264]
 
 
-def short_reason(value):
-    """Last meaningful line of an ffmpeg error, for logs and warnings."""
+def failure_text(value):
+    """Full error text of a failed encode (all of stderr for ffmpeg)."""
     if isinstance(value, subprocess.CalledProcessError):
         text = value.stderr or value.output or b""
         if not text:
@@ -230,7 +230,22 @@ def short_reason(value):
         text = value or ""
     if isinstance(text, bytes):
         text = text.decode("utf-8", errors="replace")
-    lines = [line.strip() for line in str(text).splitlines() if line.strip()]
+    return str(text)
+
+
+def short_reason(value):
+    """One meaningful line of an ffmpeg error, for logs and warnings.
+
+    Prefers the GPU/encoder line ('[h264_nvenc @ ...] OpenEncodeSessionEx
+    failed', 'No capable devices found') over ffmpeg's generic last line
+    ('Conversion failed!')."""
+    lines = [line.strip() for line in failure_text(value).splitlines() if line.strip()]
+    for line in reversed(lines):
+        lowered = line.lower()
+        if any(marker in line for marker in _DEVICE_MARKERS) or (
+            line.startswith("[") and ("nvenc" in lowered or "cuda" in lowered or "hwdevice" in lowered)
+        ):
+            return line[:200]
     return (lines[-1] if lines else "unknown error")[:200]
 
 
@@ -268,7 +283,7 @@ def run_encode(build_command, *, tier, label, output_path=None, source=None, gpu
             if attempt.input_args and source:
                 mark_source_cpu_decode(source)
             else:
-                note_nvenc_failure(reason)
+                note_nvenc_failure(failure_text(exc))
             _emit(warn, f"⚠️ {label}: {attempt.label} failed ({reason}); retrying with {attempts[index + 1].label}.")
             continue
         note_nvenc_success()
@@ -278,7 +293,9 @@ def run_encode(build_command, *, tier, label, output_path=None, source=None, gpu
 
 
 def note_nvenc_failure(reason):
-    """Count NVENC failures; after three (or a dead device) use libx264 for a while."""
+    """Count NVENC failures; after three (or a dead device) use libx264 for a while.
+
+    Pass the full ffmpeg stderr: the device marker is rarely the last line."""
     global _failures, _latched_until
     reason = str(reason or "")
     with _lock:
@@ -292,7 +309,7 @@ def note_nvenc_failure(reason):
     if trip:
         with _lock:
             _latched_until = time.monotonic() + LATCH_SECONDS
-        _warn_once(f"⚠️ NVENC disabled for {LATCH_SECONDS // 60} min in this process: {reason}")
+        _warn_once(f"⚠️ NVENC disabled for {LATCH_SECONDS // 60} min in this process: {short_reason(reason)}")
 
 
 def note_nvenc_success():

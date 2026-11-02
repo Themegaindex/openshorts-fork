@@ -2715,8 +2715,9 @@ def process_video_to_vertical(input_video, final_output_video, progress_callback
 
     if ffmpeg_process.returncode != 0 or encoder_died:
         if encode_attempt.encoder == "nvenc":
-            reason = video_encoding.short_reason(stderr_output or f"exit code {ffmpeg_process.returncode}")
-            video_encoding.note_nvenc_failure(reason)
+            failure = stderr_output or f"exit code {ffmpeg_process.returncode}"
+            reason = video_encoding.short_reason(failure)
+            video_encoding.note_nvenc_failure(failure)
             JOB_REPORTER.warning(
                 f"GPU encoder failed after {frame_number} frames ({reason}); "
                 "rendering the clip again with libx264.",
@@ -4137,6 +4138,12 @@ def _render_shorts_clips(
     """Render the legacy Shorts loop with optional combined-job weighting."""
     shorts = clips_data.get("shorts", [])
     total_clips = len(shorts)
+    # A cut keeps the source size; NVENC rejects frames wider or taller than
+    # 4096, and such a source must go straight to libx264.
+    try:
+        cut_width, cut_height = get_video_resolution(input_video)
+    except Exception:
+        cut_width = cut_height = None
     if not shorts:
         return 0.0
     clip_render_weights = [
@@ -4186,6 +4193,8 @@ def _render_shorts_clips(
                     output_path=clip_temp_path,
                     source=input_video,
                     gpu_frames=True,
+                    width=cut_width or None,
+                    height=cut_height or None,
                     warn=JOB_REPORTER.warning,
                     stdout=subprocess.DEVNULL,
                     stderr=subprocess.PIPE,
@@ -4458,7 +4467,14 @@ def _render_longform_video(
     # One encoder for every segment: the join stream-copies the video, and
     # mixed NVENC/libx264 segments (different SPS/PPS) would break the file.
     # A failure therefore re-encodes ALL segments with the next attempt.
-    attempts = video_encoding.encode_attempts(video_encoding.HIGH, source=input_video, gpu_frames=False)
+    # NVENC's size check needs the encoded size: the canvas when one is used.
+    encode_width, encode_height = (
+        (LONGFORM_CANVAS_WIDTH, LONGFORM_CANVAS_HEIGHT) if filter_complex else (source_width, source_height)
+    )
+    attempts = video_encoding.encode_attempts(
+        video_encoding.HIGH, source=input_video, gpu_frames=False,
+        width=encode_width or None, height=encode_height or None,
+    )
     for attempt_index, attempt in enumerate(attempts):
         completed = 0.0
         try:
@@ -4490,7 +4506,9 @@ def _render_longform_video(
                     _run_checked_ffmpeg(command, label=f"Long-form segment {index}")
                 completed += segment_duration
         except RuntimeError as exc:
-            if attempt_index == len(attempts) - 1 or "timed out" in str(exc):
+            # A file name or a CUDA message can contain "timed out"; only a real
+            # subprocess timeout must skip the remaining attempts.
+            if attempt_index == len(attempts) - 1 or isinstance(exc.__cause__, subprocess.TimeoutExpired):
                 raise
             if attempt.input_args:
                 video_encoding.mark_source_cpu_decode(input_video)

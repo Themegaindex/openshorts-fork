@@ -184,6 +184,39 @@ def test_device_error_reprobes_before_latching(gpu):
     assert ve.select_encoder() == "x264"
 
 
+_DEAD_GPU_STDERR = (
+    b"Input #0, mov,mp4 from 'in.mp4':\n"
+    b"[h264_nvenc @ 000001] No capable devices found\n"
+    b"[vost#0:0/h264_nvenc @ 000002] Error while opening encoder\n"
+    b"Conversion failed!\n"
+)
+
+
+def test_short_reason_prefers_the_gpu_line_over_ffmpegs_last_line():
+    error = subprocess.CalledProcessError(1, ["ffmpeg"], stderr=_DEAD_GPU_STDERR)
+    assert ve.short_reason(error) == "[vost#0:0/h264_nvenc @ 000002] Error while opening encoder"
+    assert ve.short_reason(b"plain\nConversion failed!\n") == "Conversion failed!"
+    assert "No capable devices found" in ve.failure_text(error)
+
+
+def test_run_encode_latches_at_once_when_the_gpu_died(gpu, tmp_path):
+    ve.nvenc_profile()
+    gpu["state"]["full"] = gpu["state"]["compat"] = False      # re-probe fails: device gone
+    out = tmp_path / "out.mp4"
+    calls = []
+
+    def runner(command, **_kwargs):
+        calls.append(command)
+        if "h264_nvenc" in command:
+            raise subprocess.CalledProcessError(1, command, stderr=_DEAD_GPU_STDERR)
+        out.write_bytes(b"x" * 5000)
+
+    ve.run_encode(lambda a: ["ffmpeg", *a.video_args, str(out)], tier=ve.HIGH, label="Cut",
+                  output_path=str(out), runner=runner, warn=lambda _m: None)
+    assert ["h264_nvenc" in c for c in calls] == [True, False]
+    assert ve.select_encoder() == "x264"
+
+
 def test_nvdec_attempt_chain_for_av1_source(gpu, monkeypatch):
     monkeypatch.setenv("VIDEO_HWDECODE", "auto")
     monkeypatch.setattr(ve, "_probe_source", lambda _p: {"codec": "av1", "pix_fmt": "yuv420p", "rotation": 0, "cpu_only": False})

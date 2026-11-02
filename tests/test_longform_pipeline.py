@@ -2252,3 +2252,74 @@ def test_longform_nvenc_failure_rerenders_all_segments_with_x264(monkeypatch, tm
     encoders = ["nvenc" if "h264_nvenc" in c else "x264" if "libx264" in c else "copy" for c in commands]
     assert encoders == ["nvenc", "nvenc", "x264", "x264", "x264", "copy"]
     assert any(e[0] == "warning" and "re-encoding every segment" in e[1][0] for e in reporter.events)
+
+
+def _longform_attempt_harness(monkeypatch, tmp_path, nvenc_error, sizes):
+    import subprocess
+    import video_encoding
+
+    commands = []
+    monkeypatch.setattr(main, "JOB_REPORTER", _Reporter())
+    monkeypatch.setattr(main, "get_video_resolution", lambda _path: (640, 480))
+    nvenc = video_encoding.EncodeAttempt("nvenc", ("-c:v", "h264_nvenc", "-pix_fmt", "yuv420p"))
+    x264 = video_encoding.EncodeAttempt("x264", tuple(video_encoding._X264_ARGS[video_encoding.HIGH]))
+
+    def attempts(*_args, **kwargs):
+        sizes.append((kwargs.get("width"), kwargs.get("height")))
+        return [nvenc, x264]
+
+    monkeypatch.setattr(main.video_encoding, "encode_attempts", attempts)
+    monkeypatch.setattr(main.video_encoding, "note_nvenc_failure", lambda _reason: None)
+
+    def fake_ffmpeg(command, **_kwargs):
+        commands.append(command)
+        if "h264_nvenc" in command:
+            raise nvenc_error(subprocess)
+
+    monkeypatch.setattr(main, "_run_checked_ffmpeg", fake_ffmpeg)
+
+    def finalize(_input, output, _progress):
+        with open(output, "wb") as handle:
+            handle.write(b"video")
+        return True
+
+    monkeypatch.setattr(main, "_finalize_clip_passthrough", finalize)
+    plan = {"total_duration": 30, "segments": [{"start": 10, "end": 40}]}
+    return commands, lambda: main._render_longform_video(
+        plan, "Server timed out.mp4", str(tmp_path), "Video", total_weight=30,
+    )
+
+
+def test_longform_fallback_ignores_timed_out_inside_ffmpeg_text(monkeypatch, tmp_path):
+    def failure(subprocess):
+        try:
+            raise subprocess.CalledProcessError(1, ["ffmpeg"])
+        except subprocess.CalledProcessError as exc:
+            try:
+                raise RuntimeError(
+                    "Long-form segment 1 failed: Input #0, from 'Server timed out.mp4': Conversion failed!"
+                ) from exc
+            except RuntimeError as wrapped:
+                return wrapped
+
+    sizes = []
+    commands, render = _longform_attempt_harness(monkeypatch, tmp_path, failure, sizes)
+    render()
+    assert ["libx264" in " ".join(c) for c in commands][:2] == [False, True]
+    assert sizes == [(1920, 1080)]          # 640x480 goes on the 16:9 canvas
+
+
+def test_longform_real_timeout_is_not_retried(monkeypatch, tmp_path):
+    def failure(subprocess):
+        try:
+            raise subprocess.TimeoutExpired(["ffmpeg"], 5)
+        except subprocess.TimeoutExpired as exc:
+            try:
+                raise RuntimeError("Long-form segment 1 timed out after 5s") from exc
+            except RuntimeError as wrapped:
+                return wrapped
+
+    commands, render = _longform_attempt_harness(monkeypatch, tmp_path, failure, [])
+    with pytest.raises(RuntimeError, match="timed out"):
+        render()
+    assert len(commands) == 1
