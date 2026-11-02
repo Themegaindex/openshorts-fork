@@ -97,7 +97,8 @@ def test_delivery_dimensions_custom_width_even_and_on_aspect(width, aspect, expe
 @pytest.mark.parametrize(
     "raw,expected",
     [(None, 1080), ("", 1080), ("1080", 1080), ("1440", 1440), ("1081", 1080),
-     ("0", 0), ("native", 0), ("-1", 0), ("abc", 1080), ("200", 360), ("99999", 2160)],
+     ("0", 0), ("native", 0), ("-1", 0), ("abc", 1080), ("200", 360), ("99999", 2160),
+     ("inf", 1080), ("1e400", 1080), ("-inf", 1080), ("nan", 1080)],
 )
 def test_delivery_width_env_parsing(monkeypatch, raw, expected):
     monkeypatch.delenv("SHORTS_DELIVERY_WIDTH", raising=False)

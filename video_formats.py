@@ -94,7 +94,7 @@ def delivery_width_from_env(raw=None):
         return 0
     try:
         value = int(float(text))
-    except ValueError:
+    except (ValueError, OverflowError):          # "abc", "nan", "inf", "1e400"
         return DEFAULT_DELIVERY_WIDTH
     if value <= 0:
         return 0

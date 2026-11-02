@@ -2266,6 +2266,12 @@ def _finalize_clip_passthrough(input_video, final_output_video, progress_callbac
     scale_filter = None
     if target_size:
         scale_filter = delivery_scale_filter(width, height, *target_size, upscale=SHORTS_UPSCALE_INTERPOLATION)
+        if not scale_filter and video_encoding.source_rotation(input_video):
+            # A rotated phone clip is already the right size on screen, but a
+            # stream copy keeps it coded 1920x1080 plus a rotation tag, and
+            # the hook layer sizes itself from the coded size. FFmpeg rotates
+            # the frames upright on any re-encode.
+            scale_filter = "setsar=1"
         if scale_filter:
             width, height = target_size
 

@@ -356,6 +356,12 @@ def _probe_source(path):
     return info
 
 
+def source_rotation(path):
+    """Display rotation of the first video stream in degrees (0-359), 0 if unknown."""
+    info = _probe_source(path)
+    return int((info or {}).get("rotation") or 0) % 360
+
+
 def nvdec_input_args(source, *, gpu_frames):
     """Input args that decode the source on the GPU, or [] when not eligible."""
     if os.environ.get("VIDEO_HWDECODE", "auto").strip().lower() in ("off", "0", "cpu", "false"):

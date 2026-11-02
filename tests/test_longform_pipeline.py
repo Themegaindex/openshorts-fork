@@ -1120,6 +1120,23 @@ def test_passthrough_scale_only_reencodes_and_exact_size_stays_copy(monkeypatch,
     assert commands[-1] == copy_command
 
 
+def test_rotated_phone_clip_at_delivery_size_is_reencoded_upright(monkeypatch, tmp_path):
+    commands = []
+    monkeypatch.setattr(main, "JOB_REPORTER", _Reporter())
+    monkeypatch.setattr(main, "WATERMARK_ENABLED", False)
+    monkeypatch.setattr(main, "get_video_resolution", lambda _path: (1080, 1920))   # display size
+    monkeypatch.setattr(main.video_encoding, "source_rotation", lambda _path: 90)
+    monkeypatch.setattr(main.subprocess, "run", lambda command, **_kwargs: commands.append(command))
+    src, out = str(tmp_path / "phone.mp4"), str(tmp_path / "out.mp4")
+
+    assert main._finalize_clip_passthrough(src, out, target_size=(1080, 1920)) is True
+    assert "-vf" in commands[-1] and "-c" not in commands[-1]
+    assert commands[-1][commands[-1].index("-vf") + 1].startswith("setsar=1,")
+    # The original format keeps the file untouched.
+    assert main._finalize_clip_passthrough(src, out) is True
+    assert commands[-1][commands[-1].index("-c") + 1] == "copy"
+
+
 @pytest.mark.parametrize(
     "last_run,excluded",
     [({"gpu_wait_seconds": 30.0}, True), ({"model_downloaded": True}, True),
