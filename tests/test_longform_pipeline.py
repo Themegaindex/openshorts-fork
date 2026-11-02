@@ -285,6 +285,71 @@ def test_youtube_refusal_detection_matches_transfer_blocks(message):
     assert main._is_youtube_refusal(RuntimeError(message)) is True
 
 
+def test_youtube_download_drops_browser_auth_on_transfer_fallback(monkeypatch, tmp_path):
+    monkeypatch.setattr(main, "JOB_REPORTER", _Reporter())
+    monkeypatch.setattr(main.time, "sleep", lambda _: None)
+    monkeypatch.setattr(main, "youtube_auth_attempts", lambda: [
+        ("browser-auth", {"cookiesfrombrowser": ("brave", None), "cookiefile": None}),
+        ("anonymous-fallback", {"cookiesfrombrowser": None, "cookiefile": None}),
+    ])
+    seen = []
+
+    class FakeYDL:
+        def __init__(self, opts):
+            self.opts = opts
+            seen.append(opts)
+
+        def __enter__(self):
+            return self
+
+        def __exit__(self, *args):
+            pass
+
+        def extract_info(self, url, download):
+            return {"title": "test_video", "formats": [{"height": 1080, "vcodec": "h264"}]}
+
+        def download(self, urls):
+            if self.opts.get("cookiesfrombrowser"):
+                raise RuntimeError("HTTP Error 403: Forbidden")
+            (tmp_path / "test_video.mp4").write_bytes(b"merged video")
+
+    monkeypatch.setattr(main.yt_dlp, "YoutubeDL", FakeYDL)
+    path, title = main.download_youtube_video("https://www.youtube.com/watch?v=test", str(tmp_path), resume=True)
+
+    assert Path(path).read_bytes() == b"merged video"
+    assert title == "test_video"
+    assert len(seen) == 3
+    assert seen[1]["cookiesfrombrowser"] == ("brave", None)
+    assert seen[2]["cookiesfrombrowser"] is None
+    assert seen[2]["cookiefile"] is None
+    assert seen[2]["overwrites"] is False
+
+
+def test_youtube_bot_check_surfaces_recovery_instead_of_ip_ban(monkeypatch, tmp_path):
+    monkeypatch.setattr(main, "JOB_REPORTER", _Reporter())
+    monkeypatch.setattr(main, "youtube_auth_attempts", lambda: [
+        ("anonymous-fallback", {"cookiesfrombrowser": None, "cookiefile": None}),
+    ])
+
+    class FakeYDL:
+        def __init__(self, opts):
+            pass
+
+        def __enter__(self):
+            return self
+
+        def __exit__(self, *args):
+            pass
+
+        def extract_info(self, *args, **kwargs):
+            raise RuntimeError("Sign in to confirm you're not a bot")
+
+    monkeypatch.setattr(main.yt_dlp, "YoutubeDL", FakeYDL)
+    with pytest.raises(main.YouTubeDownloadError, match="YouTube requires sign-in") as error:
+        main.download_youtube_video("https://www.youtube.com/watch?v=test", str(tmp_path))
+    assert "IP ban" not in str(error.value)
+
+
 @pytest.mark.parametrize("message", [
     "ERROR: [youtube] xY403abcDe: Video unavailable",
     "ERROR: Content too short (expected 12345 bytes and served 4291)",

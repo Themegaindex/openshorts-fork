@@ -15,6 +15,7 @@ import os
 import sys
 
 from dotenv import load_dotenv
+from youtube_download import open_youtube_dl, youtube_auth_attempts, youtube_base_options
 
 load_dotenv()
 
@@ -22,19 +23,6 @@ load_dotenv()
 # main.py. In particular, never auto-load a stale bgutil provider from the
 # host Python environment and probe its default localhost port.
 os.environ.setdefault("YTDLP_NO_PLUGINS", "1")
-
-
-def _find_cookies_path():
-    # Mirrors main.py's cookie discovery.
-    script_dir = os.path.dirname(os.path.abspath(__file__))
-    for candidate in [
-        os.path.join(script_dir, 'www.youtube.com_cookies.txt'),
-        os.path.join(script_dir, 'cookies.txt'),
-        '/app/cookies.txt',
-    ]:
-        if os.path.exists(candidate):
-            return candidate
-    return None
 
 
 def main() -> int:
@@ -61,27 +49,18 @@ def main() -> int:
             def error(self, msg):
                 warnings.append(str(msg))
 
-        cookies_path = _find_cookies_path()
         base_opts = {
             'quiet': True,
             'no_warnings': False,
             'logger': _CollectLogger(),
             'socket_timeout': 20,
             'retries': 2,
-            'nocheckcertificate': True,
-            'cachedir': False,
+            **youtube_base_options(),
         }
-        # yt-dlp's default player clients (tv_downgraded/web_safari with
-        # cookies, android_vr/web_safari anonymous) are the ones that still
-        # serve HD without PO tokens — never override them here.
-        attempts = []
-        if cookies_path:
-            attempts.append(("cookie-auth", {**base_opts, 'cookiefile': cookies_path}))
-        attempts.append(("anonymous", {**base_opts, 'cookiefile': None}))
-
-        for mode, opts in attempts:
+        for mode, auth_options in youtube_auth_attempts():
+            opts = {**base_opts, **auth_options}
             try:
-                with yt_dlp.YoutubeDL(opts) as ydl:
+                with open_youtube_dl(opts, yt_dlp.YoutubeDL) as ydl:
                     info = ydl.extract_info(args.url, download=False)
                 formats = info.get('formats') or []
                 heights = [

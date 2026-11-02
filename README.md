@@ -151,6 +151,29 @@ Im Browser **`http://localhost:5175`** aufrufen
 4. **YouTube Studio**: Thumbnails, Titel und Beschreibungen für YouTube generieren
 5. **UGC Gallery**: Alle generierten Videos und Avatare durchstöbern
 
+### YouTube fordert eine Anmeldung oder Bot-Bestätigung
+
+Öffne das Video im Browser, melde dich an und bestätige eine eventuell angezeigte
+Prüfung. Exportiere anschließend frische YouTube-Cookies im Netscape-Format nach
+`www.youtube.com_cookies.txt` im Projektordner. Die
+[yt-dlp-Anleitung](https://github.com/yt-dlp/yt-dlp/wiki/Extractors#exporting-youtube-cookies)
+beschreibt einen Export aus einer privaten Sitzung, deren Cookies anschließend
+nicht durch weitere Browser-Nutzung rotiert werden. Danach den fehlgeschlagenen
+Job erneut starten. Cookies gehören nicht in Git oder Support-Logs.
+
+Für einen anderen Dateipfad gibt es `YOUTUBE_COOKIES_FILE` in `.env`. Bei lokaler
+Ausführung kann alternativ `YOUTUBE_COOKIES_BROWSER=brave` (auch `firefox`,
+`chrome` oder `edge`) und optional `YOUTUBE_COOKIES_PROFILE=Default` gesetzt werden.
+Browser-Cookies werden nur bei dieser ausdrücklichen Konfiguration gelesen.
+Unter Windows muss der Browser dafür gegebenenfalls vollständig geschlossen sein.
+Meldet yt-dlp einen DPAPI-Entschlüsselungsfehler, verwende den Cookie-Export.
+Ein Docker-Backend kann die Browser-Cookies des Hosts nicht direkt lesen.
+
+Nach Änderungen an `.env` das Backend neu starten. Browser, Cookie-Datei und
+anonyme Sitzung werden getrennt versucht; eine Cookie-Datei wird beim Download
+nicht überschrieben. Bleibt YouTube gesperrt, kann eine vorhandene Videodatei
+über den Upload verarbeitet werden.
+
 ---
 
 ## Technische Pipeline

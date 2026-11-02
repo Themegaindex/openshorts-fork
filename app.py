@@ -1714,6 +1714,7 @@ async def run_job(job_id, job_data):
     output_dir = job_data['output_dir']
     execution_id = job_data.get("execution_id")
 
+    jobs[job_id]['error_summary'] = None
     _mark_job_status(job_id, 'processing', resumable=True)
     jobs[job_id]['phase'] = 'queued'
     jobs[job_id]['phase_label'] = 'Queued'
@@ -1841,7 +1842,8 @@ async def run_job(job_id, job_data):
                 _mark_job_status(job_id, 'failed', error_summary="No metadata file generated.", resumable=True)
                 _append_log(job_id, "No metadata file generated.", level="error", category="result", important=True)
         else:
-            _mark_job_status(job_id, 'failed', error_summary=f"Process failed with exit code {returncode}", resumable=True)
+            error_summary = jobs[job_id].get('error_summary') or f"Process failed with exit code {returncode}"
+            _mark_job_status(job_id, 'failed', error_summary=error_summary, resumable=True)
             _append_log(job_id, f"Process failed with exit code {returncode}", level="error", category="process", important=True)
 
     except Exception as e:

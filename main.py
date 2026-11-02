@@ -44,6 +44,10 @@ import json
 import shutil
 from typing import List, Optional
 import longform
+from youtube_download import (
+    YouTubeDownloadError, open_youtube_dl, youtube_auth_attempts,
+    youtube_base_options, youtube_failure_message,
+)
 
 # OS advisory file locks for the shared ETA history (_job_stats_file_lock):
 # msvcrt on Windows, flock everywhere else.
@@ -1935,102 +1939,27 @@ def download_youtube_video(url, output_dir=".", resume=False):
     step_start_time = time.time()
     download_progress_hook, download_postprocessor_hook = _make_ytdlp_progress_hooks()
 
-    # Look for cookies in the project directory (multiple common filenames)
-    _script_dir = os.path.dirname(os.path.abspath(__file__))
-    _cookie_candidates = [
-        os.path.join(_script_dir, 'www.youtube.com_cookies.txt'),
-        os.path.join(_script_dir, 'cookies.txt'),
-        '/app/cookies.txt',  # Docker fallback
-    ]
-    cookies_path = None
-    for _cp in _cookie_candidates:
-        if os.path.exists(_cp):
-            cookies_path = _cp
-            print(f"🍪 Found cookies file: {cookies_path}")
-            break
-
-    cookies_env = os.environ.get("YOUTUBE_COOKIES")
-    if cookies_env:
-        print("🍪 Found YOUTUBE_COOKIES env var, writing cookies file...")
-        if not cookies_path:
-            cookies_path = os.path.join(_script_dir, 'cookies.txt')
-        try:
-            with open(cookies_path, 'w') as f:
-                f.write(cookies_env)
-            if os.path.exists(cookies_path):
-                # Never echo cookie contents: stdout lands in the job log,
-                # the dashboard and persisted support logs.
-                print(f"   Cookies file created. Size: {os.path.getsize(cookies_path)} bytes")
-        except Exception as e:
-            print(f"⚠️ Failed to write cookies file: {e}")
-            cookies_path = None
-    else:
-        if not cookies_path:
-            print("⚠️ No cookies file found and YOUTUBE_COOKIES env var not set.")
-    
-    js_runtimes = None
-    if shutil.which('deno'):
-        js_runtimes = {'deno': {}}
-        print("🧠 Using Deno for yt-dlp JS challenges")
-    elif shutil.which('node'):
-        js_runtimes = {'node': {}}
-        print("🧠 Using Node.js for yt-dlp JS challenges")
-    else:
-        print("⚠️ No supported JS runtime found for yt-dlp (Deno/Node). Download quality may be limited.")
-
-    # yt-dlp options: adapt based on whether cookies are available
-    # WITH cookies: use 'web' client, DO NOT skip webpage (needed for cookie auth)
-    # WITHOUT cookies: use more reliable non-auth clients and skip webpage
-
-    # Do NOT override player_client: yt-dlp's curated defaults (tv_downgraded/
-    # web_safari with cookies, android_vr/web_safari anonymous) are exactly the
-    # clients that still serve HD without PO tokens. Our old hardcoded list
-    # (web_safari/ios/web/mweb/android) hit PO-token/SABR walls and silently
-    # degraded downloads to the token-free 360p format.
-    _extractor_args = {}
-    if cookies_path:
-        print("🔧 Using cookie-authenticated yt-dlp config (default clients)")
-    else:
-        print("🔧 Using anonymous yt-dlp config (default clients)")
-
+    # The pre-flight quality probe uses the same sessions and JS runtime.
+    auth_attempts = youtube_auth_attempts()
     _COMMON_YDL_OPTS = {
         'quiet': False,
         'verbose': True,
         'no_warnings': False,
-        'cookiefile': cookies_path if cookies_path else None,
         'socket_timeout': 30,
         'retries': 10,
         'fragment_retries': 10,
-        'nocheckcertificate': True,
-        'cachedir': False,
-        'extractor_args': _extractor_args,
-        'http_headers': {
-            'User-Agent': (
-                'Mozilla/5.0 (Windows NT 10.0; Win64; x64) '
-                'AppleWebKit/537.36 (KHTML, like Gecko) '
-                'Chrome/120.0.0.0 Safari/537.36'
-            ),
-        },
+        **youtube_base_options(),
         'progress_hooks': [download_progress_hook],
         'postprocessor_hooks': [download_postprocessor_hook],
     }
-    if js_runtimes:
-        _COMMON_YDL_OPTS['js_runtimes'] = js_runtimes
 
     # --- Smart retry: probe both configs and keep the one offering the best
     # --- quality. YouTube silently limits some clients/cookie states to the
     # --- muxed 360p format; without this check we'd process mush without warning.
     probe_results = []  # (attempt_name, attempt_opts, info, max_height)
-    last_error = None
-    for attempt_name, attempt_opts in [
-        ("cookie-auth", _COMMON_YDL_OPTS),
-        ("anonymous-fallback", {
-            **_COMMON_YDL_OPTS,
-            'cookiefile': None,
-            # Default clients here too (android_vr/web_safari) — see note above.
-            'extractor_args': {},
-        }),
-    ]:
+    errors = []
+    for attempt_name, auth_options in auth_attempts:
+        attempt_opts = {**_COMMON_YDL_OPTS, **auth_options}
         try:
             print(f"🔄 Trying download mode: {attempt_name}...")
             with JOB_REPORTER.operation(
@@ -2039,7 +1968,7 @@ def download_youtube_video(url, output_dir=".", resume=False):
                 message=f"Reading YouTube metadata ({attempt_name}).",
                 category="download",
             ):
-                with yt_dlp.YoutubeDL(attempt_opts) as ydl:
+                with open_youtube_dl(attempt_opts, yt_dlp.YoutubeDL) as ydl:
                     probe = ydl.extract_info(url, download=False)
             # Check if we actually got video formats (not just images/storyboards)
             formats = probe.get('formats') or []
@@ -2059,38 +1988,11 @@ def download_youtube_video(url, output_dir=".", resume=False):
                 break
             print(f"⚠️ {attempt_name}: best offered is only {max_height}p — probing next mode for higher quality...")
         except Exception as e:
-            last_error = e
-            print(f"⚠️ {attempt_name} failed: {e}")
+            errors.append(e)
+            print(f"⚠️ {attempt_name} failed: {youtube_failure_message([e])}")
 
     if not probe_results:
-        if last_error is not None:
-            print("🚨 YOUTUBE DOWNLOAD ERROR 🚨", file=sys.stderr)
-
-            error_msg = f"""
-
-❌ ================================================================= ❌
-❌ FATAL ERROR: YOUTUBE DOWNLOAD FAILED
-❌ ================================================================= ❌
-
-REASON: YouTube has blocked the download request (Error 429/Unavailable).
-        This is likely a temporary IP ban on this server.
-
-👇 SOLUTION FOR USER 👇
----------------------------------------------------------------------
-1. Download the video manually to your computer.
-2. Use the 'Upload Video' tab in this app to process it.
----------------------------------------------------------------------
-
-Technical Details: {str(last_error)}
-            """
-            print(error_msg, file=sys.stdout)
-            print(error_msg, file=sys.stderr)
-            sys.stdout.flush()
-            sys.stderr.flush()
-            time.sleep(0.5)
-            raise last_error
-        print("❌ All download modes failed. No video formats available.")
-        raise SystemExit(1)
+        raise YouTubeDownloadError(youtube_failure_message(errors)) from None
 
     attempt_name, attempt_opts, info, best_height = max(probe_results, key=lambda item: item[3])
     _COMMON_YDL_OPTS.update(attempt_opts)
@@ -2140,9 +2042,9 @@ Technical Details: {str(last_error)}
     download_attempts = [(_COMMON_YDL_OPTS, best_format, f"best available ({best_height}p)")]
     if best_height > 1080:
         download_attempts.append((_COMMON_YDL_OPTS, hd_format, "1080p"))
-    if _COMMON_YDL_OPTS.get('cookiefile'):
+    if _COMMON_YDL_OPTS.get('cookiefile') is not None or _COMMON_YDL_OPTS.get('cookiesfrombrowser'):
         download_attempts.append(
-            ({**_COMMON_YDL_OPTS, 'cookiefile': None}, hd_format, "1080p without cookies"))
+            ({**_COMMON_YDL_OPTS, 'cookiefile': None, 'cookiesfrombrowser': None}, hd_format, "1080p without cookies"))
 
     for index, (attempt_opts, format_spec, attempt_label) in enumerate(download_attempts):
         ydl_opts = {
@@ -2163,12 +2065,15 @@ Technical Details: {str(last_error)}
                 message=f"YouTube download worker started ({attempt_label}).",
                 category="download",
             ):
-                with yt_dlp.YoutubeDL(ydl_opts) as ydl:
+                with open_youtube_dl(ydl_opts, yt_dlp.YoutubeDL) as ydl:
                     ydl.download([url])
             break
         except Exception as e:
             is_last_attempt = index == len(download_attempts) - 1
             if is_last_attempt or not _is_youtube_refusal(e):
+                message = youtube_failure_message([e])
+                if message != str(e):
+                    raise YouTubeDownloadError(message) from None
                 raise
             next_label = download_attempts[index + 1][2]
             JOB_REPORTER.warning(
