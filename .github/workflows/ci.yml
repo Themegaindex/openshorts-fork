@@ -59,7 +59,22 @@ jobs:
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v6
+      # The backend image (PyTorch, OpenCV, MediaPipe) takes several GB; the
+      # private repository's run hit "No space left on device". Remove
+      # preinstalled toolchains this job never uses (it sets up no Python,
+      # Node or Go). Housekeeping must never fail the build itself.
+      - name: Free runner disk space
+        run: |
+          df -h /
+          sudo rm -rf /usr/share/dotnet /usr/local/lib/android /usr/local/.ghcup \
+            /opt/hostedtoolcache /usr/share/swift /opt/az || true
+          sudo docker image prune --all --force || true
+          df -h /
       - name: Build backend image
         run: docker build -t openshorts-backend .
+      - name: Reclaim build cache
+        run: |
+          docker builder prune --all --force || true
+          df -h /
       - name: Build dashboard image
         run: docker build -t openshorts-dashboard ./dashboard
