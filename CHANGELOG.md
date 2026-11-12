@@ -30,6 +30,12 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 
 ### Fixed
 
+- **Eigene Actor-Bilder werden nicht mehr nach 24 h gelöscht**: Das Aufräumen hielt `output/actor_uploads/` für einen alten Job.
+- **Browser hinter einem Reverse Proxy mit API-Token**: Der CORS-Vorabcheck (Preflight) bekam 401, weil ein Browser dort nie eigene Header mitschickt. Er wird jetzt vom CORS-Layer beantwortet; die Origin-Prüfung gilt weiter.
+- **Lange YouTube-Videos**: Die Downloadgrenze pro Datei ist mit `OPENSHORTS_MAX_DOWNLOAD_GB` einstellbar (Standard 2).
+- **Langes Einbrennen**: Die Zeitgrenze richtet sich nach der Videolänge (mindestens 30 min, sonst das Zehnfache der Laufzeit). Bei Überschreitung gibt es eine klare Fehlermeldung, und die halbe Ausgabedatei wird gelöscht.
+- **Website-Analyse bei komprimierten Seiten**: Gzip-Antworten werden entpackt; die 5-MB-Grenze gilt für die übertragenen und die entpackten Daten. Mediendownloads bleiben unkomprimiert.
+- **S3-Galerie**: Eine Liste mit fehlgeschlagenen Lesevorgängen wird nur noch 30 s statt 5 min zwischengespeichert, damit ein kurzer Fehler kein vorhandenes Video versteckt.
 - **Falscher Einzel-Zoom in langen Zwei-Personen-Interviews**: Wiederkehrende links/rechts stabile Personentreffer reichen jetzt auch dann für den Split, wenn YOLO eine Person in einzelnen Prüfbildern übersieht. Räumliche Ausreißer und doppelte Boxen derselben Person werden verworfen; ein unsicherer Langszenen-Zoom fällt sicher auf Weitwinkel zurück.
 - **Weiterlaufende Stoppuhr nach Job-Abschluss**: `elapsed_seconds` endet nun am gespeicherten Abschlusszeitpunkt. Auch ältere abgeschlossene Jobs werden anhand ihres letzten validierten Status eingefroren, statt bei jedem späteren Abruf weitere Minuten zu sammeln.
 - **Verlust kompletter Gemini-Analysepakete**: Leere, blockierte oder dauerhaft ungültige Paketantworten werden einmal pro enthaltenem Zeitfenster isoliert wiederholt. Dadurch bleiben alle unproblematischen Fenster erhalten; echte Blockierungs-/Finish-Gründe und verfügbare Kostenwerte werden im Antwortartefakt gespeichert. Auch ein unerwartetes erfolgreiches Worker-Ergebnis mit `payload: null` gilt jetzt nur als Ausfall dieses einzelnen Fensters, statt die gesamte Pipeline mit einem `AttributeError` abzubrechen.

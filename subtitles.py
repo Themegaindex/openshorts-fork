@@ -1,3 +1,4 @@
+import os
 import re
 import subprocess
 import sys
@@ -1393,6 +1394,31 @@ def build_layer_command(video_path, output_path, subtitle_filter=None,
     return cmd
 
 
+# A fixed 30 min limit failed 4K60 videos longer than ~25 min. The libx264
+# fallback needs ~5.5 s per second of 4K60, so allow 10x the duration.
+LAYER_BURN_MIN_TIMEOUT_SECONDS = 1800
+LAYER_BURN_TIMEOUT_PER_SECOND = 10
+
+
+def _media_duration_seconds(video_path):
+    """Container duration in seconds, or 0.0 when ffprobe cannot tell."""
+    try:
+        output = subprocess.run(
+            ["ffprobe", "-v", "error", "-show_entries", "format=duration",
+             "-of", "default=noprint_wrappers=1:nokey=1", video_path],
+            capture_output=True, text=True, timeout=30, check=True,
+        ).stdout
+        duration = float(output.strip().splitlines()[0])
+    except Exception:
+        return 0.0
+    return duration if 0 < duration < float("inf") else 0.0
+
+
+def _layer_burn_timeout(video_path):
+    return max(LAYER_BURN_MIN_TIMEOUT_SECONDS,
+               math.ceil(_media_duration_seconds(video_path) * LAYER_BURN_TIMEOUT_PER_SECOND))
+
+
 def burn_layers(video_path, output_path, subtitle_path=None, burn_opts=None,
                 hook_png=None, hook_x=0, hook_y=0, hook_entrance=False):
     """Render subtitles and/or a hook overlay onto video_path in one pass."""
@@ -1409,6 +1435,7 @@ def burn_layers(video_path, output_path, subtitle_path=None, burn_opts=None,
         _log(f"🎬 Burning layers (single pass): {' '.join(cmd)}")
         return cmd
 
+    timeout = _layer_burn_timeout(video_path)
     try:
         result = video_encoding.run_encode(
             _build,
@@ -1418,8 +1445,17 @@ def burn_layers(video_path, output_path, subtitle_path=None, burn_opts=None,
             warn=_log,
             stdout=subprocess.DEVNULL,
             stderr=subprocess.PIPE,
-            timeout=1800,
+            timeout=timeout,
         )
+    except subprocess.TimeoutExpired as exc:
+        # run_encode never retries a timeout. FFmpeg was killed mid-write, so
+        # the output is a broken MP4 that must not be served.
+        try:
+            os.remove(output_path)
+        except OSError:
+            pass
+        _log(f"❌ FFmpeg Layer Burn: timed out after {timeout} s")
+        raise Exception(f"FFmpeg layer burn timed out after {timeout} s") from exc
     except subprocess.CalledProcessError as exc:
         stderr_text = (exc.stderr or b"").decode(errors='replace')
         _log(f"❌ FFmpeg Layer Error: {stderr_text}")

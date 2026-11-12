@@ -201,6 +201,31 @@ def test_nvenc_layer_command_keeps_filters_and_flags():
     assert cmd[-3:] == ["-movflags", "+faststart", "out.mp4"]
 
 
+@pytest.mark.parametrize("duration, expected_timeout", [("2700.5", 27005), ("60", 1800), ("N/A", 1800)])
+def test_burn_timeout_scales_with_duration_and_fails_cleanly(
+        monkeypatch, tmp_path, duration, expected_timeout):
+    """A fixed 1800 s limit killed long 4K burns and leaked a raw TimeoutExpired."""
+    import subtitles
+
+    out = tmp_path / "out.mp4"
+    seen = {}
+
+    def fake_run(command, **kwargs):
+        if command[0] == "ffprobe":
+            return subprocess.CompletedProcess(command, 0, stdout=f"{duration}\n", stderr="")
+        seen["timeout"] = kwargs["timeout"]
+        out.write_bytes(b"half-written mp4")
+        raise subprocess.TimeoutExpired(command, kwargs["timeout"])
+
+    monkeypatch.setattr(subtitles.subprocess, "run", fake_run)
+    with pytest.raises(Exception, match="timed out after") as caught:
+        subtitles.burn_layers("in.mp4", str(out), hook_png="h.png")
+
+    assert not isinstance(caught.value, subprocess.TimeoutExpired)
+    assert seen["timeout"] == expected_timeout
+    assert not out.exists()  # a killed encode must not leave a broken file
+
+
 def test_burn_layers_falls_back_to_x264_when_nvenc_fails(monkeypatch, tmp_path):
     import subtitles
     import video_encoding
@@ -212,6 +237,8 @@ def test_burn_layers_falls_back_to_x264_when_nvenc_fails(monkeypatch, tmp_path):
     commands = []
 
     def fake_run(command, **_kwargs):
+        if command[0] == "ffprobe":  # duration probe for the burn timeout
+            return subprocess.CompletedProcess(command, 0, stdout="", stderr="")
         commands.append(command)
         if "h264_nvenc" in command:
             raise subprocess.CalledProcessError(1, command, stderr=b"OpenEncodeSessionEx failed")

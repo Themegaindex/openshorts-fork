@@ -38,6 +38,11 @@ class SecurityBoundaryMiddleware:
         headers = {key.lower(): value for key, value in scope.get("headers", [])}
         path = get_route_path(scope)
         protected = path.startswith(("/api", "/videos", "/thumbnails", "/docs", "/redoc", "/openapi"))
+        # A browser never sends custom headers on a CORS preflight, so it can
+        # not carry the token. CORSMiddleware answers it without reaching a
+        # route; the origin check below still applies.
+        preflight = (scope.get("method") == "OPTIONS" and b"origin" in headers
+                     and b"access-control-request-method" in headers)
         if protected:
             token = os.environ.get("OPENSHORTS_API_TOKEN", "")
             peer = (scope.get("client") or ("", 0))[0]
@@ -45,7 +50,9 @@ class SecurityBoundaryMiddleware:
                 local = ipaddress.ip_address(peer).is_loopback
             except ValueError:
                 local = False
-            if token:
+            if preflight:
+                pass
+            elif token:
                 supplied = headers.get(b"x-openshorts-token", b"")
                 if not hmac.compare_digest(supplied, token.encode("utf-8")):
                     return await JSONResponse({"detail": "Access token required"}, status_code=401)(scope, receive, send)

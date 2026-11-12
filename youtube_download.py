@@ -11,13 +11,28 @@ class YouTubeDownloadError(RuntimeError):
     """An actionable download failure, safe to show in the job summary."""
 
 
-# yt-dlp skips a format above this size without raising. Callers must check
-# that a complete video file actually exists after ydl.download().
-MAX_DOWNLOAD_BYTES = 2 * 1024 * 1024 * 1024
+DEFAULT_MAX_DOWNLOAD_GB = 2.0
+
+
+def max_download_bytes():
+    """Per-file download limit from OPENSHORTS_MAX_DOWNLOAD_GB (default 2 GB).
+
+    yt-dlp skips a format above this size without raising. Callers must check
+    that a complete video file actually exists after ydl.download(). Read at
+    call time: main.py loads .env only after importing this module.
+    """
+    raw = os.environ.get("OPENSHORTS_MAX_DOWNLOAD_GB", "").strip()
+    try:
+        gigabytes = float(raw) if raw else DEFAULT_MAX_DOWNLOAD_GB
+    except ValueError:
+        gigabytes = DEFAULT_MAX_DOWNLOAD_GB
+    if not 0 < gigabytes < float("inf"):
+        gigabytes = DEFAULT_MAX_DOWNLOAD_GB
+    return int(gigabytes * 1024 ** 3)
 
 
 def youtube_base_options():
-    options = {'cachedir': False, 'noplaylist': True, 'allowed_extractors': ['youtube.*'], 'max_filesize': MAX_DOWNLOAD_BYTES}
+    options = {'cachedir': False, 'noplaylist': True, 'allowed_extractors': ['youtube.*'], 'max_filesize': max_download_bytes()}
     for runtime in ('deno', 'node'):
         path = shutil.which(runtime)
         if path:

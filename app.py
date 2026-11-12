@@ -1407,7 +1407,9 @@ async def cleanup_jobs():
                     protected_uploads.add(os.path.abspath(input_path))
 
             for job_id in os.listdir(OUTPUT_DIR):
-                if job_id.startswith(".") or job_id == "thumbnails":
+                # Shared folders, not jobs: actor_uploads holds the user's
+                # uploaded actor images, which SaaS jobs read by URL later.
+                if job_id.startswith(".") or job_id in ("thumbnails", "actor_uploads"):
                     continue
                 try:
                     validate_id(job_id)

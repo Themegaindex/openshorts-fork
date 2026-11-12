@@ -139,6 +139,31 @@ def test_api_rejects_foreign_browser_origin(isolated_app):
     assert response.status_code == 403
 
 
+def test_cors_preflight_skips_token_but_keeps_origin_check(monkeypatch, isolated_app):
+    # A browser never sends custom headers on a preflight. With a token set,
+    # the preflight got 401 without CORS headers, so a browser behind the
+    # documented reverse proxy could not call the API at all.
+    monkeypatch.setenv("OPENSHORTS_API_TOKEN", "synthetic-access-token")
+    allowed = app.configured_origins()[0]
+    preflight = {"Origin": allowed, "Access-Control-Request-Method": "POST",
+                 "Access-Control-Request-Headers": "x-openshorts-token,x-gemini-key"}
+
+    def request(method, headers):
+        async def run():
+            transport = httpx.ASGITransport(app=app.app, client=("192.0.2.20", 12345))
+            async with httpx.AsyncClient(transport=transport, base_url="http://localhost:8000") as client:
+                return await client.request(method, "/api/process", headers=headers)
+        return asyncio.run(run())
+
+    answered = request("OPTIONS", preflight)
+    assert answered.status_code == 200
+    assert answered.headers["access-control-allow-origin"] == allowed
+    assert request("OPTIONS", {**preflight, "Origin": "https://attacker.example"}).status_code == 403
+    # Only a real preflight is exempt; everything else still needs the token.
+    assert request("OPTIONS", {"Origin": allowed}).status_code == 401
+    assert request("POST", {"Origin": allowed}).status_code == 401
+
+
 def test_private_metadata_is_not_served(monkeypatch, isolated_app):
     _, output, _ = isolated_app
     folder = output / "synthetic-job"
@@ -417,10 +442,40 @@ def test_download_writes_valid_bounded_media(monkeypatch, tmp_path):
     assert list(tmp_path.iterdir()) == [target]
 
 
-def test_download_rejects_compressed_response(monkeypatch):
-    from security import public_text
-    _mock_public_response(monkeypatch, headers={"Content-Encoding": "gzip"}, chunks=(b"synthetic",))
+def test_media_download_rejects_compressed_response(monkeypatch, tmp_path):
+    from security import download_public_media
+    _mock_public_response(monkeypatch, headers={"Content-Type": "image/png", "Content-Encoding": "gzip"},
+                          chunks=(b"x" * 2048,))
     with pytest.raises(ValueError, match="Encoded"):
+        download_public_media("https://93.184.216.34/image", str(tmp_path / "image.png"), kind="image")
+
+
+def test_public_text_decodes_gzip_pages(monkeypatch):
+    # Many servers gzip HTML even when asked for identity. Rejecting that broke
+    # the SaaS website scrape for the whole domain.
+    import gzip
+    from security import public_text
+    page = "<html>synthetic public page</html>".encode("utf-8")
+    _mock_public_response(monkeypatch, headers={"Content-Type": "text/html; charset=utf-8", "Content-Encoding": "gzip"},
+                          chunks=(gzip.compress(page),))
+    assert public_text("https://93.184.216.34/page") == page.decode("utf-8")
+
+
+def test_public_text_limits_decoded_size(monkeypatch):
+    # 20 MB of zeros compress to ~20 KB: the limit must hold for the decoded text.
+    import gzip
+    from security import public_text
+    bomb = gzip.compress(b"\0" * (20 * 1024 * 1024))
+    _mock_public_response(monkeypatch, headers={"Content-Encoding": "gzip"}, chunks=(bomb,))
+    with pytest.raises(ValueError, match="size"):
+        public_text("https://93.184.216.34/page", max_bytes=1024 * 1024)
+
+
+@pytest.mark.parametrize("encoding, body", [("br", b"synthetic"), ("gzip", b"not gzip at all")])
+def test_public_text_rejects_unreadable_encodings(monkeypatch, encoding, body):
+    from security import public_text
+    _mock_public_response(monkeypatch, headers={"Content-Encoding": encoding}, chunks=(body,))
+    with pytest.raises(ValueError):
         public_text("https://93.184.216.34/page")
 
 

@@ -9,6 +9,7 @@ import socket
 import tempfile
 import time
 from urllib.parse import urljoin, urlsplit
+import zlib
 
 import httpx
 
@@ -80,13 +81,17 @@ def _public_target(url):
 
 
 @contextmanager
-def public_stream(url, *, timeout=30.0, headers=None):
-    """GET public web content with DNS pinning and a check on every redirect."""
+def public_stream(url, *, timeout=30.0, headers=None, accept_encoding="identity"):
+    """GET public web content with DNS pinning and a check on every redirect.
+
+    With accept_encoding other than "identity" the caller decodes the raw
+    body itself (see public_text); the encoding check below is then skipped.
+    """
     with httpx.Client(timeout=timeout, follow_redirects=False, trust_env=False) as client:
         for _ in range(6):
             original, target = _public_target(url)
             authority = original.netloc.decode("ascii")
-            request_headers = {**(headers or {}), "Host": authority, "Accept-Encoding": "identity"}
+            request_headers = {**(headers or {}), "Host": authority, "Accept-Encoding": accept_encoding}
             with client.stream("GET", target, headers=request_headers, extensions={"sni_hostname": original.host}) as response:
                 if response.status_code in (301, 302, 303, 307, 308):
                     location = response.headers.get("location")
@@ -95,7 +100,7 @@ def public_stream(url, *, timeout=30.0, headers=None):
                     url = urljoin(str(original), location)
                     continue
                 response.raise_for_status()
-                if response.headers.get("content-encoding", "identity").lower() not in ("", "identity"):
+                if accept_encoding == "identity" and response.headers.get("content-encoding", "identity").lower() not in ("", "identity"):
                     raise ValueError("Encoded download responses are not supported")
                 yield response
                 return
@@ -109,7 +114,8 @@ def bounded_chunks(response, max_bytes, *, max_seconds=1800):
     size = 0
     started = time.monotonic()
     # Raw chunks prevent a peer trickling bytes from hiding indefinitely inside
-    # an iterator's fixed-size output buffer. Encoded responses are rejected above.
+    # an iterator's fixed-size output buffer. These are the bytes on the wire:
+    # public_stream rejects encoded bodies unless the caller decodes them.
     for chunk in response.iter_raw():
         size += len(chunk)
         if size > max_bytes or time.monotonic() - started > max_seconds:
@@ -117,10 +123,51 @@ def bounded_chunks(response, max_bytes, *, max_seconds=1800):
         yield chunk
 
 
+def _text_decoder(content_encoding):
+    encoding = content_encoding.strip().lower()
+    if encoding in ("", "identity"):
+        return None
+    if encoding in ("gzip", "x-gzip"):
+        return zlib.decompressobj(16 + zlib.MAX_WBITS)
+    if encoding == "deflate":
+        return zlib.decompressobj()
+    raise ValueError("Encoded download responses are not supported")
+
+
 def public_text(url, *, timeout=30, headers=None, max_bytes=5 * 1024 * 1024):
-    with public_stream(url, timeout=timeout, headers=headers) as response:
-        content = b"".join(bounded_chunks(response, max_bytes, max_seconds=120))
-        return content.decode(response.encoding or "utf-8", errors="replace")
+    """Fetch a public page as text. Many servers gzip HTML even when asked not to.
+
+    Only gzip is requested: "deflate" is sent zlib-wrapped or raw depending on
+    the server, and a raw stream would fail the zlib decoder.
+
+    max_bytes caps both the bytes on the wire and the decoded text, and the
+    decoder never produces more than the remaining budget per chunk, so a
+    small compressed body cannot inflate past the limit in memory.
+    """
+    with public_stream(url, timeout=timeout, headers=headers, accept_encoding="gzip") as response:
+        decoder = _text_decoder(response.headers.get("content-encoding", "identity"))
+        parts = []
+        size = 0
+        for chunk in bounded_chunks(response, max_bytes, max_seconds=120):
+            if decoder is not None:
+                try:
+                    chunk = decoder.decompress(chunk, max_bytes - size + 1)
+                except zlib.error as exc:
+                    raise ValueError("Invalid compressed response") from exc
+            size += len(chunk)
+            if size > max_bytes:
+                raise ValueError("Download exceeds size or time limit")
+            parts.append(chunk)
+        if decoder is not None:
+            try:
+                tail = decoder.flush()
+            except zlib.error as exc:
+                raise ValueError("Invalid compressed response") from exc
+            size += len(tail)
+            if size > max_bytes:
+                raise ValueError("Download exceeds size or time limit")
+            parts.append(tail)
+        return b"".join(parts).decode(response.encoding or "utf-8", errors="replace")
 
 
 def download_public_media(url, output_path, *, kind="media", timeout=120, max_bytes=512 * 1024 * 1024):

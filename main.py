@@ -43,7 +43,7 @@ import longform
 import video_encoding
 import whisper_runtime
 from youtube_download import (
-    MAX_DOWNLOAD_BYTES, YouTubeDownloadError, open_youtube_dl, youtube_auth_attempts,
+    YouTubeDownloadError, max_download_bytes, open_youtube_dl, youtube_auth_attempts,
     youtube_base_options, youtube_failure_message,
 )
 
@@ -2174,12 +2174,13 @@ def download_youtube_video(url, output_dir=".", resume=False):
         # yt-dlp skips a format above max_filesize without raising and leaves
         # only the other per-format file (often the audio track). Using that
         # as the source would run the whole job on an audio file.
-        limit_gb = MAX_DOWNLOAD_BYTES / 1024 ** 3
+        limit_gb = max_download_bytes() / 1024 ** 3
         if index == len(download_attempts) - 1:
             raise YouTubeDownloadError(
                 f"The download finished without a complete video file. The most likely cause "
                 f"is the {limit_gb:g} GB download limit: yt-dlp skips larger files without an "
-                "error. Use a shorter video or a lower-resolution source."
+                "error. Use a shorter video, a lower-resolution source, or raise "
+                "OPENSHORTS_MAX_DOWNLOAD_GB."
             )
         next_label = download_attempts[index + 1][2]
         JOB_REPORTER.warning(

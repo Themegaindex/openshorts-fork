@@ -783,8 +783,13 @@ def test_cleanup_sweep_survives_foreign_folder_and_purges_leftovers(monkeypatch,
     thumb_dir = thumbnails_dir / "session1"
     thumb_dir.mkdir()
     (thumb_dir / "thumb_1.jpg").write_bytes(b"thumb")
+    # Shared library of uploaded actor images: a valid-looking name, but not
+    # a job. Purging it broke every /videos/actor_uploads/ URL after 24 h.
+    actor_dir = output_dir / "actor_uploads"
+    actor_dir.mkdir()
+    (actor_dir / "custom_1.png").write_bytes(b"actor")
     expired = time.time() - app.JOB_RETENTION_SECONDS - 100
-    for path in (saas_dir, face_dir, thumb_dir):
+    for path in (saas_dir, face_dir, thumb_dir, actor_dir):
         os.utime(path, (expired, expired))
     monkeypatch.setattr(app, "publish_jobs", {
         "upload-running": {"status": "uploading", "created_at": time.time() - app.PUBLISH_JOB_TTL_SECONDS - 10},
@@ -806,6 +811,8 @@ def test_cleanup_sweep_survives_foreign_folder_and_purges_leftovers(monkeypatch,
     assert "abc" not in app.saas_jobs
     assert not face_dir.exists()
     assert not thumb_dir.exists()
+    assert (actor_dir / "custom_1.png").exists()
+    assert not (tombstone_dir / "actor_uploads.json").exists()
     assert "upload-running" in app.publish_jobs
 
 

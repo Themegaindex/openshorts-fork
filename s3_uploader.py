@@ -45,6 +45,7 @@ import json
 import time as time_module
 
 CACHE_TTL_SECONDS = 300  # 5 minutes
+FAILED_READ_CACHE_TTL_SECONDS = 30
 
 def get_s3_client():
     """Returns an authenticated S3 client."""
@@ -182,6 +183,10 @@ _video_gallery_cache = {
     # False when the listing stopped at a limit; then a caller asking for more
     # entries must not be served the shortened list.
     "complete": False,
+    # A listing with failed metadata reads lives only briefly: long enough to
+    # spare S3 when one file is broken for good, short enough that a transient
+    # failure does not hide a video (404 on /video/{id}) for five minutes.
+    "failed_reads": False,
 }
 
 def upload_video_to_gallery(video_path, actor_image_path, metadata, video_id=None):
@@ -256,7 +261,8 @@ def list_video_gallery(limit=50, force_refresh=False):
     if not force_refresh and _video_gallery_cache["data"] is not None:
         cached = _video_gallery_cache["data"]
         long_enough = _video_gallery_cache["complete"] or (limit and len(cached) >= limit)
-        if long_enough and now - _video_gallery_cache["timestamp"] < CACHE_TTL_SECONDS:
+        ttl = FAILED_READ_CACHE_TTL_SECONDS if _video_gallery_cache["failed_reads"] else CACHE_TTL_SECONDS
+        if long_enough and now - _video_gallery_cache["timestamp"] < ttl:
             return cached[:limit] if limit else cached
 
     bucket_name = os.environ.get('AWS_S3_PUBLIC_BUCKET', 'my-public-bucket')
@@ -267,6 +273,7 @@ def list_video_gallery(limit=50, force_refresh=False):
 
     videos = []
     complete = True
+    failed_reads = False
 
     try:
         paginator = s3_client.get_paginator('list_objects_v2')
@@ -288,10 +295,11 @@ def list_video_gallery(limit=50, force_refresh=False):
                 data = json.loads(content)
                 videos.append(data)
                 if limit and len(videos) >= limit:
-                    complete = len(videos) == len(meta_files)
+                    complete = meta_obj is meta_files[-1]
                     break
             except Exception as e:
                 logger.error(f"Error reading metadata {meta_obj['Key']}: {e}")
+                failed_reads = True
                 continue
 
     except Exception as e:
@@ -301,6 +309,7 @@ def list_video_gallery(limit=50, force_refresh=False):
     _video_gallery_cache["data"] = videos
     _video_gallery_cache["timestamp"] = now
     _video_gallery_cache["complete"] = complete
+    _video_gallery_cache["failed_reads"] = failed_reads
 
     return videos[:limit] if limit else videos
 
