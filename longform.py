@@ -15,13 +15,11 @@ import os
 import re
 from typing import Iterable, Optional
 
-from clip_selection import snap_clip_to_words
 import video_encoding
 
 
 TARGET_ASPECT_RATIO = 16 / 9
 SENTENCE_END_RE = re.compile(r"[.!?\u2026][\"'\u2019\u201d)\]]*$")
-ALLOWED_ROLES = {"cold_open", "setup", "bridge", "body", "payoff"}
 PLANNER_VERSION = 2
 QUALITY_GATE_VERSION = 2
 DEFAULT_STRONG_PAUSE_SECONDS = 0.55

@@ -4,7 +4,6 @@ import sys
 import uuid
 import subprocess
 import threading
-import queue
 import json
 import shutil
 import glob
@@ -27,7 +26,7 @@ from starlette.middleware.trustedhost import TrustedHostMiddleware
 from fastapi.responses import HTMLResponse, JSONResponse, FileResponse
 from starlette.background import BackgroundTask
 from pydantic import BaseModel, Field
-from s3_uploader import upload_job_artifacts, list_all_clips, upload_actor_to_s3, list_actor_gallery, upload_video_to_gallery, list_video_gallery
+from s3_uploader import upload_job_artifacts, upload_actor_to_s3, list_actor_gallery, upload_video_to_gallery, list_video_gallery
 from video_formats import CANONICAL_OUTPUT_FORMATS, normalize_output_format
 from security import confined_path, validate_id, upload_suffix, validate_youtube_url, download_public_media
 from security_http import MediaFiles, SecurityBoundaryMiddleware, configured_origins
@@ -41,7 +40,8 @@ os.makedirs(UPLOAD_DIR, exist_ok=True)
 os.makedirs(OUTPUT_DIR, exist_ok=True)
 
 # Configuration
-# Default to 1 if not set, but user can set higher for powerful servers
+# Parallel video workers. Each one runs Whisper/YOLO/FFmpeg, so lower this on
+# small machines.
 MAX_CONCURRENT_JOBS = int(os.environ.get("MAX_CONCURRENT_JOBS", "5"))
 MAX_FILE_SIZE_MB = 2048  # 2GB limit
 MAX_PENDING_JOBS = 20
@@ -1409,6 +1409,13 @@ async def cleanup_jobs():
             for job_id in os.listdir(OUTPUT_DIR):
                 if job_id.startswith(".") or job_id == "thumbnails":
                     continue
+                try:
+                    validate_id(job_id)
+                except ValueError:
+                    # Not a job folder (for example copied in by hand).
+                    # _get_job() raises on such a name, and that used to end
+                    # the whole sweep, every 5 minutes, so nothing was purged.
+                    continue
                 job_path = os.path.join(OUTPUT_DIR, job_id)
                 if not os.path.isdir(job_path):
                     continue
@@ -1440,24 +1447,15 @@ async def cleanup_jobs():
                     print(f"⚠️ Failed to write tombstone for {job_id}: {e}")
                 shutil.rmtree(job_path, ignore_errors=True)
                 jobs.pop(job_id, None)
+                # A SaaS job keeps its state file inside this folder. A separate
+                # memory sweep further down required the folder to still exist,
+                # so it never fired and the API kept serving dead video URLs.
+                if job_id.startswith("saas_"):
+                    saas_jobs.pop(job_id[len("saas_"):], None)
                 for lock_key in [key for key in clip_operation_locks if key[0] == job_id]:
                     clip_operation_locks.pop(lock_key, None)
                 job_state_locks.pop(job_id, None)
                 job_resume_locks.pop(job_id, None)
-
-            # Cleanup SaaSShorts jobs from memory
-            try:
-                saas_expired = [
-                    jid for jid, jdata in list(saas_jobs.items())
-                    if jdata.get("status") in ("completed", "failed")
-                    and jdata.get("output_dir")
-                    and os.path.isdir(jdata["output_dir"])
-                    and now - os.path.getmtime(jdata["output_dir"]) > JOB_RETENTION_SECONDS
-                ]
-                for jid in saas_expired:
-                    del saas_jobs[jid]
-            except NameError:
-                pass
 
             # Cleanup thumbnail sessions (TTL-based; created_at added at creation).
             for sid, session in list(thumbnail_sessions.items()):
@@ -1466,21 +1464,40 @@ async def cleanup_jobs():
                     thumbnail_sessions.pop(sid, None)
                     _remove_state_file(THUMBNAIL_SESSION_STATE_DIR, sid)
 
-            # Cleanup finished publish jobs (TTL-based).
+            # Generated thumbnails follow the normal retention. The job sweep
+            # above skips this folder, so they used to stay forever.
+            for sid in os.listdir(THUMBNAILS_DIR):
+                session_dir = os.path.join(THUMBNAILS_DIR, sid)
+                try:
+                    if (sid not in thumbnail_sessions and os.path.isdir(session_dir)
+                            and now - os.path.getmtime(session_dir) > JOB_RETENTION_SECONDS):
+                        shutil.rmtree(session_dir, ignore_errors=True)
+                except OSError:
+                    pass
+
+            # Cleanup finished publish jobs (TTL-based). An upload still in
+            # progress can outlive the TTL; dropping it made the upload thread
+            # fail with KeyError and lost its result.
             for pid, pjob in list(publish_jobs.items()):
                 created = pjob.get("created_at") or 0
+                if pjob.get("status") == "uploading" and now - float(created) < JOB_RETENTION_SECONDS:
+                    continue
                 if now - float(created) > PUBLISH_JOB_TTL_SECONDS:
                     publish_jobs.pop(pid, None)
                     _remove_state_file(PUBLISH_JOB_STATE_DIR, pid)
 
-            # Cleanup Uploads
+            # Cleanup Uploads. Thumbnail face/background images live in
+            # thumb_<session> folders, which os.remove() could never delete.
             for filename in os.listdir(UPLOAD_DIR):
                 file_path = os.path.join(UPLOAD_DIR, filename)
                 try:
                     if os.path.abspath(file_path) in protected_uploads:
                         continue
                     if now - os.path.getmtime(file_path) > JOB_RETENTION_SECONDS:
-                        os.remove(file_path)
+                        if os.path.isdir(file_path):
+                            shutil.rmtree(file_path, ignore_errors=True)
+                        else:
+                            os.remove(file_path)
                 except Exception: pass
 
         except Exception as e:
@@ -1577,10 +1594,25 @@ app.add_middleware(
     allow_headers=["*"],
 )
 
+class ApiGZipMiddleware(GZipMiddleware):
+    """Compress API responses only.
+
+    Starlette also compresses streamed file bodies. Videos and the ZIP download
+    were then recompressed at level 9 on the event loop and lost their
+    Content-Length, so the browser could not show download progress.
+    """
+
+    async def __call__(self, scope, receive, send):
+        path = scope.get("path", "") if scope.get("type") == "http" else ""
+        if not path.startswith("/api/") or "/download" in path:
+            await self.app(scope, receive, send)
+            return
+        await super().__call__(scope, receive, send)
+
+
 # Compress JSON responses: a real 249 KB status-poll payload measures 29.6 KB
-# gzipped (-88%). Video files are served via /videos (already compressed
-# codecs, > minimum_size guard not relevant since StaticFiles streams).
-app.add_middleware(GZipMiddleware, minimum_size=1024)
+# gzipped (-88%). Media is already compressed and is passed through untouched.
+app.add_middleware(ApiGZipMiddleware, minimum_size=1024)
 app.add_middleware(SecurityBoundaryMiddleware, max_body_bytes=(MAX_FILE_SIZE_MB + 1) * 1024 * 1024)
 app.add_middleware(TrustedHostMiddleware, allowed_hosts=[h.strip() for h in os.environ.get("OPENSHORTS_ALLOWED_HOSTS", "localhost,127.0.0.1,[::1]").split(",") if h.strip()])
 
@@ -1592,12 +1624,10 @@ THUMBNAILS_DIR = os.path.join(OUTPUT_DIR, "thumbnails")
 os.makedirs(THUMBNAILS_DIR, exist_ok=True)
 app.mount("/thumbnails", MediaFiles(directory=THUMBNAILS_DIR), name="thumbnails")
 
-class ProcessRequest(BaseModel):
-    url: str
-
-
 class ResumeRequest(BaseModel):
-    phase: Optional[str] = None
+    # Mirrors main.py --resume-phase. Any other value re-queued the job and
+    # the worker then died with an argparse error.
+    phase: Optional[Literal["transcribe", "analyze", "render"]] = None
 
 
 def _build_resume_command(job_id: str, output_dir: str, phase: Optional[str] = None,
@@ -1805,7 +1835,6 @@ async def run_job(job_id, job_data):
         t_log.start()
 
         # Async wait for process with incremental updates
-        start_wait = time.time()
         while process.poll() is None:
             await asyncio.sleep(2)
 
@@ -1828,7 +1857,7 @@ async def run_job(job_id, job_data):
                         )
                         if partial_result:
                             jobs[job_id]['result'] = partial_result
-            except Exception as e:
+            except Exception:
                 # Ignore read errors during processing
                 pass
 
@@ -2463,6 +2492,7 @@ from subtitles import (
     generate_ass,
     generate_srt,
     generate_srt_from_video,
+    probe_frame_size,
     remap_transcript_segments,
 )
 from hooks import prepare_hook_overlay
@@ -3033,7 +3063,7 @@ class SubtitleRequest(BaseModel):
     bg_color: str = Field(default="#000000", pattern=r"^#[0-9A-Fa-f]{6}$")
     bg_opacity: float = Field(default=0.0, ge=0.0, le=1.0)
     style: Literal["classic", "karaoke"] = "classic"
-    preset: Literal["custom", "neon_sweep", "rainbow_word"] = "custom"
+    preset: Literal["custom", "neon_sweep", "neon_tube", "rainbow_word"] = "custom"
     highlight_color: str = Field(default="#FFD700", pattern=r"^#[0-9A-Fa-f]{6}$")
     effect: Literal["none", "glow", "pop", "box", "bounce"] = "none"
     base_opacity: float = Field(default=1.0, ge=0.05, le=1.0)
@@ -3104,6 +3134,12 @@ async def _add_subtitles_locked(req: SubtitleRequest):
         effect=req.effect, base_opacity=req.base_opacity, uppercase=req.uppercase,
         preset=req.preset,
     )
+    if req.preset == "neon_tube":
+        # The tube contour and glow are sized for the frame they get burned
+        # into; the ass filter runs on the clean source at its own size.
+        karaoke_opts["frame_size"] = await asyncio.get_event_loop().run_in_executor(
+            None, probe_frame_size, input_path,
+        )
 
     try:
         # 1. Generate subtitle file (SRT, or karaoke ASS with word highlight)
@@ -3407,9 +3443,12 @@ async def _add_hook_locked(req: HookRequest):
         data = json.load(f)
         
     result_clips = job.get("result", {}).get("clips", []) if isinstance(job.get("result"), dict) else []
-    result_clip = result_clips[req.clip_index] if req.clip_index < len(result_clips) else None
+    # Same check as the sibling endpoints. Without it an unknown index was
+    # only rejected after the FFmpeg render and the layer-store write.
+    if req.clip_index >= len(result_clips):
+        raise HTTPException(status_code=404, detail="Clip not found")
     metadata_clips, metadata_index, _video_type = _lookup_metadata_clip(
-        data, req.clip_index, result_clip,
+        data, req.clip_index, result_clips[req.clip_index],
     )
     clip_data = metadata_clips[metadata_index]
     
@@ -3621,7 +3660,9 @@ async def post_to_socials(req: SocialPostRequest):
 
         # Construct parameters for Upload-Post API
         # Fallbacks
-        final_title = req.title or clip.get('title', 'Viral Short')
+        # Shorts carry their title as video_title_for_youtube_short; only long
+        # videos (rejected above) have a plain "title".
+        final_title = req.title or clip.get('video_title_for_youtube_short') or 'Viral Short'
         final_description = req.description or clip.get('video_description_for_instagram') or clip.get('video_description_for_tiktok') or "Check this out!"
         
         # Prepare form data
@@ -3699,9 +3740,8 @@ async def get_social_user(api_key: str = Header(..., alias="X-Upload-Post-Key"))
                 raise HTTPException(status_code=resp.status_code, detail=f"Failed to fetch user: {resp.text}")
             
             data = resp.json()
-            print(f"🔍 Upload-Post User Response: {data}")
-            
-            user_id = None
+            # The full response (all linked social accounts) is not logged on
+            # purpose: it is account data, not diagnostics.
             # The structure is {'success': True, 'profiles': [{'username': '...'}, ...]}
             profiles_list = []
             if isinstance(data, dict):
@@ -3739,6 +3779,16 @@ async def get_social_user(api_key: str = Header(..., alias="X-Upload-Post-Key"))
              raise HTTPException(status_code=500, detail="Could not load social profiles. Check the server logs for details.")
 
 # --- Thumbnail Studio Endpoints ---
+
+def _call_main(name, *args):
+    """Run a main.py function; call it through run_in_executor.
+
+    main imports torch, YOLO and MediaPipe at module level. Importing it inside
+    a coroutine froze the whole API for seconds on the first thumbnail request.
+    """
+    import main
+    return getattr(main, name)(*args)
+
 
 @app.post("/api/thumbnail/upload")
 async def thumbnail_upload(
@@ -3784,18 +3834,16 @@ async def thumbnail_upload(
             vpath = video_path
             # Download YouTube video if URL was provided
             if not vpath and url:
-                from main import download_youtube_video
                 loop = asyncio.get_event_loop()
-                vpath, _ = await loop.run_in_executor(None, download_youtube_video, url, UPLOAD_DIR)
+                vpath, _ = await loop.run_in_executor(None, _call_main, "download_youtube_video", url, UPLOAD_DIR)
                 session = thumbnail_sessions.get(session_id)
                 if session is None:
                     return
                 session["video_path"] = vpath
                 _persist_thumbnail_session(session_id)
 
-            from main import transcribe_video
             loop = asyncio.get_event_loop()
-            transcript = await loop.run_in_executor(None, transcribe_video, vpath)
+            transcript = await loop.run_in_executor(None, _call_main, "transcribe_video", vpath)
             segments = transcript.get("segments", [])
             duration = segments[-1]["end"] if segments else 0
 
@@ -3860,7 +3908,8 @@ async def thumbnail_analyze(
         if session.get("transcript_error"):
             raise HTTPException(status_code=500, detail="Transcription failed. Check the server logs for details.")
 
-        video_path = session["video_path"]
+        # Sessions from the manual title mode have no video at all.
+        video_path = session.get("video_path")
         if not video_path or not os.path.exists(video_path):
             raise HTTPException(status_code=404, detail="Video file not found in session")
 
@@ -3874,10 +3923,9 @@ async def thumbnail_analyze(
         session_id = str(uuid.uuid4())
 
         if url:
-            from main import download_youtube_video
             loop = asyncio.get_running_loop()
             video_path, _ = await loop.run_in_executor(
-                None, download_youtube_video, url, UPLOAD_DIR
+                None, _call_main, "download_youtube_video", url, UPLOAD_DIR
             )
         else:
             video_path = _upload_path(file, f"thumb_{session_id}")
@@ -4186,38 +4234,6 @@ async def thumbnail_publish_status(publish_id: str):
     return publish_jobs[publish_id]
 
 
-# @app.get("/api/gallery/clips")
-# async def get_gallery_clips(limit: int = 20, offset: int = 0, refresh: bool = False):
-#     """
-#     Fetch clips from S3 for the gallery with pagination.
-#
-#     Args:
-#         limit: Number of clips to return (default 20, max 100)
-#         offset: Starting position for pagination
-#         refresh: Force refresh cache
-#     """
-#     try:
-#         # Clamp limit to reasonable values
-#         limit = min(max(1, limit), 100)
-#
-#         # Get clips (uses cache internally)
-#         all_clips = list_all_clips(limit=limit + offset, force_refresh=refresh)
-#
-#         # Apply offset for pagination
-#         clips = all_clips[offset:offset + limit]
-#
-#         return {
-#             "clips": clips,
-#             "total": len(all_clips),
-#             "limit": limit,
-#             "offset": offset,
-#             "has_more": len(all_clips) > offset + limit
-#         }
-#     except Exception as e:
-#         print(f"❌ Gallery Error: {e}")
-#         raise HTTPException(status_code=500, detail=str(e))
-
-
 # ═══════════════════════════════════════════════════════════════════════
 # SaaSShorts: AI UGC Video Generator for SaaS Products
 # ═══════════════════════════════════════════════════════════════════════
@@ -4265,10 +4281,13 @@ async def saasshorts_analyze(
         def run_analysis():
             web_research = None
 
-            if req.url and req.url.strip():
+            # Pasted URLs often carry a trailing space or newline, which the
+            # public-URL guard rejects as a control character (HTTP 500).
+            url = (req.url or "").strip()
+            if url:
                 # URL provided: full scrape + research pipeline
-                scraped = scrape_website(req.url)
-                web_research = research_saas_online(req.url, gemini_key)
+                scraped = scrape_website(url)
+                web_research = research_saas_online(url, gemini_key)
                 analysis = analyze_saas(scraped, gemini_key, web_research=web_research)
             else:
                 # Manual description: build analysis from description
@@ -4372,7 +4391,10 @@ async def saasshorts_actor_options(
             desc += f" (holding {req.product_description})"
         urls = []
         for p in paths:
-            s3_url = upload_actor_to_s3(p, description=desc)
+            # boto3 blocks; on the event loop it froze the whole API per upload.
+            s3_url = await loop.run_in_executor(
+                None, functools.partial(upload_actor_to_s3, p, description=desc),
+            )
             if s3_url:
                 urls.append(s3_url)
             else:
@@ -4501,7 +4523,6 @@ async def gallery_html_page():
         duration = v.get("duration", 0)
         mode = v.get("video_mode", "")
         product = html_mod.escape(v.get("product_name", ""))
-        caption = html_mod.escape(v.get("caption", "")[:120])
 
         mode_badge = '<span style="background:#22c55e;color:#000;padding:2px 8px;border-radius:9999px;font-size:10px;font-weight:700">LOW COST</span>' if mode == "lowcost" else '<span style="background:#8b5cf6;color:#fff;padding:2px 8px;border-radius:9999px;font-size:10px;font-weight:700">PREMIUM</span>'
 
@@ -4746,8 +4767,6 @@ async def saasshorts_generate(
     if req.selected_actor_url:
         if req.selected_actor_url.startswith(("https://", "http://")):
             # Download from S3 public URL to job output dir (off the event loop).
-            import httpx
-
             def _download_actor():
                 actor_local = os.path.join(job_output_dir, "selected_actor.png")
                 return download_public_media(req.selected_actor_url, actor_local, kind="image", timeout=30, max_bytes=10 * 1024 * 1024)
@@ -4805,7 +4824,8 @@ async def saasshorts_generate(
                 saas_jobs[job_id]["logs"].append("Video generation completed!")
                 _persist_saas_job(job_id)
 
-                # Upload to public gallery (non-blocking)
+                # Upload to public gallery, in a worker thread: boto3 blocks,
+                # and a whole video upload used to freeze the API meanwhile.
                 try:
                     gallery_meta = {
                         "title": req.script.get("title", "Untitled"),
@@ -4823,12 +4843,12 @@ async def saasshorts_generate(
                         "segments": req.script.get("segments", []),
                         "cost_estimate": result.get("cost_estimate", {}),
                     }
-                    gallery_result = upload_video_to_gallery(
+                    gallery_result = await loop.run_in_executor(None, lambda: upload_video_to_gallery(
                         video_path=result["video_path"],
                         actor_image_path=result.get("actor_image", ""),
                         metadata=gallery_meta,
                         video_id=job_id[:8],
-                    )
+                    ))
                     if gallery_result:
                         saas_jobs[job_id]["result"]["gallery_video_id"] = gallery_result["video_id"]
                         log_msg("📤 Uploaded to public gallery.")

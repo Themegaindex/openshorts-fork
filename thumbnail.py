@@ -1,6 +1,5 @@
 import os
 from security import confined_path, validate_id
-import uuid
 import time
 import json
 from google import genai
@@ -91,7 +90,7 @@ OUTPUT JSON:
     video_duration = segments[-1]["end"] if segments else 0
 
     try:
-        text = response.text.strip()
+        text = (response.text or "").strip()
         if text.startswith("```json"):
             text = text[7:]
         if text.startswith("```"):
@@ -165,7 +164,7 @@ OUTPUT JSON:
     )
 
     try:
-        text = response.text.strip()
+        text = (response.text or "").strip()
         if text.startswith("```json"):
             text = text[7:]
         if text.startswith("```"):
@@ -340,7 +339,7 @@ OUTPUT: Return ONLY the description text (no JSON wrapper, no markdown code bloc
         contents=[prompt],
     )
 
-    description = response.text.strip()
+    description = (response.text or "").strip()
     # Clean up any accidental markdown wrappers
     if description.startswith("```"):
         lines = description.split("\n")

@@ -53,7 +53,10 @@ export default function ResultCard({ clip, index, jobId, uploadPostKey, uploadUs
             setScheduleDate("");
             setPostResult(null);
         }
-    }, [showModal, clip]);
+        // Only on open: while the job still runs, every status poll hands this
+        // card a new `clip` object, which used to wipe the form every 2 seconds.
+        // eslint-disable-next-line react-hooks/exhaustive-deps
+    }, [showModal]);
 
     const handleAutoEdit = async () => {
         setIsEditing(true);
@@ -151,15 +154,10 @@ export default function ResultCard({ clip, index, jobId, uploadPostKey, uploadUs
         }
     };
 
-    const handleHook = async (hookData) => {
+    const handleHook = async (payload) => {
         setIsHooking(true);
         setEditError(null);
         try {
-            // Support both string (legacy) and object
-            const payload = typeof hookData === 'string'
-                ? { text: hookData, position: 'top', size: 'M' }
-                : hookData;
-
             const res = await fetch(getApiUrl('/api/hook'), {
                 method: 'POST',
                 headers: { 'Content-Type': 'application/json' },
@@ -196,12 +194,10 @@ export default function ResultCard({ clip, index, jobId, uploadPostKey, uploadUs
     };
 
     const handleTranslate = async (options) => {
-        console.log('[Translate] Starting translation with options:', options);
         setIsTranslating(true);
         setEditError(null);
         try {
             const apiKey = elevenLabsKey;
-            console.log('[Translate] API Key available:', !!apiKey);
 
             if (!apiKey) {
                 throw new Error("ElevenLabs API Key is missing. Please set it in Settings.");
@@ -213,8 +209,6 @@ export default function ResultCard({ clip, index, jobId, uploadPostKey, uploadUs
                 target_language: options.targetLanguage,
                 input_filename: currentVideoUrl.split('/').pop()
             };
-            console.log('[Translate] Request body:', requestBody);
-            console.log('[Translate] Sending request to /api/translate');
 
             const res = await fetch(getApiUrl('/api/translate'), {
                 method: 'POST',
@@ -225,16 +219,9 @@ export default function ResultCard({ clip, index, jobId, uploadPostKey, uploadUs
                 body: JSON.stringify(requestBody)
             });
 
-            console.log('[Translate] Response status:', res.status);
-
-            if (!res.ok) {
-                const message = await readApiError(res);
-                console.error('[Translate] Error response:', message);
-                throw new Error(message);
-            }
+            if (!res.ok) throw new Error(await readApiError(res));
 
             const data = await res.json();
-            console.log('[Translate] Success response:', data);
             if (data.new_video_url) {
                 // Dubbing drops the now-stale subtitles server-side.
                 const nextLayers = { ...layers, subtitle: false };
@@ -389,7 +376,7 @@ export default function ResultCard({ clip, index, jobId, uploadPostKey, uploadUs
     };
 
     return (
-        <div className={`bg-surface border border-white/5 rounded-2xl overflow-hidden flex group hover:border-white/10 transition-all animate-[fadeIn_0.5s_ease-out] h-auto ${isLong ? 'xl:col-span-2 flex-col min-h-[520px]' : 'flex-col md:flex-row min-h-[300px]'}`} style={{ animationDelay: `${index * 0.1}s` }}>
+        <div className={`bg-surface border border-white/5 rounded-2xl overflow-hidden flex group hover:border-white/10 transition-all h-auto ${isLong ? 'xl:col-span-2 flex-col min-h-[520px]' : 'flex-col md:flex-row min-h-[300px]'}`}>
             {/* Left: Video Preview (Responsive Width) */}
             <div className={`${isLong ? 'w-full aspect-video border-b border-white/5' : 'w-full md:w-[180px] lg:w-[200px] aspect-[9/16] md:aspect-auto'} bg-black relative shrink-0 group/video`}>
                 <video
@@ -753,13 +740,17 @@ export default function ResultCard({ clip, index, jobId, uploadPostKey, uploadUs
                 </div>
             )}
 
-            <SubtitleModal
-                isOpen={showSubtitleModal}
-                onClose={() => setShowSubtitleModal(false)}
-                onGenerate={handleSubtitle}
-                isProcessing={isSubtitling}
-                videoUrl={currentVideoUrl}
-            />
+            {/* Mounted only while open: the modal reads the remembered style on
+                mount, so a style saved on one card reaches the others. */}
+            {showSubtitleModal && (
+                <SubtitleModal
+                    isOpen
+                    onClose={() => setShowSubtitleModal(false)}
+                    onGenerate={handleSubtitle}
+                    isProcessing={isSubtitling}
+                    videoUrl={currentVideoUrl}
+                />
+            )}
 
             <HookModal
                 isOpen={showHookModal}

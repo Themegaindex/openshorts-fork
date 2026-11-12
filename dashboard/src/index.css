@@ -21,6 +21,14 @@
   @apply bg-primary hover:bg-blue-600 text-white px-6 py-3 rounded-xl font-medium transition-all active:scale-[0.98] disabled:opacity-50 disabled:cursor-not-allowed shadow-lg shadow-primary/20;
 }
 
+/* Lives in the components layer so utilities at the call site (padding,
+   text-red-300 on the delete buttons) still win over these defaults. */
+@layer components {
+  .btn-secondary {
+    @apply bg-white/5 hover:bg-white/10 border border-white/10 text-zinc-300 rounded-xl font-medium transition-all active:scale-[0.98] disabled:opacity-50 disabled:cursor-not-allowed;
+  }
+}
+
 /* Custom Scrollbar */
 .custom-scrollbar::-webkit-scrollbar {
   width: 6px;
@@ -41,6 +49,21 @@
 }
 
 /* Custom Animations */
+/* Opacity only: a transform here would turn the animated element into the
+   containing block of the fixed-position modals that use this animation.
+   Do not put it on an element that renders its own modal (like ResultCard):
+   while the animation is in effect the element is a stacking context, and
+   later siblings are then painted over that modal. */
+@keyframes fadeIn {
+  from {
+    opacity: 0;
+  }
+
+  to {
+    opacity: 1;
+  }
+}
+
 @keyframes scan {
   0% {
     top: 0%;
@@ -147,6 +170,40 @@ video:-webkit-full-screen {
   }
 }
 
+/* Neon Tube: crisp dark contour on every word; the spoken word is a pale core
+   with a colour rim, and its glow sits outside the contour. Earlier shadows
+   paint on top, so the list runs rim -> contour -> glow. */
+.caption-tube-white {
+  color: #fff;
+  text-shadow:
+    0 0 1px #000,
+    0 0 1px #000,
+    0 0 3px rgba(0, 0, 0, 0.75),
+    0 0 6px rgba(0, 0, 0, 0.5);
+}
+
+.caption-tube-live {
+  /* Same as the first keyframe, so the tube still shows with reduced motion. */
+  color: #8cfcfa;
+  text-shadow: 1px 0 0 #18f8f4, -1px 0 0 #18f8f4, 0 1px 0 #18f8f4, 0 -1px 0 #18f8f4, 0 0 2px #000, 0 0 3px #000, 0 0 7px rgba(24, 248, 244, 0.85), 0 0 14px rgba(24, 248, 244, 0.5);
+  animation: caption-tube-cycle 4.8s steps(1, end) infinite;
+}
+
+@keyframes caption-tube-cycle {
+  0%, 32% {
+    color: #8cfcfa;
+    text-shadow: 1px 0 0 #18f8f4, -1px 0 0 #18f8f4, 0 1px 0 #18f8f4, 0 -1px 0 #18f8f4, 0 0 2px #000, 0 0 3px #000, 0 0 7px rgba(24, 248, 244, 0.85), 0 0 14px rgba(24, 248, 244, 0.5);
+  }
+  33%, 65% {
+    color: #8cffa1;
+    text-shadow: 1px 0 0 #19ff43, -1px 0 0 #19ff43, 0 1px 0 #19ff43, 0 -1px 0 #19ff43, 0 0 2px #000, 0 0 3px #000, 0 0 7px rgba(25, 255, 67, 0.85), 0 0 14px rgba(25, 255, 67, 0.5);
+  }
+  66%, 100% {
+    color: #ff909c;
+    text-shadow: 1px 0 0 #ff2038, -1px 0 0 #ff2038, 0 1px 0 #ff2038, 0 -1px 0 #ff2038, 0 0 2px #000, 0 0 3px #000, 0 0 7px rgba(255, 32, 56, 0.85), 0 0 14px rgba(255, 32, 56, 0.5);
+  }
+}
+
 .caption-rainbow-word {
   display: inline-block;
   isolation: isolate;
@@ -203,6 +260,7 @@ video:-webkit-full-screen {
 
 @media (prefers-reduced-motion: reduce) {
   .caption-neon-live,
+  .caption-tube-live,
   .caption-rainbow-word {
     animation: none;
   }

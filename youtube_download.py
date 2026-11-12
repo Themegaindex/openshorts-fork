@@ -11,8 +11,13 @@ class YouTubeDownloadError(RuntimeError):
     """An actionable download failure, safe to show in the job summary."""
 
 
+# yt-dlp skips a format above this size without raising. Callers must check
+# that a complete video file actually exists after ydl.download().
+MAX_DOWNLOAD_BYTES = 2 * 1024 * 1024 * 1024
+
+
 def youtube_base_options():
-    options = {'cachedir': False, 'noplaylist': True, 'allowed_extractors': ['youtube.*'], 'max_filesize': 2 * 1024 * 1024 * 1024}
+    options = {'cachedir': False, 'noplaylist': True, 'allowed_extractors': ['youtube.*'], 'max_filesize': MAX_DOWNLOAD_BYTES}
     for runtime in ('deno', 'node'):
         path = shutil.which(runtime)
         if path:

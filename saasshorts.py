@@ -21,7 +21,7 @@ import hashlib
 import subprocess
 import httpx
 from urllib.parse import urljoin
-from typing import Optional, List, Dict, Callable
+from typing import List, Dict, Callable
 from concurrent.futures import ThreadPoolExecutor, as_completed
 
 import video_encoding
@@ -602,8 +602,17 @@ def _fal_run(model_id: str, input_data: dict, fal_key: str, timeout: int = 600) 
         try:
             with httpx.Client(timeout=30.0) as client:
                 poll_resp = client.get(f"{status_url}?logs=1", headers=poll_headers)
-            status_data = poll_resp.json()
         except Exception as e:
+            print(f"[fal.ai] Poll error (retrying): {e}")
+            time.sleep(5)
+            continue
+        # A client error (bad key, unknown request) never heals. Before this
+        # check it read as status UNKNOWN and was polled until the timeout.
+        if 400 <= poll_resp.status_code < 500 and poll_resp.status_code != 429:
+            raise Exception(f"fal.ai status check failed ({poll_resp.status_code}): {poll_resp.text[:300]}")
+        try:
+            status_data = poll_resp.json()
+        except ValueError as e:
             print(f"[fal.ai] Poll error (retrying): {e}")
             time.sleep(5)
             continue
@@ -614,7 +623,11 @@ def _fal_run(model_id: str, input_data: dict, fal_key: str, timeout: int = 600) 
             print(f"[fal.ai] ✅ Completed in {elapsed}s! Fetching result...")
             with httpx.Client(timeout=120.0) as client:
                 result_resp = client.get(response_url, headers=poll_headers)
-                return result_resp.json()
+            # A failed job answers here with an error body. Returned as a
+            # result, it surfaced later as a bare KeyError ("Error: 'video'").
+            if result_resp.status_code >= 400:
+                raise Exception(f"fal.ai job failed ({result_resp.status_code}): {result_resp.text[:300]}")
+            return result_resp.json()
 
         elif status in ("FAILED", "CANCELLED"):
             error = status_data.get("error", "unknown error")
@@ -942,7 +955,7 @@ def generate_broll(
     prompt: str, fal_key: str, output_path: str, duration: str = "5"
 ) -> str:
     """
-    Generate b-roll: Recraft V4 image + Ken Burns zoom effect via FFmpeg.
+    Generate b-roll: Flux 2 Pro image + Ken Burns zoom effect via FFmpeg.
     """
     print(f"[SaaSShorts] 🎬 Generating b-roll image + Ken Burns effect...")
 
@@ -974,7 +987,9 @@ def generate_broll(
     total_frames = dur_secs * fps
     # Zoom from 1.0x to 1.15x over duration (subtle, cinematic)
     zoompan_filter = (
-        f"scale=2160:3840,"
+        # The image is 3:4. Fill 9:16 and crop the sides; a plain scale
+        # squeezed it by 25 %.
+        f"scale=2160:3840:force_original_aspect_ratio=increase,crop=2160:3840,"
         f"zoompan=z='1+0.15*on/{total_frames}':"
         f"x='iw/2-(iw/zoom/2)+10*on/{total_frames}':"
         f"y='ih/2-(ih/zoom/2)':"
@@ -1119,33 +1134,6 @@ Format: Layer, Start, End, Style, Name, MarginL, MarginR, MarginV, Effect, Text
         f.write(ass_content)
 
     print(f"[SaaSShorts] ✅ TikTok subs: {len(chunks)} captions from {len(words)} words")
-    return output_path
-
-
-def generate_srt_from_script(segments: list, output_path: str) -> str:
-    """Fallback: generate basic SRT from script segments (used if no audio available)."""
-    srt_content = ""
-    index = 1
-    for seg in segments:
-        text = seg.get("subtitle_text") or seg.get("narration", "")
-        if not text:
-            continue
-        words = text.split()
-        chunk_size = 3
-        start_time = seg["start"]
-        end_time = seg["end"]
-        duration = end_time - start_time
-        chunks = [words[i : i + chunk_size] for i in range(0, len(words), chunk_size)]
-        chunk_dur = duration / max(len(chunks), 1)
-        for i, chunk in enumerate(chunks):
-            cs = start_time + i * chunk_dur
-            ce = min(start_time + (i + 1) * chunk_dur, end_time)
-            h, m, s, ms = int(cs//3600), int((cs%3600)//60), int(cs%60), int((cs-int(cs))*1000)
-            h2, m2, s2, ms2 = int(ce//3600), int((ce%3600)//60), int(ce%60), int((ce-int(ce))*1000)
-            srt_content += f"{index}\n{h:02d}:{m:02d}:{s:02d},{ms:03d} --> {h2:02d}:{m2:02d}:{s2:02d},{ms2:03d}\n{' '.join(chunk).upper()}\n\n"
-            index += 1
-    with open(output_path, "w", encoding="utf-8") as f:
-        f.write(srt_content)
     return output_path
 
 

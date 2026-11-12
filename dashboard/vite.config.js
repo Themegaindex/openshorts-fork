@@ -14,10 +14,10 @@ export default defineConfig(({ mode }) => {
   return {
   plugins: [react()],
   server: {
-    allowedHosts: [
-      'openshorts.app',
-      'www.openshorts.app'
-    ],
+    // No extra allowedHosts: Vite then accepts only localhost and IP
+    // addresses. The proxy adds the API token to every request, so a foreign
+    // host name (the upstream project's domain was listed here) would open a
+    // DNS-rebinding path to the authenticated API.
     proxy: {
       '/api': {
         target: backendTarget,

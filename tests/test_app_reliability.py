@@ -150,8 +150,10 @@ def test_safe_bounce_is_a_valid_subtitle_effect():
 
 def test_signature_subtitle_presets_are_valid():
     neon = app.SubtitleRequest(job_id="j", clip_index=0, preset="neon_sweep")
+    tube = app.SubtitleRequest(job_id="j", clip_index=0, preset="neon_tube")
     rainbow = app.SubtitleRequest(job_id="j", clip_index=0, preset="rainbow_word")
     assert neon.preset == "neon_sweep"
+    assert tube.preset == "neon_tube"
     assert rainbow.preset == "rainbow_word"
 
 
@@ -752,3 +754,90 @@ def test_subtitle_keeps_bad_request_http_status(monkeypatch, tmp_path):
         asyncio.run(app._add_subtitles_locked(request))
 
     assert exc.value.status_code == 400
+
+
+def test_cleanup_sweep_survives_foreign_folder_and_purges_leftovers(monkeypatch, tmp_path):
+    import time
+
+    output_dir = tmp_path / "output"
+    upload_dir = tmp_path / "uploads"
+    thumbnails_dir = output_dir / "thumbnails"
+    tombstone_dir = output_dir / ".job_tombstones"
+    for directory in (upload_dir, thumbnails_dir, tombstone_dir):
+        directory.mkdir(parents=True)
+    monkeypatch.setattr(app, "OUTPUT_DIR", str(output_dir))
+    monkeypatch.setattr(app, "UPLOAD_DIR", str(upload_dir))
+    monkeypatch.setattr(app, "THUMBNAILS_DIR", str(thumbnails_dir))
+    monkeypatch.setattr(app, "JOB_TOMBSTONE_DIR", str(tombstone_dir))
+    monkeypatch.setattr(app, "jobs", {})
+    monkeypatch.setattr(app, "thumbnail_sessions", {})
+
+    # A folder name that is not a valid job id used to end the whole sweep.
+    (output_dir / "benign folder").mkdir()
+    saas_dir = output_dir / "saas_abc"
+    saas_dir.mkdir()
+    monkeypatch.setattr(app, "saas_jobs", {"abc": {"status": "completed", "output_dir": str(saas_dir)}})
+    face_dir = upload_dir / "thumb_session1"
+    face_dir.mkdir()
+    (face_dir / "face.png").write_bytes(b"face")
+    thumb_dir = thumbnails_dir / "session1"
+    thumb_dir.mkdir()
+    (thumb_dir / "thumb_1.jpg").write_bytes(b"thumb")
+    expired = time.time() - app.JOB_RETENTION_SECONDS - 100
+    for path in (saas_dir, face_dir, thumb_dir):
+        os.utime(path, (expired, expired))
+    monkeypatch.setattr(app, "publish_jobs", {
+        "upload-running": {"status": "uploading", "created_at": time.time() - app.PUBLISH_JOB_TTL_SECONDS - 10},
+    })
+
+    sleeps = []
+
+    async def one_round(_seconds):
+        sleeps.append(_seconds)
+        if len(sleeps) > 1:
+            raise asyncio.CancelledError
+
+    monkeypatch.setattr(app.asyncio, "sleep", one_round)
+    with pytest.raises(asyncio.CancelledError):
+        asyncio.run(app.cleanup_jobs())
+
+    assert (output_dir / "benign folder").exists()
+    assert not saas_dir.exists()
+    assert "abc" not in app.saas_jobs
+    assert not face_dir.exists()
+    assert not thumb_dir.exists()
+    assert "upload-running" in app.publish_jobs
+
+
+def test_gzip_applies_to_api_json_but_not_to_media_or_downloads():
+    from starlette.responses import PlainTextResponse
+
+    body = "x" * 5000
+
+    async def inner(scope, receive, send):
+        await PlainTextResponse(body)(scope, receive, send)
+
+    middleware = app.ApiGZipMiddleware(inner, minimum_size=1024)
+
+    async def response_headers(path):
+        scope = {
+            "type": "http", "method": "GET", "path": path, "root_path": "",
+            "query_string": b"", "headers": [(b"accept-encoding", b"gzip")],
+        }
+        messages = []
+
+        async def receive():
+            return {"type": "http.request", "body": b"", "more_body": False}
+
+        async def send(message):
+            messages.append(message)
+
+        await middleware(scope, receive, send)
+        start = next(message for message in messages if message["type"] == "http.response.start")
+        return {key.decode().lower(): value.decode() for key, value in start["headers"]}
+
+    assert asyncio.run(response_headers("/api/status/job")).get("content-encoding") == "gzip"
+    for path in ("/api/jobs/job/download-all", "/videos/job/clip.mp4"):
+        headers = asyncio.run(response_headers(path))
+        assert "content-encoding" not in headers
+        assert headers["content-length"] == str(len(body))

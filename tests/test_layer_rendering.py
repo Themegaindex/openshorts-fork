@@ -38,8 +38,10 @@ class TestBuildLayerCommand:
         cmd = build_layer_command("in.mp4", "out.mp4", subtitle_filter="ass='s.ass'")
         assert "-vf" in cmd
         assert "-filter_complex" not in cmd
+        # No yuv444p round trip: it cost two 4K lanczos passes for no
+        # measurable gain in the 4:2:0 deliverable.
         assert cmd[cmd.index("-vf") + 1] == (
-            f"format=yuv444p,ass='s.ass',{EVEN_PAD_FILTER},format=yuv420p"
+            f"ass='s.ass',{EVEN_PAD_FILTER},format=yuv420p"
         )
 
     def test_hook_only_uses_overlay(self):
@@ -58,7 +60,7 @@ class TestBuildLayerCommand:
             subtitle_filter="ass='s.ass'", hook_png="h.png", hook_x=10, hook_y=20,
         )
         fc = cmd[cmd.index("-filter_complex") + 1]
-        assert fc == (f"[0:v]format=yuv444p,ass='s.ass'[v0];"
+        assert fc == (f"[0:v]ass='s.ass'[v0];"
                       f"[v0][1:v]overlay=10:20[v1];"
                       f"[v1]{EVEN_PAD_FILTER},format=yuv420p[vout]")
         # exactly one encode: a single ffmpeg invocation with one output
@@ -115,7 +117,7 @@ class TestHookEntrance:
                                   hook_png="h.png", hook_x=10, hook_y=20, hook_entrance=True)
         fc = cmd[cmd.index("-filter_complex") + 1]
         assert fc == ("[1:v]format=rgba,fade=t=in:st=0:d=0.35:alpha=1[hk];"
-                      "[0:v]format=yuv444p,ass='s.ass'[v0];"
+                      "[0:v]ass='s.ass'[v0];"
                       "[v0][hk]overlay=10:'20+60*pow(1-min(t/0.5,1),2)':shortest=1[v1];"
                       f"[v1]{EVEN_PAD_FILTER},format=yuv420p[vout]")
 
@@ -188,12 +190,12 @@ def test_animated_hook_is_visible_in_rendered_pixels(tmp_path):
 
 
 def test_nvenc_layer_command_keeps_filters_and_flags():
-    nvenc_args = ["-c:v", "h264_nvenc", "-preset", "p7", "-cq", "21", "-b:v", "0", "-pix_fmt", "yuv420p"]
+    nvenc_args = ["-c:v", "h264_nvenc", "-preset", "p4", "-cq", "21", "-b:v", "0", "-pix_fmt", "yuv420p"]
     cmd = build_layer_command("in.mp4", "out.mp4", subtitle_filter="ass='s.ass'",
                               hook_png="h.png", hook_x=10, hook_y=20, video_args=nvenc_args)
     assert "-sws_flags" in cmd
     fc = cmd[cmd.index("-filter_complex") + 1]
-    assert "format=yuv444p" in fc and fc.endswith(",format=yuv420p[vout]")
+    assert "yuv444p" not in fc and fc.endswith(",format=yuv420p[vout]")
     assert cmd[cmd.index("-c:a") + 1] == "copy"
     assert "h264_nvenc" in cmd and "-cq" in cmd
     assert cmd[-3:] == ["-movflags", "+faststart", "out.mp4"]
