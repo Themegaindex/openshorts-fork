@@ -2076,6 +2076,8 @@ def download_youtube_video(url, output_dir=".", resume=False):
     With resume=True already finished format files and .part fragments are kept
     so a re-download after an interrupted job continues instead of starting over.
     """
+    from security import validate_youtube_url
+    validate_youtube_url(url)
     print(f"🔍 Debug: yt-dlp version: {yt_dlp.version.__version__}")
     print("📥 Downloading video from YouTube...")
     step_start_time = time.time()

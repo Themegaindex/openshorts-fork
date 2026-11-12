@@ -1,0 +1,24 @@
+{
+  "upstream_sha": "894514049a3c6210a7cd65676344f44371b3717a",
+  "command": "npm audit --package-lock-only --json --ignore-scripts (isolated copy of upstream manifests)",
+  "exit_code": 1,
+  "metadata": {
+    "vulnerabilities": {
+      "info": 0,
+      "low": 1,
+      "moderate": 3,
+      "high": 11,
+      "critical": 0,
+      "total": 15
+    },
+    "dependencies": {
+      "prod": 20,
+      "dev": 233,
+      "optional": 23,
+      "peer": 0,
+      "peerOptional": 0,
+      "total": 252
+    }
+  },
+  "scope": "Advisory lookup only; no dependency installation, upstream application execution or exploitation."
+}

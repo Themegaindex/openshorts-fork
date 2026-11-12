@@ -18,16 +18,19 @@ from datetime import datetime, timezone
 from dotenv import load_dotenv
 from collections import OrderedDict
 from typing import Dict, Optional, List, Literal
+from urllib.parse import urlsplit, quote
 from contextlib import asynccontextmanager
 from fastapi import FastAPI, UploadFile, File, Form, HTTPException, Request, Header, BackgroundTasks
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.middleware.gzip import GZipMiddleware
-from fastapi.staticfiles import StaticFiles
+from starlette.middleware.trustedhost import TrustedHostMiddleware
 from fastapi.responses import HTMLResponse, JSONResponse, FileResponse
 from starlette.background import BackgroundTask
 from pydantic import BaseModel, Field
 from s3_uploader import upload_job_artifacts, list_all_clips, upload_actor_to_s3, list_actor_gallery, upload_video_to_gallery, list_video_gallery
 from video_formats import CANONICAL_OUTPUT_FORMATS, normalize_output_format
+from security import confined_path, validate_id, upload_suffix, validate_youtube_url, download_public_media
+from security_http import MediaFiles, SecurityBoundaryMiddleware, configured_origins
 
 load_dotenv()
 
@@ -41,6 +44,8 @@ os.makedirs(OUTPUT_DIR, exist_ok=True)
 # Default to 1 if not set, but user can set higher for powerful servers
 MAX_CONCURRENT_JOBS = int(os.environ.get("MAX_CONCURRENT_JOBS", "5"))
 MAX_FILE_SIZE_MB = 2048  # 2GB limit
+MAX_PENDING_JOBS = 20
+_process_intake_count = 0
 JOB_RETENTION_SECONDS = int(os.environ.get("JOB_RETENTION_SECONDS", str(24 * 3600)))
 # The worker emits a keepalive heartbeat every 15s, so silence this long really
 # means the process is frozen — not just busy inside a long FFmpeg/Whisper call.
@@ -333,11 +338,13 @@ def _isoformat(ts: Optional[float] = None) -> str:
 
 
 def _job_state_path(job_id: str, output_dir: Optional[str] = None) -> str:
+    _safe_id(job_id)
     job_dir = output_dir or os.path.join(OUTPUT_DIR, job_id)
     return os.path.join(job_dir, JOB_STATE_FILENAME)
 
 
 def _job_tombstone_path(job_id: str) -> str:
+    _safe_id(job_id)
     return os.path.join(JOB_TOMBSTONE_DIR, f"{job_id}.json")
 
 
@@ -1083,6 +1090,12 @@ def _recover_jobs_from_disk() -> None:
     for entry in os.listdir(OUTPUT_DIR):
         if entry.startswith(".") or entry == "thumbnails":
             continue
+        # output/ may contain unrelated or legacy folders. Only server-issued
+        # identifiers participate in job-state recovery.
+        try:
+            validate_id(entry)
+        except ValueError:
+            continue
         output_dir = os.path.join(OUTPUT_DIR, entry)
         if not os.path.isdir(output_dir):
             continue
@@ -1519,11 +1532,47 @@ async def lifespan(app: FastAPI):
 
 app = FastAPI(lifespan=lifespan)
 
+
+def _safe_id(value):
+    try:
+        return validate_id(value)
+    except ValueError as exc:
+        raise HTTPException(status_code=400, detail=str(exc)) from exc
+
+
+def _storage_path(directory, relative):
+    try:
+        return confined_path(directory, relative)
+    except ValueError as exc:
+        raise HTTPException(status_code=400, detail="Invalid storage path") from exc
+
+
+def _youtube_url(url):
+    try:
+        return validate_youtube_url(url)
+    except ValueError as exc:
+        raise HTTPException(status_code=400, detail=str(exc)) from exc
+
+
+def _upload_path(file, prefix="upload"):
+    try:
+        suffix = upload_suffix(file.filename)
+    except ValueError as exc:
+        raise HTTPException(status_code=400, detail=str(exc)) from exc
+    return _storage_path(UPLOAD_DIR, f"{prefix}_{uuid.uuid4().hex}{suffix}")
+
+
+def _check_job_capacity():
+    pending = sum(job.get("status") in ACTIVE_JOB_STATUSES for job in jobs.values())
+    pending += sum(job.get("status") == "processing" for job in saas_jobs.values())
+    if pending + _process_intake_count >= MAX_PENDING_JOBS:
+        raise HTTPException(status_code=429, detail="Job queue is full; retry later")
+
 # Enable CORS for frontend
 app.add_middleware(
     CORSMiddleware,
-    allow_origins=["*"],
-    allow_credentials=True,
+    allow_origins=configured_origins(),
+    allow_credentials=False,
     allow_methods=["*"],
     allow_headers=["*"],
 )
@@ -1532,14 +1581,16 @@ app.add_middleware(
 # gzipped (-88%). Video files are served via /videos (already compressed
 # codecs, > minimum_size guard not relevant since StaticFiles streams).
 app.add_middleware(GZipMiddleware, minimum_size=1024)
+app.add_middleware(SecurityBoundaryMiddleware, max_body_bytes=(MAX_FILE_SIZE_MB + 1) * 1024 * 1024)
+app.add_middleware(TrustedHostMiddleware, allowed_hosts=[h.strip() for h in os.environ.get("OPENSHORTS_ALLOWED_HOSTS", "localhost,127.0.0.1,[::1]").split(",") if h.strip()])
 
 # Mount static files for serving videos
-app.mount("/videos", StaticFiles(directory=OUTPUT_DIR), name="videos")
+app.mount("/videos", MediaFiles(directory=OUTPUT_DIR), name="videos")
 
 # Mount static files for serving thumbnails
 THUMBNAILS_DIR = os.path.join(OUTPUT_DIR, "thumbnails")
 os.makedirs(THUMBNAILS_DIR, exist_ok=True)
-app.mount("/thumbnails", StaticFiles(directory=THUMBNAILS_DIR), name="thumbnails")
+app.mount("/thumbnails", MediaFiles(directory=THUMBNAILS_DIR), name="thumbnails")
 
 class ProcessRequest(BaseModel):
     url: str
@@ -1855,24 +1906,28 @@ async def run_job(job_id, job_data):
             _stop_process(process)
             _unregister_job_process(job_id, process)
 
-async def _save_upload_with_limit(file: UploadFile, dest_path: str, cleanup_dirs: Optional[List[str]] = None):
+async def _save_upload_with_limit(file: UploadFile, dest_path: str, cleanup_dirs: Optional[List[str]] = None, max_bytes=None):
     """Stream an UploadFile to dest_path in 1MB chunks, enforcing MAX_FILE_SIZE_MB.
 
-    On overflow, removes the partial file plus any cleanup_dirs and raises HTTP 413.
+    On failure, removes only the newly created partial file. Caller-owned
+    directories are preserved; an oversized file raises HTTP 413.
     """
     size = 0
-    limit_bytes = MAX_FILE_SIZE_MB * 1024 * 1024
-
-    with open(dest_path, "wb") as buffer:
-        while content := await file.read(1024 * 1024):  # Read 1MB chunks
-            size += len(content)
-            if size > limit_bytes:
-                if os.path.exists(dest_path):
-                    os.remove(dest_path)
-                for d in (cleanup_dirs or []):
-                    shutil.rmtree(d, ignore_errors=True)
-                raise HTTPException(status_code=413, detail=f"File too large. Max size {MAX_FILE_SIZE_MB}MB")
-            buffer.write(content)
+    limit_bytes = max_bytes if max_bytes is not None else MAX_FILE_SIZE_MB * 1024 * 1024
+    created = False
+    try:
+        with open(dest_path, "xb") as buffer:
+            created = True
+            while content := await file.read(1024 * 1024):
+                size += len(content)
+                if size > limit_bytes:
+                    raise HTTPException(status_code=413, detail="File exceeds upload size limit")
+                buffer.write(content)
+    except BaseException:
+        # Close the handle before cleanup, including on Windows and cancellation.
+        if created:
+            os.remove(dest_path)
+        raise
 
 # Below this height the quality gate asks the user before starting (0 = off).
 QUALITY_GATE_MIN_HEIGHT = int(os.environ.get("QUALITY_GATE_MIN_HEIGHT", "720"))
@@ -2017,6 +2072,9 @@ async def process_endpoint(
     layout_style: Optional[str] = Form(None),
     video_type: Optional[str] = Form(None),
 ):
+    global _process_intake_count
+    _check_job_capacity()
+    _process_intake_count += 1
     process_request = _register_process_request(request.headers.get("X-Process-Request-Id"))
     if process_request is not None:
         process_request["in_flight"] = True
@@ -2025,6 +2083,7 @@ async def process_endpoint(
             request, file, url, output_format, layout_style, video_type, process_request,
         )
     finally:
+        _process_intake_count -= 1
         if process_request is not None:
             process_request["in_flight"] = False
             process_request["ts"] = _now_ts()
@@ -2047,7 +2106,12 @@ async def _process_endpoint_body(
     force_low_quality = False
     content_type = request.headers.get("content-type", "")
     if "application/json" in content_type:
-        body = await request.json()
+        try:
+            body = await request.json()
+        except (ValueError, TypeError) as exc:
+            raise HTTPException(status_code=400, detail="Invalid JSON request") from exc
+        if not isinstance(body, dict):
+            raise HTTPException(status_code=400, detail="Expected a JSON object")
         url = body.get("url")
         force_low_quality = bool(body.get("force_low_quality"))
         output_format = body.get("output_format")
@@ -2062,6 +2126,9 @@ async def _process_endpoint_body(
 
     if not url and not file:
         raise HTTPException(status_code=400, detail="Must provide URL or File")
+
+    if url:
+        url = _youtube_url(url)
 
     # Pre-flight quality gate: probe the offered resolution BEFORE starting the
     # job, so the user can abort (refresh cookies / update yt-dlp) instead of
@@ -2097,7 +2164,7 @@ async def _process_endpoint_body(
         cmd.extend(["-u", url])
     else:
         # Save uploaded file with size limit check
-        input_path = os.path.join(UPLOAD_DIR, f"{job_id}_{file.filename}")
+        input_path = _upload_path(file, job_id)
         input_filename = file.filename
 
         await _save_upload_with_limit(file, input_path, cleanup_dirs=[job_output_dir])
@@ -2403,7 +2470,7 @@ from translate import translate_video, get_supported_languages
 from thumbnail import analyze_video_for_titles, refine_titles, generate_thumbnail, generate_youtube_description
 
 class EditRequest(BaseModel):
-    job_id: str
+    job_id: str = Field(pattern=r"^[A-Za-z0-9][A-Za-z0-9_-]{0,127}$")
     clip_index: int = Field(ge=0)
     api_key: Optional[str] = None
     input_filename: Optional[str] = None
@@ -2631,6 +2698,8 @@ def _coerce_layer_store(raw: dict) -> dict:
 
 def _filename_from_clip(clip_data: dict, requested_filename: Optional[str] = None) -> str:
     if requested_filename:
+        if "/" in requested_filename or "\\" in requested_filename or ":" in requested_filename or requested_filename in (".", ".."):
+            raise HTTPException(status_code=400, detail="Invalid clip filename")
         return os.path.basename(requested_filename)
     current = os.path.basename(str(clip_data.get("video_url") or "").split("/")[-1])
     return current or os.path.basename(str(clip_data.get("output_filename") or ""))
@@ -2828,16 +2897,16 @@ def _clip_layer_summary(entry: dict) -> dict:
 
 def _clean_source_path(output_dir: str, entry: dict) -> str:
     clean_source = os.path.basename(str(entry.get("clean_source") or ""))
-    path = os.path.join(output_dir, clean_source)
+    path = _storage_path(output_dir, clean_source) if clean_source else ""
     if not clean_source or not os.path.exists(path):
-        raise HTTPException(status_code=404, detail=f"Clean video source not found: {path}")
+        raise HTTPException(status_code=404, detail="Clean video source not found")
     return path
 
 
 def _stored_subtitle_layer(output_dir: str, entry: dict):
     subtitle = entry.get("subtitle") or {}
     filename = os.path.basename(str(subtitle.get("path") or ""))
-    path = os.path.join(output_dir, filename)
+    path = _storage_path(output_dir, filename) if filename else ""
     if filename and os.path.exists(path):
         return path, subtitle.get("burn_opts") or {}
     return None, None
@@ -2953,7 +3022,7 @@ def _prepare_hook_layer(input_path: str, hook_layer: Optional[dict]):
 
 
 class SubtitleRequest(BaseModel):
-    job_id: str
+    job_id: str = Field(pattern=r"^[A-Za-z0-9][A-Za-z0-9_-]{0,127}$")
     clip_index: int = Field(ge=0)
     position: Literal["top", "middle", "bottom"] = "bottom"
     font_size: int = Field(default=16, ge=10, le=200)
@@ -3128,7 +3197,7 @@ async def _add_subtitles_locked(req: SubtitleRequest):
 
 
 class RemoveLayerRequest(BaseModel):
-    job_id: str
+    job_id: str = Field(pattern=r"^[A-Za-z0-9][A-Za-z0-9_-]{0,127}$")
     clip_index: int = Field(ge=0)
     # "all" also drops auto-edit and dubbing by going back to the originally
     # rendered clip; the two named layers keep the current clean source.
@@ -3231,7 +3300,7 @@ async def _remove_clip_layer_locked(req: RemoveLayerRequest):
 @app.get("/api/jobs/{job_id}/download-all")
 async def download_all_clips(job_id: str):
     """Bundle the current version of every clip of a job into one ZIP."""
-    output_dir = os.path.join(OUTPUT_DIR, job_id)
+    output_dir = _storage_path(OUTPUT_DIR, _safe_id(job_id))
     json_files = glob.glob(os.path.join(output_dir, "*_metadata.json"))
     if not json_files:
         raise HTTPException(status_code=404, detail="Job not found")
@@ -3250,7 +3319,7 @@ async def download_all_clips(job_id: str):
             filename = _resolve_clip_filename(clip, base_name, i)
             if prefix == "long" and not clip.get("video_url") and not clip.get("output_filename"):
                 filename = f"{base_name}_long_{i + 1}.mp4"
-            path = os.path.join(output_dir, filename)
+            path = _storage_path(output_dir, filename)
             if filename and os.path.exists(path) and os.path.getsize(path) > 0:
                 files.append((f"{prefix}_{i + 1:02d}_{os.path.basename(path)}", path))
 
@@ -3310,7 +3379,7 @@ async def download_clip(job_id: str, clip_index: int):
 
 
 class HookRequest(BaseModel):
-    job_id: str
+    job_id: str = Field(pattern=r"^[A-Za-z0-9][A-Za-z0-9_-]{0,127}$")
     clip_index: int = Field(ge=0)
     text: str
     input_filename: Optional[str] = None
@@ -3389,7 +3458,7 @@ async def _add_hook_locked(req: HookRequest):
     }
 
 class TranslateRequest(BaseModel):
-    job_id: str
+    job_id: str = Field(pattern=r"^[A-Za-z0-9][A-Za-z0-9_-]{0,127}$")
     clip_index: int = Field(ge=0)
     target_language: str = Field(min_length=2, max_length=20, pattern=r"^[A-Za-z-]+$")
     source_language: Optional[str] = Field(default=None, min_length=2, max_length=20, pattern=r"^[A-Za-z-]+$")
@@ -3508,7 +3577,7 @@ async def _translate_clip_locked(req: TranslateRequest, x_elevenlabs_key: Option
     }
 
 class SocialPostRequest(BaseModel):
-    job_id: str
+    job_id: str = Field(pattern=r"^[A-Za-z0-9][A-Za-z0-9_-]{0,127}$")
     clip_index: int = Field(ge=0)
     api_key: str
     user_id: str
@@ -3679,6 +3748,10 @@ async def thumbnail_upload(
     """Upload video and start background Whisper transcription immediately."""
     if not url and not file:
         raise HTTPException(status_code=400, detail="Must provide URL or File")
+    if url:
+        url = _youtube_url(url)
+    if len(thumbnail_sessions) >= 50:
+        raise HTTPException(status_code=429, detail="Too many thumbnail sessions")
 
     session_id = str(uuid.uuid4())
     transcript_event = asyncio.Event()
@@ -3686,7 +3759,7 @@ async def thumbnail_upload(
     # Save file if uploaded directly
     video_path = None
     if file:
-        video_path = os.path.join(UPLOAD_DIR, f"thumb_{session_id}_{file.filename}")
+        video_path = _upload_path(file, f"thumb_{session_id}")
         await _save_upload_with_limit(file, video_path)
 
     # Initialize session
@@ -3765,6 +3838,13 @@ async def thumbnail_analyze(
     if not api_key:
         raise HTTPException(status_code=400, detail="Missing X-Gemini-Key header")
 
+    if session_id:
+        _safe_id(session_id)
+    if url:
+        url = _youtube_url(url)
+    if not session_id and len(thumbnail_sessions) >= 50:
+        raise HTTPException(status_code=429, detail="Too many thumbnail sessions")
+
     pre_transcript = None
 
     # Check for pre-existing session with background Whisper
@@ -3778,7 +3858,7 @@ async def thumbnail_analyze(
             await transcript_event.wait()
 
         if session.get("transcript_error"):
-            raise HTTPException(status_code=500, detail=f"Transcription failed: {session['transcript_error']}")
+            raise HTTPException(status_code=500, detail="Transcription failed. Check the server logs for details.")
 
         video_path = session["video_path"]
         if not video_path or not os.path.exists(video_path):
@@ -3800,10 +3880,8 @@ async def thumbnail_analyze(
                 None, download_youtube_video, url, UPLOAD_DIR
             )
         else:
-            video_path = os.path.join(UPLOAD_DIR, f"thumb_{session_id}_{file.filename}")
-            with open(video_path, "wb") as buffer:
-                content = await file.read()
-                buffer.write(content)
+            video_path = _upload_path(file, f"thumb_{session_id}")
+            await _save_upload_with_limit(file, video_path)
 
     try:
         # Run analysis in thread pool (skips Whisper if pre_transcript is available)
@@ -3841,7 +3919,7 @@ async def thumbnail_analyze(
 
 
 class ThumbnailTitlesRequest(BaseModel):
-    session_id: Optional[str] = None
+    session_id: Optional[str] = Field(default=None, pattern=r"^[A-Za-z0-9][A-Za-z0-9_-]{0,127}$")
     message: Optional[str] = None
     title: Optional[str] = None
 
@@ -3854,6 +3932,10 @@ async def thumbnail_titles(
     api_key = x_gemini_key
     if not api_key:
         raise HTTPException(status_code=400, detail="Missing X-Gemini-Key header")
+    if req.session_id:
+        _safe_id(req.session_id)
+    if (not req.session_id or req.session_id not in thumbnail_sessions) and len(thumbnail_sessions) >= 50:
+        raise HTTPException(status_code=429, detail="Too many thumbnail sessions")
 
     # Manual title mode - just create a session with the user's title
     if req.title:
@@ -3919,6 +4001,7 @@ async def thumbnail_generate(
     api_key = x_gemini_key
     if not api_key:
         raise HTTPException(status_code=400, detail="Missing X-Gemini-Key header")
+    _safe_id(session_id)
 
     # Clamp count
     count = min(max(1, count), 6)
@@ -3926,19 +4009,17 @@ async def thumbnail_generate(
     # Save optional uploaded images
     face_path = None
     bg_path = None
-    thumb_upload_dir = os.path.join(UPLOAD_DIR, f"thumb_{session_id}")
+    thumb_upload_dir = _storage_path(UPLOAD_DIR, f"thumb_{session_id}")
     os.makedirs(thumb_upload_dir, exist_ok=True)
 
     try:
         if face and face.filename:
-            face_path = os.path.join(thumb_upload_dir, f"face_{face.filename}")
-            with open(face_path, "wb") as f:
-                f.write(await face.read())
+            face_path = _storage_path(thumb_upload_dir, f"face_{uuid.uuid4().hex}{upload_suffix(face.filename)}")
+            await _save_upload_with_limit(face, face_path, max_bytes=10 * 1024 * 1024)
 
         if background and background.filename:
-            bg_path = os.path.join(thumb_upload_dir, f"bg_{background.filename}")
-            with open(bg_path, "wb") as f:
-                f.write(await background.read())
+            bg_path = _storage_path(thumb_upload_dir, f"bg_{uuid.uuid4().hex}{upload_suffix(background.filename)}")
+            await _save_upload_with_limit(background, bg_path, max_bytes=10 * 1024 * 1024)
 
         # Get video context from session (transcript summary from analysis step)
         video_context = ""
@@ -4032,14 +4113,14 @@ async def thumbnail_publish(
         raise HTTPException(status_code=404, detail="Original video file not found")
 
     # Resolve thumbnail path from URL
-    thumb_relative = thumbnail_url.lstrip("/")
-    if thumb_relative.startswith("thumbnails/"):
-        thumb_path = os.path.join(OUTPUT_DIR, thumb_relative)
-    else:
-        thumb_path = os.path.join(THUMBNAILS_DIR, thumb_relative)
+    _safe_id(session_id)
+    thumb_relative = thumbnail_url.removeprefix("/thumbnails/").removeprefix("thumbnails/")
+    thumb_path = _storage_path(THUMBNAILS_DIR, thumb_relative)
+    if os.path.splitext(thumb_path)[1].lower() not in (".jpg", ".jpeg", ".png", ".webp"):
+        raise HTTPException(status_code=400, detail="Invalid thumbnail type")
 
     if not os.path.exists(thumb_path):
-        raise HTTPException(status_code=404, detail=f"Thumbnail file not found: {thumb_path}")
+        raise HTTPException(status_code=404, detail="Thumbnail file not found")
 
     # Generate a unique ID for this publish job so the frontend can poll
     publish_id = str(uuid.uuid4())
@@ -4159,7 +4240,7 @@ saas_jobs: Dict[str, Dict] = {}
 class SaaSAnalyzeRequest(BaseModel):
     url: Optional[str] = None
     description: Optional[str] = None  # Manual product/business description
-    num_scripts: int = 3
+    num_scripts: int = Field(default=3, ge=1, le=6)
     style: str = "ugc"
     language: str = "en"
     actor_gender: str = "female"
@@ -4218,7 +4299,7 @@ async def saasshorts_analyze(
 
 class SaaSActorRequest(BaseModel):
     actor_description: str
-    num_options: int = 3
+    num_options: int = Field(default=3, ge=1, le=6)
     product_description: Optional[str] = None
 
 
@@ -4229,20 +4310,25 @@ async def saasshorts_actor_upload(file: UploadFile = File(...)):
         raise HTTPException(status_code=400, detail="File must be an image")
 
     try:
-        content = await file.read()
-
-        # Validate minimum size
-        if len(content) < 1000:
-            raise HTTPException(status_code=400, detail="File too small to be a valid image")
-
         upload_id = uuid.uuid4().hex[:8]
         upload_dir = os.path.join(OUTPUT_DIR, "actor_uploads")
         os.makedirs(upload_dir, exist_ok=True)
         filename = f"custom_{upload_id}.png"
         file_path = os.path.join(upload_dir, filename)
 
-        with open(file_path, "wb") as f:
-            f.write(content)
+        await _save_upload_with_limit(file, file_path, max_bytes=10 * 1024 * 1024)
+        # Decode before use so spoofed MIME types and decompression bombs fail.
+        def verify_image():
+            from PIL import Image
+            with Image.open(file_path) as image:
+                if image.width * image.height > 25_000_000:
+                    raise ValueError("Image dimensions exceed limit")
+                image.verify()
+        try:
+            await asyncio.get_running_loop().run_in_executor(None, verify_image)
+        except Exception as exc:
+            os.remove(file_path)  # Only the newly created, rejected upload.
+            raise HTTPException(status_code=400, detail="Invalid or oversized image") from exc
 
         return {"url": f"/videos/actor_uploads/{filename}"}
 
@@ -4270,14 +4356,15 @@ async def saasshorts_actor_options(
 
         loop = asyncio.get_running_loop()
         import functools
-        paths = await loop.run_in_executor(
-            None,
-            functools.partial(
-                generate_actor_images,
-                req.actor_description, fal_key, out_dir, "actor", req.num_options,
-                product_description=req.product_description,
-            ),
-        )
+        async with concurrency_semaphore:
+            paths = await loop.run_in_executor(
+                None,
+                functools.partial(
+                    generate_actor_images,
+                    req.actor_description, fal_key, out_dir, "actor", req.num_options,
+                    product_description=req.product_description,
+                ),
+            )
 
         # Upload each actor image to public S3 with description
         desc = req.actor_description
@@ -4312,7 +4399,7 @@ async def saasshorts_video_gallery(limit: int = 50):
 
 
 class SaaSPostRequest(BaseModel):
-    job_id: str
+    job_id: str = Field(pattern=r"^[A-Za-z0-9][A-Za-z0-9_-]{0,127}$")
     api_key: str
     user_id: str
     platforms: List[str]
@@ -4408,9 +4495,9 @@ async def gallery_html_page():
     ld_items = []
     for i, v in enumerate(videos):
         title = html_mod.escape(v.get("title", "Untitled"))
-        video_url = v.get("video_url", "")
-        actor_url = v.get("actor_url", "")
-        video_id = v.get("video_id", "")
+        video_url = _html_url(v.get("video_url", ""))
+        actor_url = _html_url(v.get("actor_url", ""))
+        video_id = quote(str(v.get("video_id", "")), safe="")
         duration = v.get("duration", 0)
         mode = v.get("video_mode", "")
         product = html_mod.escape(v.get("product_name", ""))
@@ -4434,9 +4521,9 @@ async def gallery_html_page():
           </div>
         </a>'''
 
-        ld_items.append(f'{{"@type":"ListItem","position":{i+1},"url":"https://openshorts.app/video/{video_id}","name":"{title}"}}')
+        ld_items.append({"@type": "ListItem", "position": i + 1, "url": f"https://openshorts.app/video/{video_id}", "name": v.get("title", "Untitled")})
 
-    ld_json = f'{{"@context":"https://schema.org","@type":"CollectionPage","name":"AI UGC Video Gallery","mainEntity":{{"@type":"ItemList","numberOfItems":{len(videos)},"itemListElement":[{",".join(ld_items)}]}}}}'
+    ld_json = _json_ld({"@context": "https://schema.org", "@type": "CollectionPage", "name": "AI UGC Video Gallery", "mainEntity": {"@type": "ItemList", "numberOfItems": len(videos), "itemListElement": ld_items}})
 
     return f'''<!DOCTYPE html>
 <html lang="en">
@@ -4468,6 +4555,22 @@ h1{{font-size:28px;font-weight:700;padding:40px 20px 0;text-align:center}}
 </body></html>'''
 
 
+def _html_url(value):
+    import html
+    value = str(value or "")
+    parsed = urlsplit(value)
+    if "\\" in value or any(ord(c) < 32 for c in value):
+        return ""
+    if not ((parsed.scheme in ("https", "http") and parsed.hostname and not parsed.username and not parsed.password) or (value.startswith("/") and not value.startswith("//"))):
+        return ""
+    return html.escape(value, quote=True)
+
+
+def _json_ld(value):
+    # HTML parses a closing script tag even inside a JSON string.
+    return json.dumps(value, ensure_ascii=True).replace("<", "\\u003c").replace(">", "\\u003e").replace("&", "\\u0026")
+
+
 @app.get("/video/{video_id}", response_class=HTMLResponse)
 async def video_html_page(video_id: str):
     """SEO individual video page with og:video meta tags."""
@@ -4481,19 +4584,19 @@ async def video_html_page(video_id: str):
     title = html_mod.escape(meta.get("title", "Untitled"))
     caption = html_mod.escape(meta.get("caption", ""))
     narration = html_mod.escape(meta.get("full_narration", ""))
-    video_url = meta.get("video_url", "")
-    actor_url = meta.get("actor_url", "")
+    video_url = _html_url(meta.get("video_url", ""))
+    actor_url = _html_url(meta.get("actor_url", ""))
     duration = meta.get("duration", 0)
     mode = meta.get("video_mode", "")
     product = html_mod.escape(meta.get("product_name", ""))
-    product_url = html_mod.escape(meta.get("product_url", ""))
-    language = meta.get("language", "en")
-    hashtags = " ".join(meta.get("hashtags", []))
+    product_url = _html_url(meta.get("product_url", ""))
+    language = html_mod.escape(str(meta.get("language", "en")), quote=True)
+    hashtags = html_mod.escape(" ".join(str(tag) for tag in meta.get("hashtags", [])), quote=True)
     cost = meta.get("cost_estimate", {}).get("total", 0)
     created = meta.get("created_at", "")
     actor_desc = html_mod.escape(meta.get("actor_description", ""))
 
-    ld_json = f'{{"@context":"https://schema.org","@type":"VideoObject","name":"{title}","description":"{caption}","thumbnailUrl":"{actor_url}","contentUrl":"{video_url}","uploadDate":"{created}","duration":"PT{int(duration)}S","width":1080,"height":1920,"inLanguage":"{language}"}}'
+    ld_json = _json_ld({"@context": "https://schema.org", "@type": "VideoObject", "name": meta.get("title", "Untitled"), "description": meta.get("caption", ""), "thumbnailUrl": meta.get("actor_url", ""), "contentUrl": meta.get("video_url", ""), "uploadDate": created, "duration": f"PT{int(duration)}S", "width": 1080, "height": 1920, "inLanguage": meta.get("language", "en")})
 
     mode_label = "Low Cost" if mode == "lowcost" else "Premium"
 
@@ -4542,7 +4645,7 @@ h1{{font-size:22px;font-weight:700;margin-bottom:8px}}
 <div class="section"><h2>Caption</h2><p>{caption}</p><p style="color:#8b5cf6;margin-top:4px">{hashtags}</p></div>
 <div class="section"><h2>Script</h2><p>{narration}</p></div>
 <div class="section"><h2>Actor</h2><p>{actor_desc}</p></div>
-{f'<div class="section"><h2>Product</h2><p><a href="{product_url}" style="color:#8b5cf6" target="_blank">{product}</a></p></div>' if product_url else ''}
+{f'<div class="section"><h2>Product</h2><p><a href="{product_url}" style="color:#8b5cf6" target="_blank" rel="noopener noreferrer">{product}</a></p></div>' if product_url else ''}
 <a href="/gallery">← Back to Gallery</a>
 <br><a href="/" class="cta">Create Your Own</a>
 </div>
@@ -4567,8 +4670,8 @@ class SaaSGenerateRequest(BaseModel):
     voice_id: Optional[str] = None
     actor_description: Optional[str] = None
     selected_actor_url: Optional[str] = None  # Pre-selected actor image URL
-    retry_job_id: Optional[str] = None
-    video_mode: str = "lowcost"  # "lowcost" or "premium"
+    retry_job_id: Optional[str] = Field(default=None, pattern=r"^[A-Za-z0-9][A-Za-z0-9_-]{0,127}$")
+    video_mode: Literal["lowcost", "premium"] = "lowcost"
 
 
 @app.post("/api/saasshorts/generate")
@@ -4585,12 +4688,27 @@ async def saasshorts_generate(
         raise HTTPException(status_code=400, detail="Missing fal.ai API Key (X-Fal-Key header)")
     if not elevenlabs_key:
         raise HTTPException(status_code=400, detail="Missing ElevenLabs API Key (X-ElevenLabs-Key header)")
+    _check_job_capacity()
+    if req.retry_job_id:
+        _safe_id(req.retry_job_id)
+        if saas_jobs.get(req.retry_job_id, {}).get("status") == "processing":
+            raise HTTPException(status_code=409, detail="Job is already active")
+    segments = req.script.get("segments", [])
+    if not isinstance(segments, list) or len(segments) > 30 or any(not isinstance(seg, dict) for seg in segments):
+        raise HTTPException(status_code=400, detail="A script supports at most 30 segments")
+    selected_local_actor = None
+    if req.selected_actor_url and not req.selected_actor_url.startswith(("https://", "http://")):
+        if not req.selected_actor_url.startswith("/videos/"):
+            raise HTTPException(status_code=400, detail="Invalid actor media path")
+        selected_local_actor = _storage_path(OUTPUT_DIR, req.selected_actor_url.removeprefix("/videos/"))
+        if os.path.splitext(selected_local_actor)[1].lower() not in (".jpg", ".jpeg", ".png", ".webp"):
+            raise HTTPException(status_code=400, detail="Invalid actor image type")
 
     # Support retry: reuse output_dir so cached assets (image, voice, head, broll) are kept
     reused = False
     if req.retry_job_id:
         # Check memory first, then disk
-        old_dir = os.path.join(OUTPUT_DIR, f"saas_{req.retry_job_id}")
+        old_dir = _storage_path(OUTPUT_DIR, f"saas_{req.retry_job_id}")
         if req.retry_job_id in saas_jobs:
             old_dir = saas_jobs[req.retry_job_id]["output_dir"]
 
@@ -4626,26 +4744,26 @@ async def saasshorts_generate(
     # If user selected a pre-generated actor, resolve it to a local path
     selected_actor_path = None
     if req.selected_actor_url:
-        if req.selected_actor_url.startswith("http"):
+        if req.selected_actor_url.startswith(("https://", "http://")):
             # Download from S3 public URL to job output dir (off the event loop).
             import httpx
 
             def _download_actor():
                 actor_local = os.path.join(job_output_dir, "selected_actor.png")
-                with httpx.Client(timeout=30.0) as client:
-                    resp = client.get(req.selected_actor_url)
-                    if resp.status_code == 200:
-                        with open(actor_local, "wb") as f:
-                            f.write(resp.content)
-                        return actor_local
-                return None
+                return download_public_media(req.selected_actor_url, actor_local, kind="image", timeout=30, max_bytes=10 * 1024 * 1024)
 
             try:
                 selected_actor_path = await asyncio.get_running_loop().run_in_executor(None, _download_actor)
-            except Exception:
-                pass
+            except ValueError as exc:
+                saas_jobs[job_id]["status"] = "failed"
+                _persist_saas_job(job_id)
+                raise HTTPException(status_code=400, detail="Invalid actor URL or media") from exc
+            except Exception as exc:
+                saas_jobs[job_id]["status"] = "failed"
+                _persist_saas_job(job_id)
+                raise HTTPException(status_code=502, detail="Actor download failed") from exc
         else:
-            src = os.path.join(OUTPUT_DIR, req.selected_actor_url.replace("/videos/", ""))
+            src = selected_local_actor
             if os.path.exists(src):
                 selected_actor_path = src
 

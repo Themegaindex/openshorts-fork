@@ -1276,6 +1276,7 @@ def burn_layers(video_path, output_path, subtitle_path=None, burn_opts=None,
             warn=_log,
             stdout=subprocess.DEVNULL,
             stderr=subprocess.PIPE,
+            timeout=1800,
         )
     except subprocess.CalledProcessError as exc:
         stderr_text = (exc.stderr or b"").decode(errors='replace')

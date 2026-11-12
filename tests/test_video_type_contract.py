@@ -188,7 +188,7 @@ def test_process_endpoint_forwards_only_nonlegacy_video_type(
     monkeypatch.setattr(app, "jobs", {})
     monkeypatch.setattr(app, "job_queue", queue)
     request = _json_request({
-        "url": "https://example.com/video",
+        "url": "https://www.youtube.com/watch?v=abcdefghijk",
         "output_format": "vertical",
         "layout_style": "smart",
         "video_type": video_type,
@@ -339,7 +339,7 @@ def _process_with_request_id(monkeypatch, tmp_path, queue, request_id):
     monkeypatch.setattr(app, "QUALITY_GATE_MIN_HEIGHT", 0)
     monkeypatch.setattr(app, "job_queue", queue)
     request = _json_request(
-        {"url": "https://example.com/video", "output_format": "vertical",
+        {"url": "https://www.youtube.com/watch?v=abcdefghijk", "output_format": "vertical",
          "layout_style": "smart", "video_type": "shorts"},
         extra_headers=[(b"x-process-request-id", request_id.encode())],
     )

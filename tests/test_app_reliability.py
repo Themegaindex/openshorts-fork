@@ -693,7 +693,7 @@ def test_thumbnail_url_download_runs_off_event_loop(monkeypatch, tmp_path):
     result = asyncio.run(app.thumbnail_analyze(
         request=SimpleNamespace(),
         file=None,
-        url="https://example.com/video",
+        url="https://www.youtube.com/watch?v=abcdefghijk",
         session_id=None,
         x_gemini_key="key",
     ))

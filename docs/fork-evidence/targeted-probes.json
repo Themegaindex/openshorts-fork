@@ -1,0 +1,70 @@
+{
+  "upstream_sha": "894514049a3c6210a7cd65676344f44371b3717a",
+  "python_version": "3.11.6",
+  "network_requests": 0,
+  "real_secrets_used": false,
+  "method": "Reviewed definitions isolated with AST; DNS mocked; own temporary JSON only; neither app nor upstream workers launched.",
+  "ip_policy": [
+    {
+      "address": "127.0.0.1",
+      "fork_public_target_accepts": false,
+      "upstream_ip_predicate_accepts": false
+    },
+    {
+      "address": "100.64.0.1",
+      "fork_public_target_accepts": false,
+      "upstream_ip_predicate_accepts": false
+    },
+    {
+      "address": "::ffff:127.0.0.1",
+      "fork_public_target_accepts": false,
+      "upstream_ip_predicate_accepts": false
+    },
+    {
+      "address": "64:ff9b::7f00:1",
+      "fork_public_target_accepts": true,
+      "upstream_ip_predicate_accepts": false
+    },
+    {
+      "address": "64:ff9b::a00:1",
+      "fork_public_target_accepts": true,
+      "upstream_ip_predicate_accepts": false
+    },
+    {
+      "address": "93.184.216.34",
+      "fork_public_target_accepts": true,
+      "upstream_ip_predicate_accepts": true
+    }
+  ],
+  "malformed_dns_error": {
+    "fork": {
+      "type": "UnicodeError",
+      "is_validation_error": true
+    },
+    "upstream": {
+      "type": "UnsafeURLError",
+      "is_validation_error": true
+    }
+  },
+  "metadata_atomicity": [
+    {
+      "implementation": "fork",
+      "reader_sees_valid_json": false,
+      "final_json_valid": true
+    },
+    {
+      "implementation": "upstream",
+      "reader_sees_valid_json": true,
+      "final_json_valid": true
+    }
+  ],
+  "credential_url_logs": {
+    "fork_log_entry_retains_synthetic_password": true,
+    "upstream_scrubber_removes_synthetic_password": true
+  },
+  "limitations": [
+    "NAT64 internal reachability depends on a translating network and was not tested.",
+    "No new end-to-end remotely exploitable vulnerability or severity assigned by these comparison probes.",
+    "Metadata observation is deterministic interleaving at json.dump, not a stress or performance benchmark."
+  ]
+}

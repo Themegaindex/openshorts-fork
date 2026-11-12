@@ -1,0 +1,301 @@
+{
+  "date": "2026-11-05",
+  "baseline": "98afa9ea5e9a842eb358834fe0cbd251d335573b",
+  "checks": [
+    {
+      "check": "security-tests",
+      "command": [
+        ".venv-security/Scripts/python",
+        "-X",
+        "utf8",
+        "-m",
+        "pytest",
+        "tests/test_security.py",
+        "-q",
+        "-rs",
+        "--tb=short"
+      ],
+      "exit_code": 0,
+      "expected_exit_code": 0,
+      "classification": "passed",
+      "output": "final-security-tests.txt"
+    },
+    {
+      "check": "backend-tests",
+      "command": [
+        ".venv-security/Scripts/python",
+        "-X",
+        "utf8",
+        "-m",
+        "pytest",
+        "tests/",
+        "-q",
+        "-rs",
+        "--tb=short"
+      ],
+      "exit_code": 0,
+      "expected_exit_code": 0,
+      "classification": "passed",
+      "output": "final-pytest.txt"
+    },
+    {
+      "check": "baseline-regressions",
+      "command": [
+        ".venv-security/Scripts/python",
+        "-X",
+        "utf8",
+        "tools/reproduce_security_baseline.py"
+      ],
+      "exit_code": 0,
+      "expected_exit_code": 0,
+      "classification": "expected-baseline-failures-confirmed",
+      "output": "baseline-security-tests.txt"
+    },
+    {
+      "check": "bandit-raw",
+      "command": [
+        ".venv-security/Scripts/python",
+        "-X",
+        "utf8",
+        "-m",
+        "bandit",
+        "advisory_lock.py",
+        "app.py",
+        "calibrate_eta.py",
+        "clip_selection.py",
+        "edit_builder.py",
+        "editor.py",
+        "frame_sampler.py",
+        "gemini_worker.py",
+        "hooks.py",
+        "longform.py",
+        "main.py",
+        "media_audio.py",
+        "quality_probe.py",
+        "render_planning.py",
+        "s3_uploader.py",
+        "saasshorts.py",
+        "security.py",
+        "security_http.py",
+        "speaker_tracking.py",
+        "subtitles.py",
+        "thumbnail.py",
+        "translate.py",
+        "video_encoding.py",
+        "video_formats.py",
+        "whisper_runtime.py",
+        "youtube_download.py",
+        "-f",
+        "json",
+        "-o",
+        "docs/security-evidence/final-bandit.json"
+      ],
+      "exit_code": 1,
+      "expected_exit_code": 1,
+      "classification": "open-scanner-alerts",
+      "output": "final-bandit-command.txt"
+    },
+    {
+      "check": "bandit-medium-high-gate",
+      "command": [
+        ".venv-security/Scripts/python",
+        "-X",
+        "utf8",
+        "-m",
+        "bandit",
+        "advisory_lock.py",
+        "app.py",
+        "calibrate_eta.py",
+        "clip_selection.py",
+        "edit_builder.py",
+        "editor.py",
+        "frame_sampler.py",
+        "gemini_worker.py",
+        "hooks.py",
+        "longform.py",
+        "main.py",
+        "media_audio.py",
+        "quality_probe.py",
+        "render_planning.py",
+        "s3_uploader.py",
+        "saasshorts.py",
+        "security.py",
+        "security_http.py",
+        "speaker_tracking.py",
+        "subtitles.py",
+        "thumbnail.py",
+        "translate.py",
+        "video_encoding.py",
+        "video_formats.py",
+        "whisper_runtime.py",
+        "youtube_download.py",
+        "-ll",
+        "-ii"
+      ],
+      "exit_code": 1,
+      "expected_exit_code": 1,
+      "classification": "open-scanner-alerts",
+      "output": "final-bandit-gate.txt"
+    },
+    {
+      "check": "test-requirements-audit",
+      "command": [
+        ".venv-security/Scripts/python",
+        "-X",
+        "utf8",
+        "-m",
+        "pip_audit",
+        "-r",
+        "requirements-test.txt",
+        "--format",
+        "json",
+        "--output",
+        "docs/security-evidence/final-pip-audit-test-requirements.json"
+      ],
+      "exit_code": 0,
+      "expected_exit_code": 0,
+      "classification": "passed",
+      "output": "final-pip-test-command.txt"
+    },
+    {
+      "check": "tool-environment-audit",
+      "command": [
+        ".venv-security/Scripts/python",
+        "-X",
+        "utf8",
+        "-m",
+        "pip_audit",
+        "--local",
+        "--format",
+        "json",
+        "--output",
+        "docs/security-evidence/final-pip-audit-tool-environment.json"
+      ],
+      "exit_code": 0,
+      "expected_exit_code": 0,
+      "classification": "passed",
+      "output": "final-pip-tools-command.txt"
+    },
+    {
+      "check": "existing-runtime-audit",
+      "command": [
+        ".venv-security/Scripts/python",
+        "-X",
+        "utf8",
+        "-m",
+        "pip_audit",
+        "--path",
+        "venv/Lib/site-packages",
+        "--format",
+        "json",
+        "--output",
+        "docs/security-evidence/final-pip-audit-runtime.json"
+      ],
+      "exit_code": 1,
+      "expected_exit_code": 1,
+      "classification": "open-scanner-alerts",
+      "output": "final-pip-runtime-command.txt"
+    },
+    {
+      "check": "pip-check",
+      "command": [
+        ".venv-security/Scripts/python",
+        "-m",
+        "pip",
+        "check"
+      ],
+      "exit_code": 0,
+      "expected_exit_code": 0,
+      "classification": "passed",
+      "output": "final-pip-check.txt"
+    },
+    {
+      "check": "frontend-lint",
+      "command": [
+        "npm.cmd",
+        "--prefix",
+        "dashboard",
+        "run",
+        "lint"
+      ],
+      "exit_code": 0,
+      "expected_exit_code": 0,
+      "classification": "passed",
+      "output": "final-frontend-lint.txt"
+    },
+    {
+      "check": "frontend-build",
+      "command": [
+        "npm.cmd",
+        "--prefix",
+        "dashboard",
+        "run",
+        "build"
+      ],
+      "exit_code": 0,
+      "expected_exit_code": 0,
+      "classification": "passed",
+      "output": "final-frontend-build.txt"
+    },
+    {
+      "check": "npm-audit",
+      "command": [
+        "npm.cmd",
+        "--prefix",
+        "dashboard",
+        "audit",
+        "--json"
+      ],
+      "exit_code": 0,
+      "expected_exit_code": 0,
+      "classification": "passed",
+      "output": "final-npm-audit.json"
+    },
+    {
+      "check": "diff-whitespace",
+      "command": [
+        "git",
+        "diff",
+        "--check"
+      ],
+      "exit_code": 0,
+      "expected_exit_code": 0,
+      "classification": "passed",
+      "output": "diff-check.txt"
+    }
+  ],
+  "not_run": [
+    "Docker backend/frontend builds and container smoke tests: Docker unavailable",
+    "Remote CI and external Claude/Codex gates: no publication performed",
+    "Real provider/GPU integration calls: isolated local audit only"
+  ],
+  "additional_checks": [
+    {
+      "check": "secret-signatures",
+      "command": [
+        ".venv-security/Scripts/python",
+        "-X",
+        "utf8",
+        "tools/scan_secrets.py",
+        "--history"
+      ],
+      "exit_code": 0,
+      "output": "secret-scan.json",
+      "classification": "passed-with-scope-limitations"
+    },
+    {
+      "check": "documentation-and-evidence",
+      "command": "Local Python assertions: Markdown path resolution, AST parsing, evidence-count consistency",
+      "exit_code": 0,
+      "output": "documentation-check.txt",
+      "classification": "passed"
+    },
+    {
+      "check": "frontend-token-exposure",
+      "command": "Build with synthetic backend token; assert token bytes absent from every dashboard/dist file",
+      "exit_code": 0,
+      "output": "frontend-token-check.txt",
+      "classification": "passed"
+    }
+  ]
+}

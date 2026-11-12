@@ -1,0 +1,4 @@
+......................s...........................................       [100%]
+=========================== short test summary info ===========================
+SKIPPED [1] tests\test_security.py:181: Creating symlinks requires a Windows privilege
+65 passed, 1 skipped in 1.33s

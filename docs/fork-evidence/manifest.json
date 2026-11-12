@@ -1,0 +1,103 @@
+{
+  "date": "2026-11-05",
+  "fork_sha": "98afa9ea5e9a842eb358834fe0cbd251d335573b",
+  "upstream_sha": "894514049a3c6210a7cd65676344f44371b3717a",
+  "scope": "Documentation comparison extension; previous audit manifest remains unchanged; this manifest is not externally signed.",
+  "files": [
+    {
+      "path": "docs/FORK_CONTRIBUTIONS.md",
+      "bytes": 27917,
+      "sha256": "ae6229e2f9bcd972ffacc673428ca7e3f67854d233f401f2c58f7ab0230bad38"
+    },
+    {
+      "path": "docs/SECURITY_PORTFOLIO.md",
+      "bytes": 11336,
+      "sha256": "b7ca813fb1b015353e441a009219ab568e2daa0723b023acbb5a380983e9023b"
+    },
+    {
+      "path": "docs/SECURITY_AUDIT.md",
+      "bytes": 29596,
+      "sha256": "5b8d5f4dccf32acc1058d9ea20cf2c6e051abaa33185c90c9fe1c21531724543"
+    },
+    {
+      "path": "docs/SECURITY_TESTING.md",
+      "bytes": 12915,
+      "sha256": "a9adcbcfac591e5b33b92c55b49d88ccafad9bf8caf207a60a0151140be29f9a"
+    },
+    {
+      "path": "README.md",
+      "bytes": 17358,
+      "sha256": "ca846e03021f1e5186c6275a2d38747d6909c5a65fbd432bb3418252274afcb1"
+    },
+    {
+      "path": "README.en.md",
+      "bytes": 12945,
+      "sha256": "9531d625a17e7d9fc1145c43b149cb7eecd9a75d11dfd345fe8cfb827bfb8ce3"
+    },
+    {
+      "path": "tools/compare_fork_security.py",
+      "bytes": 5308,
+      "sha256": "235a9f30b1dc5f2d766026c73efd918e936e786650a8a7628f9f0e6294990bd7"
+    },
+    {
+      "path": "docs/fork-evidence/archive/SECURITY_AUDIT.pre-comparison.md",
+      "bytes": 27072,
+      "sha256": "8caf209e4ceda8b91621042a15a9cc33e8fed8281711be413260b214f049bde2"
+    },
+    {
+      "path": "docs/fork-evidence/archive/SECURITY_PORTFOLIO.pre-comparison.md",
+      "bytes": 1587,
+      "sha256": "866cee38647e14543c72d2c6bcbe753e700f7a242d1caf341a30563b4d081d1f"
+    },
+    {
+      "path": "docs/fork-evidence/comparison.json",
+      "bytes": 345712,
+      "sha256": "d177e30a560ec7066ba2f3075f6a4951917c301fc5c41a9f704ced6a68fb8950"
+    },
+    {
+      "path": "docs/fork-evidence/github-provenance.json",
+      "bytes": 2367,
+      "sha256": "c1d9eec1655d3e82b53c009fb5b22a1f60e95c3b148a61ae334bdb79026ab5f5"
+    },
+    {
+      "path": "docs/fork-evidence/local-npm-audit.json",
+      "bytes": 385,
+      "sha256": "bf493e1aa51c4f0b8ca4ff6863d33098368bf881b4e8d9ccc45d001deb76af3a"
+    },
+    {
+      "path": "docs/fork-evidence/README.md",
+      "bytes": 5462,
+      "sha256": "96efd606fded407d59d36be43065f8cc7fed9867fae06aad7cb727523e404ac6"
+    },
+    {
+      "path": "docs/fork-evidence/secret-scan.json",
+      "bytes": 459,
+      "sha256": "0fd35fc2b3e7827521c1475fb2db6feb86c36e23892f6bf9042e72efc38981f3"
+    },
+    {
+      "path": "docs/fork-evidence/targeted-probes.json",
+      "bytes": 2126,
+      "sha256": "8cbd6e39538fe9803798252e2f6231f863ba4fac10542ee8c99632e6f8a85e26"
+    },
+    {
+      "path": "docs/fork-evidence/upstream-npm-audit-summary.json",
+      "bytes": 638,
+      "sha256": "7bd9f3db0e57c410ada88eaa6ac4194e56bada02a7388588ce4da0bb521085cf"
+    },
+    {
+      "path": "docs/fork-evidence/upstream-npm-audit.json",
+      "bytes": 26765,
+      "sha256": "4f9dc35893f99dfea0f26fb8f5a314d5d1f0110fce80bccebde467a6bc6391d3"
+    },
+    {
+      "path": "docs/fork-evidence/upstream-security-commits.json",
+      "bytes": 6894,
+      "sha256": "4a8cec247aa2edfe66fea4e3146c5252ce6ab2c31297c6495611ddce42e38f07"
+    },
+    {
+      "path": "docs/fork-evidence/validation.json",
+      "bytes": 4317,
+      "sha256": "cd33ec1dc0d2a9c26a27d0220bbbb4563891250abe57dbb992bc2ff5b2fa72f6"
+    }
+  ]
+}

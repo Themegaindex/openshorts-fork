@@ -12,7 +12,7 @@ class YouTubeDownloadError(RuntimeError):
 
 
 def youtube_base_options():
-    options = {'cachedir': False, 'noplaylist': True}
+    options = {'cachedir': False, 'noplaylist': True, 'allowed_extractors': ['youtube.*'], 'max_filesize': 2 * 1024 * 1024 * 1024}
     for runtime in ('deno', 'node'):
         path = shutil.which(runtime)
         if path:

@@ -1,0 +1,64 @@
+{
+  "verified_date": "2026-11-05",
+  "fork": {
+    "repo": "Themegaindex/openshorts-fork",
+    "branch": "main",
+    "sha": "98afa9ea5e9a842eb358834fe0cbd251d335573b",
+    "committed_at": "2026-11-02T16:19:59Z"
+  },
+  "upstream": {
+    "repo": "mutonby/openshorts",
+    "branch": "main",
+    "sha": "894514049a3c6210a7cd65676344f44371b3717a",
+    "committed_at": "2026-11-05T12:43:16Z"
+  },
+  "pr50": {
+    "url": "https://github.com/mutonby/openshorts/pull/50",
+    "author_login": "Themegaindex",
+    "state": "closed",
+    "merged": false,
+    "merge_commit_sha": null,
+    "head_repo": "Themegaindex/openshorts-fork",
+    "head_sha": "b7fc31ab360858b017d77c8659980d71379c3932"
+  },
+  "upstream_ports": [
+    {
+      "sha": "40151e1708100327f647bdd190adcf4808838a60",
+      "date": "2026-07-17",
+      "author_name": "juancarlos.cavero",
+      "explicit_source_pr": 50,
+      "coauthor_name": "Themegaindex",
+      "scope": "Karaoke subtitles, deterministic Auto-Edit, emoji hooks, retries; adapted to upstream."
+    },
+    {
+      "sha": "b3e44643cc1fd0cf3822f202726d451d2e0ef1e4",
+      "date": "2026-07-17",
+      "author_name": "juancarlos.cavero",
+      "explicit_source_pr": 50,
+      "scope": "Window scoring, shortlist/detail Gemini pipeline and clip-selection helpers."
+    }
+  ],
+  "inherited_tree_identity": {
+    "fork_inherited_sha": "0ffe730ce12443e4fc2638113372bb1f18b05b96",
+    "upstream_equivalent_sha": "8f4bc542ce5bab8fdc55ce35836160484dffdd1f",
+    "identical_tree_sha": "db0a251ea0adc16e8adf52996edd420937dd197c"
+  },
+  "edit_builder_port_identity": {
+    "fork_commit": "46a41024827414c04571dbcd029e72faef1f0423",
+    "upstream_commit": "40151e1708100327f647bdd190adcf4808838a60",
+    "path": "edit_builder.py",
+    "identical_blob_sha": "5e8c91d504b944965278d33182cf161422889231"
+  },
+  "license": {
+    "path": "LICENSE",
+    "blob_sha_at_local_fork_and_upstream": "a5ad963b0d2f14faa6fb11625048155106bddb17",
+    "notice": "Copyright (c) 2024 OpenShorts",
+    "upstream_cloud_has_separate_license": true,
+    "cloud_code_imported": false
+  },
+  "sources": [
+    "https://api.github.com/repos/Themegaindex/openshorts-fork/branches/main",
+    "https://api.github.com/repos/mutonby/openshorts/branches/main",
+    "https://api.github.com/repos/mutonby/openshorts/pulls/50"
+  ]
+}

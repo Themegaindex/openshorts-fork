@@ -1,4 +1,5 @@
 import os
+from security import confined_path, validate_id
 import uuid
 import time
 import json
@@ -191,7 +192,7 @@ def generate_thumbnail(api_key, title, session_id, face_image_path=None, bg_imag
     """
     client = genai.Client(api_key=api_key)
 
-    output_dir = os.path.join("output", "thumbnails", session_id)
+    output_dir = confined_path(os.path.join("output", "thumbnails"), validate_id(session_id))
     os.makedirs(output_dir, exist_ok=True)
 
     prompt_parts = []

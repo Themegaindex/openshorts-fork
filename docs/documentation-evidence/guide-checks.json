@@ -1,0 +1,11 @@
+{
+  "date": "2026-11-06",
+  "readme_clone_urls_correct": true,
+  "branding_correct": true,
+  "english_default_and_german_present": true,
+  "vite_node_requirement_consistent": true,
+  "relative_links_checked": 100,
+  "link_failures": [],
+  "machine_path_findings": [],
+  "scope": "Changed guides and newly produced documentation evidence; signature scan is separate."
+}
