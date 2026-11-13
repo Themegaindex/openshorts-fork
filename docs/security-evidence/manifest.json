@@ -1,0 +1,352 @@
+{
+  "date": "2026-11-05",
+  "baseline": "98afa9ea5e9a842eb358834fe0cbd251d335573b",
+  "scope": "Current local byte contents; excludes user changes and manifest itself; not externally signed.",
+  "files": [
+    {
+      "path": ".dockerignore",
+      "bytes": 792,
+      "sha256": "e23fd19cdb02a80b258867d0010442b3166adab6625a1bce4671f26cf6e31c36"
+    },
+    {
+      "path": ".env.example",
+      "bytes": 8246,
+      "sha256": "0e402c99c9786d892bc50758fea685bd693e6c879e7012acf03aaaa68a670a53"
+    },
+    {
+      "path": ".gitignore",
+      "bytes": 865,
+      "sha256": "b0c9fe04c8ef0bdbc0454fabf2a0b314c7b3101b325bca6cce2daaed2029f0e5"
+    },
+    {
+      "path": "Dockerfile",
+      "bytes": 2122,
+      "sha256": "61f81f0828bb63aed838bfb3c7c4b2eb79218e2cf70a5a6606b95365c29cad9f"
+    },
+    {
+      "path": "README.en.md",
+      "bytes": 12715,
+      "sha256": "e0646ddb354e4d0ebadbb2534375e64043ba75562df790f2dd499b99d4c6e544"
+    },
+    {
+      "path": "README.md",
+      "bytes": 17051,
+      "sha256": "1d3d11b030ffd0b78f3e0987c29c1abb22c00d93173b54b3153131e574e13825"
+    },
+    {
+      "path": "SECURITY.md",
+      "bytes": 3827,
+      "sha256": "224eb423c75add2b795d473c1fdd08b45d37260429f504bd6a6a3981acc0556a"
+    },
+    {
+      "path": "app.py",
+      "bytes": 208598,
+      "sha256": "f88ce41ba692504e5d008811f790bb656d8baf945b021a760855f4770e1e18f1"
+    },
+    {
+      "path": "dashboard/Dockerfile",
+      "bytes": 153,
+      "sha256": "799b01de37b9901024935cd166d110f5481cdd88102a9be854391931aa6375a3"
+    },
+    {
+      "path": "dashboard/package-lock.json",
+      "bytes": 291291,
+      "sha256": "961fd80cd5dd2cc5f31be7b9155660c897e1c78caa03e29355f6f2db1571526e"
+    },
+    {
+      "path": "dashboard/package.json",
+      "bytes": 821,
+      "sha256": "c52f689261e1ecf885f4293de8a76e91e8b770557deb031e2e1c49ccd0c437cc"
+    },
+    {
+      "path": "dashboard/vite.config.js",
+      "bytes": 1540,
+      "sha256": "c4e45d4afbe3710d0037f5d00e2b54c38ab890437f41d9463f371497afd2900f"
+    },
+    {
+      "path": "docker-compose.yml",
+      "bytes": 778,
+      "sha256": "346e0dc7630b6ad2e8f349235a25a6e39a225aed20c28b6538c2c540eaeb1d6c"
+    },
+    {
+      "path": "docs/SECURITY_AUDIT.md",
+      "bytes": 27072,
+      "sha256": "8caf209e4ceda8b91621042a15a9cc33e8fed8281711be413260b214f049bde2"
+    },
+    {
+      "path": "docs/SECURITY_PORTFOLIO.md",
+      "bytes": 1587,
+      "sha256": "866cee38647e14543c72d2c6bcbe753e700f7a242d1caf341a30563b4d081d1f"
+    },
+    {
+      "path": "docs/SECURITY_TESTING.md",
+      "bytes": 11591,
+      "sha256": "e5c347e65a21d4c7fd7247ce563b58b149710e086ead4c77647320af19d30caa"
+    },
+    {
+      "path": "docs/THREAT_MODEL.md",
+      "bytes": 6671,
+      "sha256": "7af9a1fdf685f227f1ce39f149e5e0068f29844749d6a0c540a1502b9bbc1514"
+    },
+    {
+      "path": "docs/security-evidence/README.md",
+      "bytes": 3283,
+      "sha256": "91ea33b0591e3a37d4be748c5b9291bc73b0bdc6c593654e0ac77dc5e4e56ab7"
+    },
+    {
+      "path": "docs/security-evidence/audit-environment-packages.json",
+      "bytes": 3152,
+      "sha256": "a8b3bc36d626937a4116d2b9ea99e556ae1de29323e2d818ee1fe09f7e605be7"
+    },
+    {
+      "path": "docs/security-evidence/baseline-bandit.json",
+      "bytes": 67734,
+      "sha256": "ac36c04a916bae6efe72ae9d07593eeed76d1b57d0e332fb2d5bd01897a1e086"
+    },
+    {
+      "path": "docs/security-evidence/baseline-frontend-build.txt",
+      "bytes": 1320,
+      "sha256": "25afe78ee4d22658367c175a631f80a55a4379384f34d315fdce1c0a8cc1b679"
+    },
+    {
+      "path": "docs/security-evidence/baseline-frontend-lint.txt",
+      "bytes": 97,
+      "sha256": "ec1299f55801891105e6e5cae7bb280e00ce41e62eae51e80ae7247061c5c125"
+    },
+    {
+      "path": "docs/security-evidence/baseline-npm-audit.json",
+      "bytes": 27119,
+      "sha256": "9042f1112f2ef50ee2ea301004242a80c4b944b3332ae9b8a5eaab5cfc21da0b"
+    },
+    {
+      "path": "docs/security-evidence/baseline-pip-audit-runtime.json",
+      "bytes": 745628,
+      "sha256": "84c472956e286988f617976319aa27f68622f4e7cee7867c5722015759ec42a0"
+    },
+    {
+      "path": "docs/security-evidence/baseline-pytest.txt",
+      "bytes": 680,
+      "sha256": "3032e02b845e2e08abdbc15410d0a9b94f7e5afcbe304a981e24f85760667823"
+    },
+    {
+      "path": "docs/security-evidence/baseline-security-tests.txt",
+      "bytes": 5242,
+      "sha256": "5315dfd11518993eed6f308915f1e6079ec60e367e7d84b67b540d2ed1a7d9b3"
+    },
+    {
+      "path": "docs/security-evidence/checks.json",
+      "bytes": 7635,
+      "sha256": "b4b036f5fdfb4ffe4b3171c9a9fbe8d30b2632b630380fdfacc8110499d3b90b"
+    },
+    {
+      "path": "docs/security-evidence/diff-check.txt",
+      "bytes": 201,
+      "sha256": "a30b0237bbed8d789dc7e30926950efb345c981ff4333c17127badcfa6293b00"
+    },
+    {
+      "path": "docs/security-evidence/diff-summary.json",
+      "bytes": 3179,
+      "sha256": "97b8f2b5c570c6d224950adbe743dcade27d84981409b3f91236c677ffc4cece"
+    },
+    {
+      "path": "docs/security-evidence/documentation-check.txt",
+      "bytes": 117,
+      "sha256": "7b41c0ea552098a91e967a3b2322c3898a8bc0b0acc5bf3f6d1d0213fb2043c3"
+    },
+    {
+      "path": "docs/security-evidence/final-bandit-command.txt",
+      "bytes": 239,
+      "sha256": "01ef7abfaeff48c8e8ce4d89480deefdd97c0c25ba50d4c0b7a1900261cd8e60"
+    },
+    {
+      "path": "docs/security-evidence/final-bandit-gate.txt",
+      "bytes": 1948,
+      "sha256": "3bfda1b6e4908d78fc4669f072758a99ba64bfb95b3b96a5fc09f4ace942402e"
+    },
+    {
+      "path": "docs/security-evidence/final-bandit.json",
+      "bytes": 66739,
+      "sha256": "88666ceb1171e8d84e5eaa0b7deac322ec8ba8c57514aebeb395ebb0e919685b"
+    },
+    {
+      "path": "docs/security-evidence/final-frontend-build.txt",
+      "bytes": 1121,
+      "sha256": "e2b914adf3d90e0b211f076ed12958a45c4515e4725b66f4330bcbda1aa52bea"
+    },
+    {
+      "path": "docs/security-evidence/final-frontend-lint.txt",
+      "bytes": 93,
+      "sha256": "7569a18bc8957f159604e1bee7de5d4c79c07a29b2f45b8406a1ed669e3a2fe0"
+    },
+    {
+      "path": "docs/security-evidence/final-npm-audit.json",
+      "bytes": 363,
+      "sha256": "5672354a585e9d621c7591572553869fd8ab6ea5d29ad9c89d406a878fb0b603"
+    },
+    {
+      "path": "docs/security-evidence/final-pip-audit-runtime.json",
+      "bytes": 745628,
+      "sha256": "5bec6563da66e634b0b9cb0589c9a2c419bbb56d4287588fa5e2b7111245ba44"
+    },
+    {
+      "path": "docs/security-evidence/final-pip-audit-test-requirements.json",
+      "bytes": 2606,
+      "sha256": "4e253afb8463cfa56eb3fffae134008b43d40faf17c2a71ef7458b16c1c8e10f"
+    },
+    {
+      "path": "docs/security-evidence/final-pip-audit-tool-environment.json",
+      "bytes": 4106,
+      "sha256": "34c43b6c97e14ee016ab05f1cd049939265e7af9ae0a33dfd9864588d2916098"
+    },
+    {
+      "path": "docs/security-evidence/final-pip-check.txt",
+      "bytes": 31,
+      "sha256": "672aec65a45bed50e70229c70934a7eebf0462595c459b83023027645d57cccf"
+    },
+    {
+      "path": "docs/security-evidence/final-pip-runtime-command.txt",
+      "bytes": 48,
+      "sha256": "034864b505457cf6e6745646a0f2c54a6a62b8da11a916e40448c230b798ba31"
+    },
+    {
+      "path": "docs/security-evidence/final-pip-test-command.txt",
+      "bytes": 32,
+      "sha256": "4e4757ff226a44b5c448b1c4624619419c22d5272463dc19510b4754871a72f9"
+    },
+    {
+      "path": "docs/security-evidence/final-pip-tools-command.txt",
+      "bytes": 32,
+      "sha256": "4e4757ff226a44b5c448b1c4624619419c22d5272463dc19510b4754871a72f9"
+    },
+    {
+      "path": "docs/security-evidence/final-pytest.txt",
+      "bytes": 1303,
+      "sha256": "6d1230f16e35eae7ddc97fe44df9525cad94b8a64c5f9ab5f745f1ee81b60e63"
+    },
+    {
+      "path": "docs/security-evidence/final-security-tests.txt",
+      "bytes": 281,
+      "sha256": "3bd380a3d7b4f2c1230f24eea91688c6d40217d01e467a06571fee15a3c9ac3f"
+    },
+    {
+      "path": "docs/security-evidence/frontend-token-check.txt",
+      "bytes": 68,
+      "sha256": "6920c1725f33c975ee8607e08bbf2282d401adbab9c185e8bf3bc475e5ea0e89"
+    },
+    {
+      "path": "docs/security-evidence/intermediate-pytest.txt",
+      "bytes": 1215,
+      "sha256": "5d317fef2e0742be127a645f7c10ceffd6dbb4fc83a2f4a869b20ca68c8ff703"
+    },
+    {
+      "path": "docs/security-evidence/review-log.md",
+      "bytes": 2740,
+      "sha256": "53c9cfbc1ffdb909e204bdbfe65f674cba2b50452de238fb17e5aceed9ad1635"
+    },
+    {
+      "path": "docs/security-evidence/scope.json",
+      "bytes": 2191,
+      "sha256": "14767f75e139704fc409b59ee6da3d37568c1526f405df788ae05f780e41d3ce"
+    },
+    {
+      "path": "docs/security-evidence/secret-scan.json",
+      "bytes": 382,
+      "sha256": "27607bf75557e792729890d94b9d5c8678317d51d27d2b59aba09a0acd7736c8"
+    },
+    {
+      "path": "editor.py",
+      "bytes": 19121,
+      "sha256": "f5e59f7c78a2a190ec4d40e3e0390f76c7648a85c64f82211fca60092a18bf0c"
+    },
+    {
+      "path": "main.py",
+      "bytes": 245695,
+      "sha256": "de764f5c449e355e22bd790c91776c27876c0656d892ddf96d1b869e1d57e9bb"
+    },
+    {
+      "path": "quality_probe.py",
+      "bytes": 3036,
+      "sha256": "aa25524b388bf0725b065dc15f1f1e8d428baba8bdb62dca98668da7809cf11e"
+    },
+    {
+      "path": "requirements-security.txt",
+      "bytes": 86,
+      "sha256": "3a11d28d9ae927389976d62225644b6a04f1f8c00b7370dc159ebb3bc2d8cab8"
+    },
+    {
+      "path": "requirements-test.txt",
+      "bytes": 289,
+      "sha256": "57bb7eeb85a5681f9f527ae77f980f4e0685d8c75c4d7d51a9dc2a6f90b3a7fe"
+    },
+    {
+      "path": "requirements.txt",
+      "bytes": 505,
+      "sha256": "506ccfb26d1badf571b19701d5d8d73b24ed549b84525548a327d97040a04244"
+    },
+    {
+      "path": "saasshorts.py",
+      "bytes": 58592,
+      "sha256": "e81258c857385a48e2699d597911303e18ad71ee22e567446095fc0306aed295"
+    },
+    {
+      "path": "security-constraints.txt",
+      "bytes": 414,
+      "sha256": "88098e0cebfedde08ed2316aa6a9db021a91eb509d33b7c6d7581e65fe72cb69"
+    },
+    {
+      "path": "security.py",
+      "bytes": 7093,
+      "sha256": "b32c57241996b5b0ebb83b7610d851e52456a8ee5277bf6b3c0f7f3313e7d348"
+    },
+    {
+      "path": "security_http.py",
+      "bytes": 4275,
+      "sha256": "a0b326ba5e69fc3860d21fab6dfbd361dea42d1bb86318f3710349d1ed6b1b0f"
+    },
+    {
+      "path": "start.bat",
+      "bytes": 1009,
+      "sha256": "9c17351a49a2dcccad305b6ac5bb2d700a3f243c8b71c20c1fe5ccd464f4ecc6"
+    },
+    {
+      "path": "subtitles.py",
+      "bytes": 53841,
+      "sha256": "de7da081c9bb2cd8c3a3cbaa2508651b8ae8a4c4886562be8e195a5d83276d44"
+    },
+    {
+      "path": "tests/test_app_reliability.py",
+      "bytes": 26534,
+      "sha256": "4c09827debaf3cd16bb3dd39b533ba681f3ea70a7b9bb63f7c3eab8f9fb9d94b"
+    },
+    {
+      "path": "tests/test_security.py",
+      "bytes": 22168,
+      "sha256": "4505205ddc5e9f422e0ba28d785ac203ffa0468252a37a5545b15469114fea7f"
+    },
+    {
+      "path": "tests/test_video_type_contract.py",
+      "bytes": 18153,
+      "sha256": "4c56d2e3af8f067d6f006672d1d1889089147bd86f7f29628cd9eb5454f50e79"
+    },
+    {
+      "path": "thumbnail.py",
+      "bytes": 12820,
+      "sha256": "92f9e04175cbe991bd3f6e44fed4dd97f2deb9399342f8f20626b113be0b05b4"
+    },
+    {
+      "path": "tools/reproduce_security_baseline.py",
+      "bytes": 2890,
+      "sha256": "cfd5d71f4434fa9fd33754e79a0e2f736c1b26700b2f94e566ba2aa8b35dd9aa"
+    },
+    {
+      "path": "tools/scan_secrets.py",
+      "bytes": 4055,
+      "sha256": "2c6fa2f44122b46b2c2f47840f56c7ea9de08d14169c3d5de4aab1144a9a5bc1"
+    },
+    {
+      "path": "youtube_download.py",
+      "bytes": 6359,
+      "sha256": "1beadcd4ab9699818aa9a6837637b76ecf63dfa61540ae3a5e136821ac0f0892"
+    }
+  ]
+}

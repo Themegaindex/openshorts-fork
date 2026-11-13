@@ -431,6 +431,84 @@ class TestGenerateAss:
         assert "WrapStyle: 0" in content
         assert "WrapStyle: 2" not in content
 
+    def _tube_events(self, tmp_path, name, **kwargs):
+        from subtitles import generate_ass
+        out = tmp_path / f"{name}.ass"
+        words = [
+            _w(" und", 0.0, 0.30), _w(" meint", 0.30, 0.60),
+            _w(" der", 0.60, 0.90), _w(" andere", 0.90, 1.20),
+        ]
+        assert generate_ass(
+            self._transcript(words), 0, 10, str(out),
+            preset="neon_tube", font_name="Arial Black", fontsize=27, **kwargs,
+        ) is True
+        content = out.read_text(encoding="utf-8-sig")
+        return content, [line for line in content.splitlines() if line.startswith("Dialogue:")]
+
+    def test_neon_tube_puts_a_dark_contour_between_letters_and_glow(self, tmp_path):
+        """Variant E: glow only on spoken words and never on the letter edge."""
+        content, events = self._tube_events(tmp_path, "tube")
+        by_layer = {}
+        for line in events:
+            by_layer.setdefault(int(line.split(",", 1)[0].split(":")[1]), []).append(line)
+
+        assert "PlayResX: 162" in content and "PlayResY: 288" in content
+        assert sorted(by_layer) == [0, 1, 2, 3, 4]
+        assert len(events) == 4 * 5  # four spoken intervals, five layers each
+        first = {layer: lines[0] for layer, lines in by_layer.items()}
+        # At this size the first block holds UND MEINT DER; ANDERE starts the next.
+        # Soft dark field and crisp dark contour sit under every word.
+        for layer in (0, 2):
+            assert r"\alpha&HFF&" not in first[layer]
+            assert first[layer].count(r"\c&H000000&\3c&H000000&") == 3
+        assert r"\bord1.6\blur4}" in first[0] and r"\bord0.85\blur0.6}" in first[2]
+        # Glow and tube only on the spoken word, in the block colour.
+        assert first[1].count(r"\alpha&H00&") == 1
+        assert r"\bord1.2\blur8}" in first[1] and r"\c&HF4F818&" in first[1]
+        assert r"\c&HFAFC8C&\3c&HF4F818&" in first[3]  # pale core, colour rim
+        # The remaining words stay plain white on top, without any glow.
+        assert first[4].count(r"\alpha&H00&") == 2
+        assert r"\bord0\blur0}" in first[4] and r"\c&HFFFFFF&" in first[4]
+        # The spoken prefix grows instead of jumping word to word.
+        assert by_layer[3][1].count(r"\alpha&H00&") == 2
+
+    def test_neon_tube_sizes_glow_and_contour_for_the_real_frame(self, tmp_path):
+        import re
+        landscape, landscape_events = self._tube_events(
+            tmp_path, "landscape", frame_size=(3840, 2160),
+        )
+        vertical_4k, _ = self._tube_events(tmp_path, "vertical", frame_size=(2160, 3840))
+        _default, default_events = self._tube_events(tmp_path, "default")
+
+        # libass draws \blur in output pixels, so the glow grows with height.
+        assert r"\blur9}" in landscape and r"\blur4.5}" in landscape
+        assert r"\blur16}" in vertical_4k and r"\blur8}" in vertical_4k
+        # A wider canvas keeps \bord round on 16:9 instead of 3x wider.
+        assert "PlayResX: 512" in landscape
+        assert "PlayResX: 162" in vertical_4k
+        # Line breaks stay the same as on the vertical canvas.
+        visible = lambda line: re.sub(r"\{[^}]*\}", "", line.split(",", 9)[-1])
+        assert [visible(line) for line in landscape_events] == [
+            visible(line) for line in default_events
+        ]
+
+    def test_probe_frame_size_reports_the_displayed_orientation(self, monkeypatch):
+        import subprocess
+        import subtitles
+        import video_encoding
+
+        monkeypatch.setattr(subtitles.subprocess, "run", lambda *a, **k: subprocess.CompletedProcess(
+            a, 0, stdout="1920x1080\n", stderr=""))
+        monkeypatch.setattr(video_encoding, "source_rotation", lambda _path: 90)
+        assert subtitles.probe_frame_size("clip.mp4") == (1080, 1920)
+        monkeypatch.setattr(video_encoding, "source_rotation", lambda _path: 0)
+        assert subtitles.probe_frame_size("clip.mp4") == (1920, 1080)
+
+        def broken(*_args, **_kwargs):
+            raise subprocess.CalledProcessError(1, "ffprobe")
+        monkeypatch.setattr(subtitles.subprocess, "run", broken)
+        assert subtitles.probe_frame_size("clip.mp4") is None
+
     def test_rainbow_word_shows_only_current_word_with_animated_gradient(self, tmp_path):
         import re
         from subtitles import (

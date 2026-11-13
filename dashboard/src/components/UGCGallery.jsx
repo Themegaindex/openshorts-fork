@@ -39,7 +39,9 @@ export default function UGCGallery() {
   }
 
   return (
-    <div className="space-y-6">
+    // Own scroll area: the tab container is overflow-hidden, so anything
+    // below the first screen used to be unreachable.
+    <div className="h-full overflow-y-auto custom-scrollbar p-6 space-y-6">
       {/* Header */}
       <div className="flex items-center justify-between">
         <div>
@@ -135,6 +137,8 @@ function AvatarCard({ avatar, copied, onCopy }) {
         <a
           href={avatar.url}
           download
+          target="_blank"
+          rel="noopener noreferrer"
           className="block text-center text-[9px] bg-white/5 hover:bg-white/10 text-zinc-400 py-1 rounded-md transition-colors"
         >
           <Download size={9} className="inline mr-0.5" />Download
@@ -180,7 +184,9 @@ function VideoCard({ video, copied, onCopy }) {
           poster={video.actor_url}
           muted
           playsInline
-          preload="metadata"
+          // The poster covers the idle state; hover starts loading. With
+          // "metadata", up to 100 videos started loading at once.
+          preload="none"
           className="w-full h-full object-cover"
         />
         {!playing && (
@@ -218,6 +224,8 @@ function VideoCard({ video, copied, onCopy }) {
           <a
             href={video.video_url}
             download
+            target="_blank"
+            rel="noopener noreferrer"
             className="flex-1 text-center text-[9px] bg-white/5 hover:bg-white/10 text-zinc-400 py-1 rounded-md transition-colors"
           >
             <Download size={9} className="inline mr-0.5" />Download

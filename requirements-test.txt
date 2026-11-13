@@ -1,4 +1,5 @@
 # Lightweight dependencies required to collect and run the automated test suite.
+-c security-constraints.txt
 # Video/ML packages from requirements.txt are intentionally excluded from CI.
 pytest
 boto3
@@ -9,3 +10,4 @@ Pillow
 pydantic
 python-dotenv
 python-multipart
+beautifulsoup4

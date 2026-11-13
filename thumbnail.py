@@ -1,5 +1,5 @@
 import os
-import uuid
+from security import confined_path, validate_id
 import time
 import json
 from google import genai
@@ -90,7 +90,7 @@ OUTPUT JSON:
     video_duration = segments[-1]["end"] if segments else 0
 
     try:
-        text = response.text.strip()
+        text = (response.text or "").strip()
         if text.startswith("```json"):
             text = text[7:]
         if text.startswith("```"):
@@ -164,7 +164,7 @@ OUTPUT JSON:
     )
 
     try:
-        text = response.text.strip()
+        text = (response.text or "").strip()
         if text.startswith("```json"):
             text = text[7:]
         if text.startswith("```"):
@@ -191,7 +191,7 @@ def generate_thumbnail(api_key, title, session_id, face_image_path=None, bg_imag
     """
     client = genai.Client(api_key=api_key)
 
-    output_dir = os.path.join("output", "thumbnails", session_id)
+    output_dir = confined_path(os.path.join("output", "thumbnails"), validate_id(session_id))
     os.makedirs(output_dir, exist_ok=True)
 
     prompt_parts = []
@@ -339,7 +339,7 @@ OUTPUT: Return ONLY the description text (no JSON wrapper, no markdown code bloc
         contents=[prompt],
     )
 
-    description = response.text.strip()
+    description = (response.text or "").strip()
     # Clean up any accidental markdown wrappers
     if description.startswith("```"):
         lines = description.split("\n")

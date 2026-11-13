@@ -181,6 +181,24 @@ def test_is_gpu_error_ignores_input_problems(exc):
     assert not whisper_runtime.is_gpu_error(exc)
 
 
+def test_windows_uses_the_caching_cuda_allocator_by_default():
+    # cuda_malloc_async aborted the worker (0xC0000409) when the GPU model was
+    # destroyed after a temperature fallback, losing the finished transcript.
+    environ = {}
+    whisper_runtime.configure_ctranslate2_allocator(environ, platform="nt")
+    assert environ == {"CT2_CUDA_ALLOCATOR": "cub_caching"}
+
+
+def test_allocator_choice_respects_explicit_setting_and_other_platforms():
+    environ = {"CT2_CUDA_ALLOCATOR": "cuda_malloc_async"}
+    whisper_runtime.configure_ctranslate2_allocator(environ, platform="nt")
+    assert environ == {"CT2_CUDA_ALLOCATOR": "cuda_malloc_async"}
+
+    environ = {}
+    whisper_runtime.configure_ctranslate2_allocator(environ, platform="posix")
+    assert environ == {}
+
+
 def test_load_oom_on_cuda_restarts_on_cpu_with_cpu_model(backend):
     backend.load_error["cuda"] = RuntimeError("CUDA failed with error out of memory")
     (segments, _info, cfg), events = _run()

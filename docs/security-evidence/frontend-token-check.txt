@@ -1,0 +1,1 @@
+PASS: synthetic backend token absent from all browser build assets

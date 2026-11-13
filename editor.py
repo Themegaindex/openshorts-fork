@@ -161,7 +161,7 @@ class VideoEditor:
             print("ℹ️ Gemini suggested no (valid) edits — keeping the clip untouched.")
             return {"filter_string": None, "edits": []}
         print(f"🎯 Applying {len(applied)} edits: " + ", ".join(f"{e['type']}@{e['start']:.1f}s" for e in applied))
-        return {"filter_string": filter_string, "edits": applied}
+        return {"filter_string": filter_string, "edits": applied, "duration": duration, "fps": fps, "has_captions": has_captions}
 
     @staticmethod
     def _extract_edits(response):
@@ -270,7 +270,7 @@ class VideoEditor:
         stderr_text = (result.stderr or b"").decode(errors="replace")
         return False, stderr_text[-1500:]
 
-    def _repair_filter(self, filter_string, error_text, width, height):
+    def _repair_filter(self, filter_string, error_text, width, height, duration=60, fps=30, has_captions=False):
         """One self-repair round-trip: show Gemini the FFmpeg error and ask for
         a corrected filter string. Returns the new string or None."""
         if not self.client:
@@ -284,11 +284,10 @@ class VideoEditor:
         FFMPEG ERROR:
         {error_text}
 
-        Fix the filter. Keep the same creative intent, obey the same rules as before:
-        - exact output resolution {width}x{height} (zoompan must set s={width}x{height}),
-        - no bare comparison operators (use between/lt/lte/gt/gte),
-        - expression values in single quotes.
-        Output JSON only: {{"filter_string": "..."}}
+        Return a simpler edit decision list; never return raw FFmpeg syntax.
+        Duration: {duration} seconds. Effects: zoom_in, punch_in, zoom_pulse,
+        color_pop, bw_moment, flash, vignette. Preserve captions: {has_captions}.
+        Output JSON only: {{"edits": [{{"type": "color_pop", "start": 1, "end": 2, "strength": 0.2}}]}}
         """
         try:
             response = self.client.models.generate_content(
@@ -301,8 +300,11 @@ class VideoEditor:
             end_idx = text.rfind('}')
             if start_idx != -1 and end_idx != -1:
                 text = text[start_idx:end_idx + 1]
-            repaired = json.loads(text).get("filter_string")
-            return repaired if isinstance(repaired, str) and repaired.strip() else None
+            edits = json.loads(text).get("edits")
+            if not isinstance(edits, list):
+                return None
+            repaired, _ = build_filter_string(edits, duration=duration, fps=fps, width=width, height=height, has_captions=has_captions)
+            return repaired
         except Exception as e:
             print(f"⚠️ Filter self-repair failed: {e}")
             return None
@@ -368,7 +370,9 @@ class VideoEditor:
         ok, error_text = self._test_filter(input_path, filter_string, env)
         if not ok:
             print(f"⚠️ AI filter failed dry-run: {error_text}")
-            repaired = self._repair_filter(filter_string, error_text, w or 1080, h or 1920)
+            repaired = self._repair_filter(filter_string, error_text, w or 1080, h or 1920,
+                                           duration=filter_data.get("duration", 60), fps=filter_data.get("fps", 30),
+                                           has_captions=filter_data.get("has_captions", False))
             if repaired:
                 repaired = self._sanitize_filter_string(repaired)
                 if w and h:

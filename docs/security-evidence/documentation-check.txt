@@ -1,0 +1,1 @@
+PASS: 38 local Markdown links resolve across 9 documents; Python sources parse; reported counts match raw evidence.

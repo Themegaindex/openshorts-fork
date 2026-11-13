@@ -1,0 +1,3 @@
+$ node -p JSON.stringify({node:process.version,vite:require('./dashboard/node_modules/vite/package.json').version,engines:require('./dashboard/node_modules/vite/package.json').engines})
+exit_code=0
+{"node":"v24.14.0","vite":"8.3.6","engines":{"node":"^20.19.0 || >=22.12.0"}}

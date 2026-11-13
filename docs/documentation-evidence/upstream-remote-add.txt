@@ -1,0 +1,2 @@
+$ git remote add upstream https://github.com/mutonby/openshorts.git
+exit_code=0

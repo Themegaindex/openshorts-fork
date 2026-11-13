@@ -31,3 +31,7 @@ Dockerfile text eol=lf
 *.tflite binary
 *.pt binary
 *.zip binary
+
+# Historical audit evidence is hashed as raw bytes. Preserve its original EOLs.
+docs/security-evidence/** -text whitespace=blank-at-eol,blank-at-eof,space-before-tab,cr-at-eol
+docs/fork-evidence/** -text whitespace=blank-at-eol,blank-at-eof,space-before-tab,cr-at-eol

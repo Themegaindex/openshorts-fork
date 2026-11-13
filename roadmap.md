@@ -20,7 +20,6 @@ verifiziert, mit 30 neuen Tests und echten FFmpeg-Renderings abgesichert.
 | Signature-Presets bei 1:1 und 16:9 zu klein (keine Verzerrung — gemessen) | Abschnitt 3 | Phase 4; braucht die Bildgeometrie im Generator |
 | Zeile 1 springt beim Zeilenwechsel zurück auf Weiß | Abschnitt 3 | Designfrage — bewusst nicht ohne deine Entscheidung geändert |
 | Rand-Regler „Keine" erzeugt weiter einen Rand von 1 | Abschnitt 3 | Kleinigkeit, war in keiner der drei Phasen |
-| Toter Code: `add_hook_to_video`, `burn_subtitles`, Gallery (~350 Zeilen) | Abschnitt 3 | Phase 4. Der tote Neon-Konstantenblock ist weg |
 | Offene CORS-Freigabe und offenes `/videos`-Verzeichnis | Abschnitt 3 | Nur relevant, wenn die Instanz öffentlich erreichbar wird |
 | Hook und Untertitel können sich überlagern | Abschnitt 4 | Braucht eine Design-Entscheidung zur Ausweichrichtung |
 | Gemischte Sprache im UI, Doppelname „Neon", Vorschau-Beispieltexte | Abschnitt 4 | Kosmetik, in keiner der drei Phasen |
@@ -283,7 +282,7 @@ Der Regler geht von 0 („None") bis 5. Bei 0 wird trotzdem 1 gesetzt. Ein randl
 
 ---
 
-### 🟡 ✅ BESTÄTIGT — Toter Code im Neon-Modul · 🟨 TEILWEISE
+### 🟡 ✅ BESTÄTIGT — Toter Code im Neon-Modul · ✅ BEHOBEN (2026-11-11)
 
 ```python
 # subtitles.py:366
@@ -658,7 +657,7 @@ Die **Idee und die Ausführung des Glüh-Effekts sind ausgezeichnet.** Der viers
 - [ ] **Echte Server-Vorschau** der ersten 3 Sekunden
 - [ ] **Untertitel-Text vor dem Einbrennen editierbar**
 - [ ] **Neue Presets** aus Abschnitt 7 (besonders „Bold Box" und „Podcast")
-- [ ] **Toten Code entfernen** (Gallery, `add_hook_to_video`, `burn_subtitles`) — `_SIGNATURE_GLOW_LAYERS` ist erledigt: die Konstante ist jetzt die gemeinsame Quelle beider Renderer statt einer Leiche
+- [x] **Toten Code entfernen** (Gallery, `add_hook_to_video`, `burn_subtitles`) — erledigt am 2026-11-11; `_SIGNATURE_GLOW_LAYERS` ist die gemeinsame Quelle beider Renderer
 - [x] **1:1- und Original-Format mit Signature-Presets testen** — gemessen: keine Verzerrung, aber Schrift zu klein
 - [ ] **`PlayResX` aus dem echten Seitenverhältnis ableiten**, damit 1:1/16:9 die Bildbreite nutzen
 

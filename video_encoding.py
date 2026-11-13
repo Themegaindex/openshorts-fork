@@ -33,15 +33,21 @@ _X264_ARGS = {
 }
 # (preset, multipass, cq) per tier. NVENC -cq is not on the x264 CRF scale.
 # Calibrated with VMAF on a 4K source cropped to 1080x1920 (RTX 3070 Laptop):
-#   master   x264 slow crf18 96.7 | nvenc p7 cq21 97.3
+#   master   x264 slow crf18 96.7 | nvenc p7 cq21 97.3 (now p4, see below)
 #   high     x264 fast crf18 96.5 | nvenc p5 cq19 97.5
 #   final    x264 fast crf20 95.9 | nvenc p6 cq22 97.1
 #   standard x264 fast crf22 95.2 | nvenc p5 cq24 96.7
 #   reframe  x264 fast crf23 94.8 | nvenc p6 cq24 96.7
 # Every tier is at least as good as the libx264 output it replaces, and
 # encodes 2-3x faster; files are larger.
+# master: p7 with fullres multipass bought nothing on a 6 s 4K60 Neon Sweep
+# burn. p4 without multipass scored the same VMAF (whole frame 99.997 for
+# both, caption region 96.85 vs 96.81) and, together with dropping the
+# yuv444p step in subtitles.build_layer_command, cut the burn from 9.4 s to
+# 4.8 s. The encoder was the bottleneck of every subtitle render (27 min for
+# a 10 min 4K60 video).
 _NVENC_TIERS = {
-    MASTER: ("p7", "fullres", 21),
+    MASTER: ("p4", "disabled", 21),
     HIGH: ("p5", "qres", 19),
     FINAL: ("p6", "qres", 22),
     STANDARD: ("p5", "qres", 24),
@@ -128,7 +134,9 @@ def _run_probe(profile):
     command = [
         "ffmpeg", "-hide_banner", "-loglevel", "error",
         "-f", "lavfi", "-i", "color=black:s=256x256:r=25:d=0.5",
-        *_nvenc_args(MASTER, profile), "-f", "null", "-",
+        # HIGH uses multipass, so the "full" probe still covers every option
+        # that some tier sends (MASTER no longer enables multipass).
+        *_nvenc_args(HIGH, profile), "-f", "null", "-",
     ]
     try:
         return subprocess.run(

@@ -28,6 +28,21 @@ const SIGNATURE_PRESETS = [
         borderWidth: 1,
     },
     {
+        id: 'neon-tube',
+        preset: 'neon_tube',
+        label: 'Neon Tube',
+        eyebrow: 'CRISP NEON',
+        description: 'Dark contour keeps letters sharp; spoken words light up as neon tubes.',
+        style: 'karaoke',
+        effect: 'glow',
+        highlightColor: '#18F8F4',
+        baseOpacity: 1,
+        uppercase: true,
+        fontName: 'Arial Black',
+        fontSize: 20,
+        borderWidth: 1,
+    },
+    {
         id: 'rainbow-word',
         preset: 'rainbow_word',
         label: 'Rainbow Word',
@@ -131,11 +146,12 @@ const SignaturePreview = ({ preset, compact = false, fontName, fontSize }) => {
         );
     }
 
+    const tube = preset === 'neon_tube';
     return (
         <span className={`caption-signature-stage caption-neon-sweep ${compact ? 'caption-signature-compact' : ''}`} style={previewStyle}>
-            <span className="caption-neon-white">UND </span>
-            <span className="caption-neon-live">MEINT</span>
-            {!compact && <><br /><span className="caption-neon-white">DER ANDERE</span></>}
+            <span className={tube ? 'caption-tube-white' : 'caption-neon-white'}>UND </span>
+            <span className={tube ? 'caption-tube-live' : 'caption-neon-live'}>MEINT</span>
+            {!compact && <><br /><span className={tube ? 'caption-tube-white' : 'caption-neon-white'}>DER ANDERE</span></>}
         </span>
     );
 };
@@ -303,7 +319,7 @@ export default function SubtitleModal({
                                     <span className="block text-[9px] font-black tracking-[0.28em] text-cyan-300">SIGNATURE GLOW</span>
                                     <span className="text-xs text-zinc-500">Measured from the CapCut originals</span>
                                 </div>
-                                <span className="rounded-full border border-cyan-400/20 bg-cyan-400/10 px-2 py-1 text-[8px] font-black tracking-widest text-cyan-200">4-LAYER</span>
+                                <span className="rounded-full border border-cyan-400/20 bg-cyan-400/10 px-2 py-1 text-[8px] font-black tracking-widest text-cyan-200">MULTI-LAYER</span>
                             </div>
                             <div className="grid grid-cols-2 gap-2.5">
                                 {SIGNATURE_PRESETS.map((p) => (
