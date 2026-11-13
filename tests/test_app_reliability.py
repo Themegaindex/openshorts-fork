@@ -390,6 +390,19 @@ def test_failed_worker_keeps_specific_error_summary(monkeypatch, tmp_path, worke
     assert job["error_summary"] == (worker_error or "Process failed with exit code 1")
 
 
+@pytest.mark.parametrize("returncode, expected", [
+    (1, "Process failed with exit code 1"),
+    (3221226505, "Worker crashed in native code (exit code 0xC0000409)."),
+    (-9, "Worker was stopped by "),   # SIGKILL on POSIX, where this code occurs
+])
+def test_worker_exit_codes_are_explained(returncode, expected):
+    # "exit code 3221226505" told the user nothing about a native crash.
+    message = app._process_exit_message(returncode)
+    assert message.startswith(expected)
+    if returncode == -9:
+        assert message.endswith("(usually out of memory).")
+
+
 def test_resume_stops_old_process_and_uses_automatic_phase(monkeypatch, tmp_path):
     job_id = "job-resume"
 

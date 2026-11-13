@@ -1789,6 +1789,23 @@ def _build_status_payload(job: dict) -> dict:
     }
 
 
+def _process_exit_message(returncode):
+    """Readable summary for a worker that ended without reporting an error."""
+    if isinstance(returncode, int) and returncode >= 0xC0000000:
+        # Windows NTSTATUS codes: a library (CUDA, Whisper, OpenCV, ...) brought
+        # the process down; no Python error was raised, so none was reported.
+        return (f"Worker crashed in native code (exit code 0x{returncode:08X}). "
+                "Resume the job; the Windows event log names the failing library.")
+    if isinstance(returncode, int) and returncode < 0:
+        try:
+            name = signal.Signals(-returncode).name
+        except ValueError:
+            name = f"signal {-returncode}"
+        hint = " (usually out of memory)" if -returncode == 9 else ""
+        return f"Worker was stopped by {name}{hint}."
+    return f"Process failed with exit code {returncode}"
+
+
 async def run_job(job_id, job_data):
     """Executes the subprocess for a specific job."""
 
@@ -1924,9 +1941,10 @@ async def run_job(job_id, job_data):
                 _mark_job_status(job_id, 'failed', error_summary="No metadata file generated.", resumable=True)
                 _append_log(job_id, "No metadata file generated.", level="error", category="result", important=True)
         else:
-            error_summary = jobs[job_id].get('error_summary') or f"Process failed with exit code {returncode}"
+            exit_message = _process_exit_message(returncode)
+            error_summary = jobs[job_id].get('error_summary') or exit_message
             _mark_job_status(job_id, 'failed', error_summary=error_summary, resumable=True)
-            _append_log(job_id, f"Process failed with exit code {returncode}", level="error", category="process", important=True)
+            _append_log(job_id, exit_message, level="error", category="process", important=True)
 
     except Exception as e:
         _mark_job_status(job_id, 'failed', error_summary=f"Execution error: {str(e)}", resumable=True)

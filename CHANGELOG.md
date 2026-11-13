@@ -30,6 +30,8 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 
 ### Fixed
 
+- **Absturz am Ende der GPU-Transkription unter Windows (Exit-Code 3221226505 / 0xC0000409)**: Mit dem Standard-Speicherverwalter von CTranslate2 (`cuda_malloc_async`) brach der ganze Worker beim Entladen des Whisper-Modells hart ab, sobald Whisper einmal auf Sampling umgeschaltet hatte; das fertige Transkript ging verloren. Unter Windows gilt jetzt `CT2_CUDA_ALLOCATOR=cub_caching` (überschreibbar). Nachgestellt: vorher 3 von 3 Abstürze, jetzt 0 von 3, ohne messbaren Geschwindigkeitsverlust.
+- **Verständliche Meldung bei Worker-Abstürzen**: Statt „Process failed with exit code 3221226505“ steht dort jetzt „Worker crashed in native code (exit code 0xC0000409)“; unter Linux wird das Signal genannt (z. B. SIGKILL, meist Speichermangel).
 - **Eigene Actor-Bilder werden nicht mehr nach 24 h gelöscht**: Das Aufräumen hielt `output/actor_uploads/` für einen alten Job.
 - **Browser hinter einem Reverse Proxy mit API-Token**: Der CORS-Vorabcheck (Preflight) bekam 401, weil ein Browser dort nie eigene Header mitschickt. Er wird jetzt vom CORS-Layer beantwortet; die Origin-Prüfung gilt weiter.
 - **Lange YouTube-Videos**: Die Downloadgrenze pro Datei ist mit `OPENSHORTS_MAX_DOWNLOAD_GB` einstellbar (Standard 2).
