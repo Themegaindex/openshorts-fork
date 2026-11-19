@@ -96,14 +96,46 @@ const CAPTION_PRESETS = [
 // Each result card owns its own modal instance, so without this every clip
 // (and every new job) started from the defaults again.
 const STYLE_STORAGE_KEY = 'openshorts_subtitle_style';
+// Version 2 added the "auto" position. Settings saved before it carry
+// position "bottom" only because that was the default, so they move to
+// "auto" once; a "bottom" picked after that is saved as version 2 and stays.
+const STYLE_VERSION = 2;
 
 const loadSavedStyle = () => {
     try {
         const raw = localStorage.getItem(STYLE_STORAGE_KEY);
-        return raw ? JSON.parse(raw) : null;
+        const saved = raw ? JSON.parse(raw) : null;
+        if (saved && saved.styleVersion !== STYLE_VERSION && saved.position === 'bottom') {
+            return { ...saved, position: 'auto' };
+        }
+        return saved;
     } catch {
         return null;
     }
+};
+
+const POSITIONS = [
+    { id: 'auto', label: 'Auto' },
+    { id: 'top', label: 'Top' },
+    { id: 'middle', label: 'Middle' },
+    { id: 'bottom', label: 'Bottom' },
+];
+
+// Shorts safe zone as shares of a portrait frame. Keep in sync with
+// DEFAULT_SAFE_BOTTOM / DEFAULT_SAFE_TOP / DEFAULT_SAFE_SIDE in
+// caption_placement.py, which places the burned-in captions.
+const SAFE_ZONE = { bottom: 0.25, top: 0.10, side: 0.14 };
+
+const percent = (share) => `${share * 100}%`;
+
+// Where the preview shows the caption on a portrait clip: bottom ends on the
+// lower safe line, top starts on the upper one, middle sits on 50 %. Auto
+// shows the bottom; the seam only applies to stacked two-person scenes.
+const portraitOverlayStyle = (position) => {
+    const sides = { left: percent(SAFE_ZONE.side), right: percent(SAFE_ZONE.side) };
+    if (position === 'top') return { ...sides, top: percent(SAFE_ZONE.top) };
+    if (position === 'middle') return { ...sides, top: 0, bottom: 0 };
+    return { ...sides, bottom: percent(SAFE_ZONE.bottom) };
 };
 
 const saveStyle = (settings) => {
@@ -161,7 +193,7 @@ export default function SubtitleModal({
     bulkProgress = null, bulkResult = null, onCancelBulk = null,
 }) {
     const saved = React.useMemo(loadSavedStyle, []);
-    const [position, setPosition] = useState(saved?.position ?? 'bottom');
+    const [position, setPosition] = useState(saved?.position ?? 'auto');
     const [fontSize, setFontSize] = useState(saved?.fontSize ?? 24);
     const [fontName, setFontName] = useState(saved?.fontName ?? 'Verdana');
     const [fontColor, setFontColor] = useState(saved?.fontColor ?? '#FFFFFF');
@@ -229,13 +261,18 @@ export default function SubtitleModal({
         `-${bw}px 0 0 ${bc}`, `${bw}px 0 0 ${bc}`,
     ].join(', ') : 'none';
 
+    // A portrait clip keeps its captions inside the Shorts safe zone, so the
+    // preview does too. Other shapes keep the old preview.
+    const portrait = videoAspect < 1;
+
     const previewStyle = {
         fontFamily: fontName,
         color: fontColor,
         // Preview scales with the chosen size (24 ≈ the old fixed 20px look)
         fontSize: `${Math.round(fontSize * 0.83)}px`,
         fontWeight: 'bold',
-        maxWidth: '85%',
+        // Portrait: the overlay is already only as wide as the safe zone.
+        maxWidth: portrait ? '100%' : '85%',
         padding: '6px 12px',
         borderRadius: '4px',
         textAlign: 'center',
@@ -248,6 +285,29 @@ export default function SubtitleModal({
             : { textShadow: outlineShadow }
         ),
     };
+
+    // The sample caption inside the preview overlay.
+    const previewCaption = preset !== 'custom' ? (
+        <SignaturePreview preset={preset} fontName={fontName} fontSize={fontSize} />
+    ) : (
+        <span style={{ ...previewStyle, textTransform: uppercase ? 'uppercase' : 'none' }}>
+            {style === 'karaoke' ? (
+                <>
+                    <span style={{ color: dimmedWhite(baseOpacity) }}>This is </span>
+                    <span style={{
+                        color: effect === 'glow' || effect === 'box' ? '#FFFFFF' : highlightColor,
+                        textShadow: effectShadow(effect, highlightColor),
+                        ...(effect === 'pop' ? { display: 'inline-block', transform: 'scale(1.12)' } : {}),
+                        ...(effect === 'bounce' ? { display: 'inline-block', animation: 'subtitle-bounce 0.6s ease-out both' } : {}),
+                        ...(effect === 'box' ? { backgroundColor: highlightColor, borderRadius: '4px', padding: '0 4px' } : {}),
+                    }}>how</span>
+                    <span style={{ color: dimmedWhite(baseOpacity) }}> your subtitles<br/>will appear on the video</span>
+                </>
+            ) : (
+                <>This is how your subtitles<br/>will appear on the video</>
+            )}
+        </span>
+    );
 
     return (
         <div className="fixed inset-0 z-[100] flex items-center justify-center p-4 bg-black/80 backdrop-blur-sm animate-[fadeIn_0.2s_ease-out]">
@@ -276,33 +336,24 @@ export default function SubtitleModal({
                      />
 
                      {/* Subtitle Overlay Preview */}
-                     <div className={`absolute w-full px-8 text-center transition-all duration-300 pointer-events-none flex flex-col items-center justify-center
-                        ${position === 'top' ? 'top-20' : ''}
-                        ${position === 'middle' ? 'top-0 bottom-0' : ''}
-                        ${position === 'bottom' ? 'bottom-20' : ''}
-                     `}>
-                        {preset !== 'custom' ? (
-                            <SignaturePreview preset={preset} fontName={fontName} fontSize={fontSize} />
-                        ) : (
-                            <span style={{ ...previewStyle, textTransform: uppercase ? 'uppercase' : 'none' }}>
-                                {style === 'karaoke' ? (
-                                    <>
-                                        <span style={{ color: dimmedWhite(baseOpacity) }}>This is </span>
-                                        <span style={{
-                                            color: effect === 'glow' || effect === 'box' ? '#FFFFFF' : highlightColor,
-                                            textShadow: effectShadow(effect, highlightColor),
-                                            ...(effect === 'pop' ? { display: 'inline-block', transform: 'scale(1.12)' } : {}),
-                                            ...(effect === 'bounce' ? { display: 'inline-block', animation: 'subtitle-bounce 0.6s ease-out both' } : {}),
-                                            ...(effect === 'box' ? { backgroundColor: highlightColor, borderRadius: '4px', padding: '0 4px' } : {}),
-                                        }}>how</span>
-                                        <span style={{ color: dimmedWhite(baseOpacity) }}> your subtitles<br/>will appear on the video</span>
-                                    </>
-                                ) : (
-                                    <>This is how your subtitles<br/>will appear on the video</>
-                                )}
-                            </span>
-                        )}
-                     </div>
+                     {portrait ? (
+                        // A box with the video's own shape: with the 600 px cap the
+                        // preview can be wider than the letterboxed video, and the
+                        // safe-zone shares must be measured on the frame itself.
+                        <div className="absolute inset-y-0 left-1/2 -translate-x-1/2 max-w-full pointer-events-none" style={{ aspectRatio: videoAspect }}>
+                            <div className="absolute text-center transition-all duration-300 flex flex-col items-center justify-center" style={portraitOverlayStyle(position)}>
+                                {previewCaption}
+                            </div>
+                        </div>
+                     ) : (
+                        <div className={`absolute w-full px-8 text-center transition-all duration-300 pointer-events-none flex flex-col items-center justify-center
+                            ${position === 'top' ? 'top-20' : ''}
+                            ${position === 'middle' ? 'top-0 bottom-0' : ''}
+                            ${position === 'bottom' || position === 'auto' ? 'bottom-20' : ''}
+                        `}>
+                            {previewCaption}
+                        </div>
+                     )}
                 </div>
 
                 {/* Right: Controls */}
@@ -473,17 +524,20 @@ export default function SubtitleModal({
                         {/* Position Selector */}
                         <div>
                             <label className="text-xs font-bold text-zinc-400 uppercase tracking-wider mb-2 block">Position</label>
-                            <div className="grid grid-cols-3 gap-2">
-                                {['top', 'middle', 'bottom'].map((pos) => (
+                            <div className="grid grid-cols-4 gap-2">
+                                {POSITIONS.map((pos) => (
                                     <button
-                                        key={pos}
-                                        onClick={() => setPosition(pos)}
-                                        className={`p-2 rounded-lg border text-center text-xs font-medium transition-all ${position === pos ? 'bg-primary/20 border-primary text-white' : 'bg-white/5 border-white/5 text-zinc-400 hover:bg-white/10'}`}
+                                        key={pos.id}
+                                        onClick={() => setPosition(pos.id)}
+                                        className={`p-2 rounded-lg border text-center text-xs font-medium transition-all ${position === pos.id ? 'bg-primary/20 border-primary text-white' : 'bg-white/5 border-white/5 text-zinc-400 hover:bg-white/10'}`}
                                     >
-                                        {pos.charAt(0).toUpperCase() + pos.slice(1)}
+                                        {pos.label}
                                     </button>
                                 ))}
                             </div>
+                            <p className="mt-2 text-[10px] leading-snug text-zinc-500">
+                                Auto puts captions between two stacked speakers, at the top when the speaker's face sits low and no hook is there, and at the bottom everywhere else. On 9:16 clips every position stays clear of the YouTube Shorts title and buttons.
+                            </p>
                         </div>
 
                         {/* Text Size */}
@@ -654,7 +708,7 @@ export default function SubtitleModal({
                     <button
                         onClick={() => {
                             const settings = { position, fontSize, fontName, fontColor, borderColor, borderWidth, bgColor, bgOpacity, style, preset, highlightColor, effect, baseOpacity, uppercase };
-                            saveStyle({ ...settings, activePreset });
+                            saveStyle({ ...settings, activePreset, styleVersion: STYLE_VERSION });
                             onGenerate(settings);
                         }}
                         disabled={isProcessing}

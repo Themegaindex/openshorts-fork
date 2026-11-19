@@ -38,6 +38,7 @@ from dotenv import load_dotenv
 import json
 import shutil
 from typing import Optional
+import caption_placement
 import frame_sampler
 import longform
 import video_encoding
@@ -2303,17 +2304,54 @@ def _render_clip(input_video, final_output_video, output_format="vertical", layo
     # that then fails to play until a manual reload.
     partial_output = _partial_render_path(final_output_video)
     _remove_quietly(partial_output)
+    layout_record = {}
     if output_format == "original":
         success = _finalize_clip_passthrough(input_video, partial_output, progress_callback)
     else:
         aspect = output_aspect_ratio(output_format)
         success = process_video_to_vertical(input_video, partial_output, progress_callback,
-                                            aspect_ratio=aspect, layout_style=layout_style)
+                                            aspect_ratio=aspect, layout_style=layout_style,
+                                            layout_record=layout_record)
     if not success:
         _remove_quietly(partial_output)
         return False
     os.replace(partial_output, final_output_video)
+    # Named after the final file, not the partial one, because that is the
+    # name the clip metadata keeps.
+    _record_layout_timeline(final_output_video, layout_record)
     return True
+
+
+def _record_layout_timeline(final_output_video, layout_record):
+    """Write which layout each scene of the clip got, next to the clip.
+
+    Best effort: the clip is already in place, and a missing timeline only
+    means ``auto`` captions stay at the bottom. A render without a timeline
+    (passthrough, original format) removes a stale one from an earlier render
+    under the same name.
+    """
+    sidecar = caption_placement.layout_sidecar_path(final_output_video)
+    segments = (layout_record or {}).get("segments")
+    try:
+        if segments:
+            _save_json_file(sidecar, caption_placement.layout_timeline_payload(
+                segments, layout_record.get("fps") or 0,
+            ))
+            return
+    except Exception as exc:
+        print(f"⚠️ Could not record the layout timeline of {final_output_video}: {exc}")
+    _remove_quietly(sidecar)
+
+
+def _record_face_sample(face_samples, scene_index, face_box, crop_box):
+    """Remember where a detected face lands in the drawn frame (the crop is
+    scaled to the full output). Never lets a bad value stop the render."""
+    try:
+        band = caption_placement.face_band_in_crop(face_box, crop_box)
+        if band is not None:
+            face_samples.setdefault(scene_index, []).append(band)
+    except Exception:
+        pass
 
 
 def _partial_render_path(final_output_video):
@@ -2344,13 +2382,17 @@ def _full_render_filename(output_dir, video_title, output_format):
 
 
 def process_video_to_vertical(input_video, final_output_video, progress_callback=None, aspect_ratio=ASPECT_RATIO,
-                              layout_style="smart", video_encoder=None, _reuse_analysis=None):
+                              layout_style="smart", video_encoder=None, _reuse_analysis=None,
+                              layout_record=None):
     """
     Core logic to convert horizontal video to vertical using scene detection and Active Speaker Tracking (MediaPipe).
 
     video_encoder="x264" forces the CPU encoder; it is used to redo a clip
     whose GPU encoder died mid-stream. _reuse_analysis (scenes, fps and
     scene decisions of that first run) skips detection and analysis then.
+    layout_record: a dict that receives the rendered layout per scene
+    ("segments", "fps") once the clip is complete. A passthrough leaves it
+    empty.
     """
     script_start_time = time.time()
 
@@ -2546,6 +2588,8 @@ def process_video_to_vertical(input_video, final_output_video, progress_callback
     yolo_throttle = FallbackThrottle(REFRAME_YOLO_INTERVAL_SECONDS)
     face_calls = yolo_calls = 0
     detect_seconds = 0.0
+    # Where the tracked face lands in each TRACK scene, for caption placement.
+    face_samples = {}
     reader = (
         frame_sampler.FramePrefetcher(cap, REFRAME_DECODE_PREFETCH)
         if REFRAME_DECODE_PREFETCH > 0 and cap.isOpened() else None
@@ -2604,6 +2648,7 @@ def process_video_to_vertical(input_video, final_output_video, progress_callback
 
             else:
                 # "Single Speaker" -> Track & Crop
+                face_box = None
                 if is_scene_start or frame_number % detect_stride == 0:
                     detect_started = time.perf_counter()
                     timestamp_seconds = frame_number / fps_value
@@ -2619,6 +2664,8 @@ def process_video_to_vertical(input_video, final_output_video, progress_callback
                             artificial_switches += 1
                         cameraman.update_target(target_decision.box)
                         scene_had_target = True
+                        # A face box; the YOLO person fallback below is not.
+                        face_box = target_decision.box
                     elif (
                         target_decision.state == TargetState.LOST
                         and person_fallback_due(speaker_tracker, yolo_throttle, timestamp_seconds)
@@ -2644,6 +2691,8 @@ def process_video_to_vertical(input_video, final_output_video, progress_callback
                 x1, y1, x2, y2 = cameraman.get_crop_box(force_snap=is_scene_start)
                 if y2 > y1 and x2 > x1:
                     output_frame = _resize_frame(frame[y1:y2, x1:x2], OUTPUT_WIDTH, OUTPUT_HEIGHT)
+                    if face_box is not None:
+                        _record_face_sample(face_samples, current_scene_index, face_box, (x1, y1, x2, y2))
                 else:
                     output_frame = _resize_frame(frame, OUTPUT_WIDTH, OUTPUT_HEIGHT)
 
@@ -2707,6 +2756,7 @@ def process_video_to_vertical(input_video, final_output_video, progress_callback
                 input_video, final_output_video, progress_callback,
                 aspect_ratio=aspect_ratio, layout_style=layout_style, video_encoder="x264",
                 _reuse_analysis={"scenes": scenes, "fps": fps, "scene_decisions": scene_decisions},
+                layout_record=layout_record,
             )
             if rendered:
                 # Only now is it clear the GPU, not the clip, was the problem.
@@ -2754,6 +2804,20 @@ def process_video_to_vertical(input_video, final_output_video, progress_callback
     # Clean up temp files
     if os.path.exists(temp_video_output): os.remove(temp_video_output)
     if os.path.exists(temp_audio_output): os.remove(temp_audio_output)
+
+    if layout_record is not None:
+        # What the frame loop above actually drew, for caption placement.
+        # The clip is finished; a failure here only loses the timeline.
+        try:
+            layout_record["fps"] = fps_value
+            layout_record["segments"] = caption_placement.build_layout_timeline(
+                scene_boundaries, scene_strategies, scene_split_centers,
+                stacked=(OUTPUT_HEIGHT > OUTPUT_WIDTH), fps=fps_value,
+                frames_rendered=frame_number, face_samples=face_samples,
+            )
+        except Exception as exc:
+            print(f"⚠️ Could not build the layout timeline: {exc}")
+            layout_record.pop("segments", None)
     
     return True
 
