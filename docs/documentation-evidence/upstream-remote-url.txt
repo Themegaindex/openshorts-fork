@@ -1,0 +1,3 @@
+$ git remote get-url upstream
+exit_code=0
+https://github.com/mutonby/openshorts.git

@@ -1,0 +1,26 @@
+{
+  "checked_on": "2026-11-06",
+  "method": "Read-only web retrieval; repository clone also executed independently. No HTTP status is inferred beyond successful tool retrieval.",
+  "pages": [
+    {
+      "url": "https://vite.dev/guide/",
+      "supports": "Vite requires Node 20.19+ or 22.12+; local Vite 8.3.6 engine verified separately."
+    },
+    {
+      "url": "https://nodejs.org/en/about/previous-releases",
+      "supports": "Node 24 LTS; Node 20 EOL at the date of this check."
+    },
+    {
+      "url": "https://github.com/Themegaindex/openshorts-fork",
+      "supports": "Public fork and canonical clone target."
+    },
+    {
+      "url": "https://github.com/Themegaindex",
+      "supports": "Maintainer profile link resolves."
+    },
+    {
+      "url": "https://github.com/mutonby/openshorts",
+      "supports": "Public upstream repository."
+    }
+  ]
+}

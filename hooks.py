@@ -1,14 +1,14 @@
 import os
 import re
-import textwrap
 import subprocess
 import urllib.request
 import uuid
 from PIL import Image, ImageDraw, ImageFont, ImageFilter
-from video_formats import EVEN_PAD_FILTER
 
 FONT_URL = "https://github.com/googlefonts/noto-fonts/raw/main/hinted/ttf/NotoSerif/NotoSerif-Bold.ttf"
-FONT_DIR = "fonts"
+# Absolute, so a worker started from another directory still finds the font
+# that ships with the repository instead of downloading a second copy.
+FONT_DIR = os.path.join(os.path.dirname(os.path.abspath(__file__)), "fonts")
 FONT_PATH = os.path.join(FONT_DIR, "NotoSerif-Bold.ttf")
 
 # Codepoint ranges NotoSerif has no glyphs for (would render as tofu boxes).
@@ -113,8 +113,16 @@ def download_font_if_needed():
                 FONT_URL, 
                 headers={'User-Agent': 'Mozilla/5.0'}
             )
-            with urllib.request.urlopen(req) as response, open(FONT_PATH, 'wb') as out_file:
-                out_file.write(response.read())
+            # Temp file + rename, with a timeout: a broken transfer used to
+            # leave a truncated font that disabled every later download.
+            tmp_path = f"{FONT_PATH}.{uuid.uuid4().hex}.tmp"
+            try:
+                with urllib.request.urlopen(req, timeout=30) as response, open(tmp_path, 'wb') as out_file:
+                    out_file.write(response.read())
+                os.replace(tmp_path, FONT_PATH)
+            finally:
+                if os.path.exists(tmp_path):
+                    os.remove(tmp_path)
             print("✅ Font downloaded.")
         except Exception as e:
             print(f"❌ Failed to download font: {e}")
@@ -132,7 +140,6 @@ def create_hook_image(text, target_width, output_image_path="hook_overlay.png", 
     line_spacing = 20 # Increased spacing
     cornerradius = 20
     shadow_offset = (5, 5) 
-    shadow_blur = 10
     
     # Font Size Calculation (approx 5% of width - tuned to match Noto Serif Bold metrics in browser)
     base_font_size = int(target_width * 0.05)
@@ -317,48 +324,3 @@ def prepare_hook_overlay(video_path, text, position="top", font_scale=1.0):
         overlay_y = int(video_height * 0.20)
 
     return img_path, overlay_x, overlay_y
-
-
-def add_hook_to_video(video_path, text, output_path, position="top", font_scale=1.0):
-    """
-    Overlays text hook onto video.
-    position: 'top', 'center', 'bottom'
-    font_scale: float multiplier (1.0 = default)
-    """
-    hook_filename = None
-    try:
-        img_path, overlay_x, overlay_y = prepare_hook_overlay(
-            video_path, text, position=position, font_scale=font_scale)
-        hook_filename = img_path
-
-        # 4. FFmpeg Command
-        print(f"🎬 Overlaying hook: '{text}' at {overlay_x},{overlay_y}")
-
-        ffmpeg_cmd = [
-            'ffmpeg', '-y',
-            '-i', video_path,
-            '-i', img_path,
-            '-filter_complex', f"[0:v][1:v]overlay={overlay_x}:{overlay_y},{EVEN_PAD_FILTER}",
-            '-c:a', 'copy',
-            '-c:v', 'libx264', '-preset', 'fast', '-crf', '22', '-pix_fmt', 'yuv420p',
-            '-movflags', '+faststart',
-            output_path
-        ]
-        
-        subprocess.run(ffmpeg_cmd, check=True, stdout=subprocess.PIPE, stderr=subprocess.PIPE, timeout=1800)
-        print(f"✅ Hook added to {output_path}")
-        return True
-
-    except subprocess.TimeoutExpired:
-        print("❌ FFmpeg hook overlay timed out after 1800s.")
-        raise RuntimeError("FFmpeg hook overlay timed out after 1800s.")
-    except subprocess.CalledProcessError as e:
-        print(f"❌ FFmpeg Error: {e.stderr.decode() if e.stderr else 'Unknown'}")
-        raise e
-    except Exception as e:
-        print(f"❌ Hook Gen Error: {e}")
-        raise e
-    finally:
-        # Cleanup temp image
-        if hook_filename and os.path.exists(hook_filename):
-            os.remove(hook_filename)

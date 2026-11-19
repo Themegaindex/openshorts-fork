@@ -1,8 +1,16 @@
 import React, { useState, useRef, useEffect, useCallback } from 'react';
 import { Upload, Image, Loader2, Send, Check, Download, ArrowRight, ArrowLeft, Sparkles, Video, Type, X, Plus, MessageSquare, FileText, Youtube, AlertCircle, CheckCircle2, Settings } from 'lucide-react';
 import { getApiUrl } from '../config';
+import { readApiError } from '../apiError';
 
 const STEPS = ['Input', 'Titles', 'Generate', 'Description', 'Publish'];
+
+// crypto.randomUUID only exists in secure contexts (https or localhost), so
+// the dashboard opened via a LAN IP threw here.
+const newSessionUuid = () => {
+  if (typeof crypto !== 'undefined' && crypto.randomUUID) return crypto.randomUUID();
+  return `${Date.now().toString(36)}${Math.random().toString(36).slice(2, 12)}`;
+};
 
 function StepIndicator({ currentStep }) {
   return (
@@ -105,7 +113,7 @@ function DragDropZone({ label, accept, onFile, file, onClear, icon: Icon }) {
   );
 }
 
-export default function ThumbnailStudio({ geminiApiKey, uploadPostKey, uploadUserId }) {
+export default function ThumbnailStudio({ geminiApiKey, uploadPostKey, uploadUserId, onOpenSettings }) {
   // Step management
   const [step, setStep] = useState(0);
   const [mode, setMode] = useState(null); // 'video' or 'manual'
@@ -183,7 +191,6 @@ export default function ThumbnailStudio({ geminiApiKey, uploadPostKey, uploadUse
       if (res.ok) {
         const data = await res.json();
         setPreprocessSessionId(data.session_id);
-        console.log(`🎙️ Background Whisper started: ${data.session_id}`);
       }
     } catch (e) {
       console.error('Pre-upload failed:', e);
@@ -215,10 +222,7 @@ export default function ThumbnailStudio({ geminiApiKey, uploadPostKey, uploadUse
         body: formData
       });
 
-      if (!res.ok) {
-        const err = await res.text();
-        throw new Error(err);
-      }
+      if (!res.ok) throw new Error(await readApiError(res));
 
       const data = await res.json();
       setSessionId(data.session_id);
@@ -250,7 +254,7 @@ export default function ThumbnailStudio({ geminiApiKey, uploadPostKey, uploadUse
     if (mode === 'manual' && manualTitle) {
       setSelectedTitle(manualTitle);
       // Create session for manual mode
-      const newSessionId = sessionId || crypto.randomUUID();
+      const newSessionId = sessionId || newSessionUuid();
       setSessionId(newSessionId);
       fetch(getApiUrl('/api/thumbnail/titles'), {
         method: 'POST',
@@ -284,9 +288,12 @@ export default function ThumbnailStudio({ geminiApiKey, uploadPostKey, uploadUse
         body: JSON.stringify({ session_id: sessionId, message: userMsg })
       });
 
-      if (!res.ok) throw new Error(await res.text());
+      if (!res.ok) throw new Error(await readApiError(res));
       const data = await res.json();
       setTitles(data.titles || []);
+      // Refined lists come without picks; the old star indices would point
+      // at unrelated titles.
+      setRecommended(data.recommended || []);
       setChatHistory(prev => [...prev, {
         role: 'assistant',
         content: `Here are refined titles based on your feedback. Click one to select it.`
@@ -326,10 +333,7 @@ export default function ThumbnailStudio({ geminiApiKey, uploadPostKey, uploadUse
         body: formData
       });
 
-      if (!res.ok) {
-        const errData = await res.json().catch(() => null);
-        throw new Error(errData?.detail || `Server error ${res.status}`);
-      }
+      if (!res.ok) throw new Error(await readApiError(res));
 
       const data = await res.json();
       if (!data.thumbnails || data.thumbnails.length === 0) {
@@ -379,10 +383,7 @@ export default function ThumbnailStudio({ geminiApiKey, uploadPostKey, uploadUse
         body: JSON.stringify({ session_id: sessionId, title: finalTitle })
       });
 
-      if (!res.ok) {
-        const err = await res.text();
-        throw new Error(err);
-      }
+      if (!res.ok) throw new Error(await readApiError(res));
 
       const data = await res.json();
       setDescription(data.description || '');
@@ -418,10 +419,7 @@ export default function ThumbnailStudio({ geminiApiKey, uploadPostKey, uploadUse
         body: formData
       });
 
-      if (!res.ok) {
-        const err = await res.text();
-        throw new Error(err);
-      }
+      if (!res.ok) throw new Error(await readApiError(res));
 
       const { publish_id } = await res.json();
 
@@ -564,7 +562,7 @@ export default function ThumbnailStudio({ geminiApiKey, uploadPostKey, uploadUse
 
               <button
                 onClick={handleAnalyze}
-                disabled={isAnalyzing || !videoFile}
+                disabled={isAnalyzing || isPreprocessing || !videoFile}
                 className="w-full btn-primary py-3 text-sm font-semibold flex items-center justify-center gap-2 disabled:opacity-50 disabled:cursor-not-allowed"
               >
                 {isAnalyzing ? (
@@ -1099,8 +1097,20 @@ export default function ThumbnailStudio({ geminiApiKey, uploadPostKey, uploadUse
                 />
               </div>
 
-              {/* Publish Button */}
-              {(!uploadPostKey || !uploadUserId) ? (
+              {/* Publish Button. The manual title mode has no video, and the
+                  backend can only publish a video it received. */}
+              {mode === 'manual' ? (
+                <div className="glass-panel p-6 space-y-2">
+                  <div className="flex items-center gap-2 text-amber-400">
+                    <AlertCircle size={16} />
+                    <span className="text-sm font-medium">Publishing needs a video</span>
+                  </div>
+                  <p className="text-xs text-zinc-500">
+                    You wrote your own title, so there is no video to upload. Download the thumbnail and copy the
+                    description, or start again with &quot;Analyze Video&quot; to publish from here.
+                  </p>
+                </div>
+              ) : (!uploadPostKey || !uploadUserId) ? (
                 <div className="glass-panel p-6 space-y-3">
                   <div className="flex items-center gap-2 text-amber-400">
                     <AlertCircle size={16} />
@@ -1110,7 +1120,7 @@ export default function ThumbnailStudio({ geminiApiKey, uploadPostKey, uploadUse
                     To publish directly to YouTube, configure your Upload-Post API key and connect a profile in Settings.
                   </p>
                   <button
-                    onClick={() => { }}
+                    onClick={onOpenSettings}
                     className="text-xs text-primary hover:underline flex items-center gap-1"
                   >
                     <Settings size={12} /> Go to Settings

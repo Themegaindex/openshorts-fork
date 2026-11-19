@@ -41,7 +41,6 @@ export default function TranslateModal({ isOpen, onClose, onTranslate, isProcess
     if (!isOpen) return null;
 
     const handleSubmit = () => {
-        console.log('[TranslateModal] handleSubmit called, targetLanguage:', targetLanguage);
         onTranslate({ targetLanguage });
     };
 

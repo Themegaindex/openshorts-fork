@@ -1,0 +1,3 @@
+$ git clone https://github.com/Themegaindex/openshorts-fork.git <temporary-clone>\openshorts-fork
+exit_code=0
+Cloning into '<temporary-clone>\openshorts-fork'...

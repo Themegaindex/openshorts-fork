@@ -10,6 +10,7 @@ Always exits 0 — the caller treats probe failures as "unknown" and starts the
 job anyway (fail-open), where the in-job warning still applies.
 """
 import argparse
+from security import validate_youtube_url
 import json
 import os
 import sys
@@ -32,6 +33,7 @@ def main() -> int:
 
     result = {"max_height": 0, "mode": None, "cookies_invalid": False}
     try:
+        validate_youtube_url(args.url)
         import yt_dlp
 
         warnings = []

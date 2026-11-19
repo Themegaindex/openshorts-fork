@@ -333,6 +333,81 @@ def test_youtube_download_drops_browser_auth_on_transfer_fallback(monkeypatch, t
     assert seen[2]["overwrites"] is False
 
 
+def test_save_json_file_temp_name_does_not_grow_with_long_titles(monkeypatch, tmp_path):
+    # 246 bytes: a valid ext4 name (limit 255). A temp name built as
+    # "<target>.<pid>.<ns>.tmp" overflowed that limit and failed every save.
+    target = tmp_path / (("я" * 100) + "_clip_selection_batch_1_attempt_1.request.json")
+    swapped = []
+    real_replace = os.replace
+
+    def spy_replace(source, destination):
+        swapped.append(source)
+        return real_replace(source, destination)
+
+    monkeypatch.setattr(main.os, "replace", spy_replace)
+    main._save_json_file(str(target), {"ok": True})
+
+    assert len(os.path.basename(swapped[0]).encode("utf-8")) <= 40
+    assert os.path.dirname(swapped[0]) == str(tmp_path)  # same folder: atomic swap
+    assert json.loads(target.read_text(encoding="utf-8")) == {"ok": True}
+    assert [entry.name for entry in tmp_path.iterdir()] == [target.name]
+
+
+def _size_limited_ydl(tmp_path, seen, formats_height=2160):
+    """Fake yt-dlp that skips the 4K format like max_filesize does: no
+    exception, only the audio part file is left behind."""
+
+    class FakeYDL:
+        def __init__(self, opts):
+            self.opts = opts
+            seen.append(opts)
+
+        def __enter__(self):
+            return self
+
+        def __exit__(self, *args):
+            pass
+
+        def extract_info(self, url, download):
+            return {"title": "test_video", "formats": [{"height": formats_height, "vcodec": "h264"}]}
+
+        def download(self, urls):
+            if "height<=1080" in self.opts["format"]:
+                (tmp_path / "test_video.mp4").write_bytes(b"merged 1080p video")
+            else:
+                (tmp_path / "test_video.f140.m4a").write_bytes(b"audio only")
+
+    return FakeYDL
+
+
+def test_youtube_download_over_size_limit_falls_back_instead_of_using_audio(monkeypatch, tmp_path):
+    reporter = _Reporter()
+    monkeypatch.setattr(main, "JOB_REPORTER", reporter)
+    monkeypatch.setattr(main, "youtube_auth_attempts", lambda: [
+        ("anonymous-fallback", {"cookiesfrombrowser": None, "cookiefile": None}),
+    ])
+    seen = []
+    monkeypatch.setattr(main.yt_dlp, "YoutubeDL", _size_limited_ydl(tmp_path, seen))
+
+    path, _ = main.download_youtube_video("https://www.youtube.com/watch?v=test", str(tmp_path))
+
+    assert Path(path).name == "test_video.mp4"
+    assert Path(path).read_bytes() == b"merged 1080p video"
+    assert any(kind == "warning" and "GB limit" in args[0] for kind, args, _ in reporter.events)
+
+
+def test_youtube_download_without_video_file_fails_clearly(monkeypatch, tmp_path):
+    monkeypatch.setattr(main, "JOB_REPORTER", _Reporter())
+    monkeypatch.setattr(main, "youtube_auth_attempts", lambda: [
+        ("anonymous-fallback", {"cookiesfrombrowser": None, "cookiefile": None}),
+    ])
+    # Only 1080p offered: there is no smaller fallback format to try.
+    monkeypatch.setattr(main.yt_dlp, "YoutubeDL", _size_limited_ydl(tmp_path, [], formats_height=1080))
+
+    with pytest.raises(main.YouTubeDownloadError, match="download limit"):
+        main.download_youtube_video("https://www.youtube.com/watch?v=test", str(tmp_path))
+
+
 def test_youtube_bot_check_surfaces_recovery_instead_of_ip_ban(monkeypatch, tmp_path):
     monkeypatch.setattr(main, "JOB_REPORTER", _Reporter())
     monkeypatch.setattr(main, "youtube_auth_attempts", lambda: [

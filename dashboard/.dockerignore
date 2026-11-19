@@ -1,0 +1,11 @@
+# The image installs its own Linux packages with `npm ci`. Without this file,
+# `COPY . .` copied the host's node_modules (Windows binaries) over them, and
+# docker-compose seeds its node_modules volume from that broken copy.
+node_modules
+dist
+output
+uploads
+.pytest_cache
+# Never ship local secrets into an image layer.
+.env*
+*_cookies.txt

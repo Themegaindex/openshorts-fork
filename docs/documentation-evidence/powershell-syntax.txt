@@ -1,0 +1,5 @@
+$ powershell -NoProfile -NonInteractive -File <temporary-clone>\parse-doc-instructions.ps1
+exit_code=0
+[
+
+]

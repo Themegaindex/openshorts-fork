@@ -1,0 +1,165 @@
+{
+  "date": "2026-11-06",
+  "status": "passed",
+  "steps": [
+    {
+      "name": "fresh-clone",
+      "command": "git clone https://github.com/Themegaindex/openshorts-fork.git <temporary-clone>\\openshorts-fork",
+      "exit_code": 0,
+      "seconds": 3.88,
+      "passed": true
+    },
+    {
+      "name": "upstream-remote-add",
+      "command": "git remote add upstream https://github.com/mutonby/openshorts.git",
+      "exit_code": 0,
+      "seconds": 0.03,
+      "passed": true
+    },
+    {
+      "name": "upstream-remote-url",
+      "command": "git remote get-url upstream",
+      "exit_code": 0,
+      "seconds": 0.02,
+      "passed": true
+    },
+    {
+      "name": "upstream-pinned-fetch",
+      "command": "git fetch --no-tags --no-write-fetch-head --no-recurse-submodules upstream 894514049a3c6210a7cd65676344f44371b3717a:refs/audit/security-20261105-upstream",
+      "exit_code": 0,
+      "seconds": 2.39,
+      "passed": true
+    },
+    {
+      "name": "merge-base",
+      "command": "git merge-base 98afa9ea5e9a842eb358834fe0cbd251d335573b 894514049a3c6210a7cd65676344f44371b3717a",
+      "exit_code": 0,
+      "seconds": 0.03,
+      "passed": true
+    },
+    {
+      "name": "divergence",
+      "command": "git rev-list --left-right --count 98afa9ea5e9a842eb358834fe0cbd251d335573b...894514049a3c6210a7cd65676344f44371b3717a",
+      "exit_code": 0,
+      "seconds": 0.03,
+      "passed": true
+    },
+    {
+      "name": "development-log",
+      "command": "git log --no-merges \"--format=%h %ad %an %s\" --date=short 0ffe730ce12443e4fc2638113372bb1f18b05b96..98afa9ea5e9a842eb358834fe0cbd251d335573b",
+      "exit_code": 0,
+      "seconds": 0.03,
+      "passed": true
+    },
+    {
+      "name": "development-stat",
+      "command": "git diff --stat 0ffe730ce12443e4fc2638113372bb1f18b05b96 98afa9ea5e9a842eb358834fe0cbd251d335573b",
+      "exit_code": 0,
+      "seconds": 0.05,
+      "passed": true
+    },
+    {
+      "name": "inherited-tree-equality",
+      "command": "git diff 0ffe730ce12443e4fc2638113372bb1f18b05b96 8f4bc542ce5bab8fdc55ce35836160484dffdd1f",
+      "exit_code": 0,
+      "seconds": 0.02,
+      "passed": true
+    },
+    {
+      "name": "upstream-helper-equality",
+      "command": "git diff 46a41024827414c04571dbcd029e72faef1f0423:edit_builder.py 40151e1708100327f647bdd190adcf4808838a60:edit_builder.py",
+      "exit_code": 0,
+      "seconds": 0.03,
+      "passed": true
+    },
+    {
+      "name": "candidate-export",
+      "passed": true,
+      "scope": "Git index snapshot over public clone; no application source committed or pushed"
+    },
+    {
+      "name": "create-lightweight-venv",
+      "command": "py -3.11 -m venv .venv-security",
+      "exit_code": 0,
+      "seconds": 5.25,
+      "passed": true
+    },
+    {
+      "name": "upgrade-pip",
+      "command": "<temporary-clone>\\.venv-security\\Scripts\\python.exe -m pip install --upgrade pip",
+      "exit_code": 0,
+      "seconds": 3.81,
+      "passed": true
+    },
+    {
+      "name": "install-security-requirements",
+      "command": "<temporary-clone>\\.venv-security\\Scripts\\python.exe -m pip install -r requirements-security.txt",
+      "exit_code": 0,
+      "seconds": 32.26,
+      "passed": true
+    },
+    {
+      "name": "candidate-pytest",
+      "command": "<temporary-clone>\\.venv-security\\Scripts\\python.exe -X utf8 -m pytest tests/ -q -rs",
+      "exit_code": 0,
+      "seconds": 7.94,
+      "passed": true
+    },
+    {
+      "name": "candidate-security-tests",
+      "command": "<temporary-clone>\\.venv-security\\Scripts\\python.exe -X utf8 -m pytest tests/test_security.py -q -rs",
+      "exit_code": 0,
+      "seconds": 2.45,
+      "passed": true
+    },
+    {
+      "name": "candidate-fork-probes",
+      "command": "<temporary-clone>\\.venv-security\\Scripts\\python.exe -B -X utf8 tools/compare_fork_security.py",
+      "exit_code": 0,
+      "seconds": 0.55,
+      "passed": true
+    },
+    {
+      "name": "npm-ci",
+      "command": "npm.cmd --prefix dashboard ci",
+      "exit_code": 0,
+      "seconds": 7.31,
+      "passed": true
+    },
+    {
+      "name": "frontend-lint",
+      "command": "npm.cmd --prefix dashboard run lint",
+      "exit_code": 0,
+      "seconds": 2.31,
+      "passed": true
+    },
+    {
+      "name": "frontend-build",
+      "command": "npm.cmd --prefix dashboard run build",
+      "exit_code": 0,
+      "seconds": 2.42,
+      "passed": true
+    },
+    {
+      "name": "node-vite-versions",
+      "command": "node -p JSON.stringify({node:process.version,vite:require('./dashboard/node_modules/vite/package.json').version,engines:require('./dashboard/node_modules/vite/package.json').engines})",
+      "exit_code": 0,
+      "seconds": 0.06,
+      "passed": true
+    },
+    {
+      "name": "powershell-syntax",
+      "command": "powershell -NoProfile -NonInteractive -File <temporary-clone>\\parse-doc-instructions.ps1",
+      "exit_code": 0,
+      "seconds": 0.41,
+      "passed": true
+    }
+  ],
+  "not_executed": [
+    "full video/ML runtime installation",
+    "GPU/provider jobs",
+    "Docker build/runtime",
+    "macOS/Linux execution",
+    "remote CI/external review gates"
+  ]
+}

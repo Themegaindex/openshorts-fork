@@ -1,11 +1,10 @@
 import React, { useState, useEffect, useMemo, useRef, lazy, Suspense } from 'react';
-import { Upload, FileVideo, Sparkles, Youtube, Instagram, Share2, LogOut, ChevronDown, Check, Activity, LayoutDashboard, Settings, PlusCircle, History, Menu, X, Terminal, Shield, LayoutGrid, Image, Globe, RotateCcw, Copy, AlertTriangle, Type, Download, Loader2 } from 'lucide-react';
+import { Sparkles, Youtube, Instagram, ChevronDown, Check, Activity, LayoutDashboard, Settings, PlusCircle, X, Terminal, Shield, LayoutGrid, Image, Globe, RotateCcw, Copy, AlertTriangle, Type, Download, Loader2 } from 'lucide-react';
 import KeyInput from './components/KeyInput';
 import MediaInput from './components/MediaInput';
 import ResultCard from './components/ResultCard';
 import SubtitleModal from './components/SubtitleModal';
 import ProcessingAnimation from './components/ProcessingAnimation';
-// import Gallery from './components/Gallery';
 import { getApiUrl } from './config';
 import { readApiError } from './apiError';
 
@@ -222,14 +221,6 @@ const Sidebar = ({ activeTab, setActiveTab }) => (
         <span className="font-medium hidden lg:block">YouTube Studio</span>
       </button>
 
-      {/* <button
-        onClick={() => setActiveTab('gallery')}
-        className={`w-full flex items-center gap-3 px-3 py-3 rounded-xl transition-colors ${activeTab === 'gallery' ? 'bg-primary/10 text-primary' : 'text-zinc-400 hover:text-white hover:bg-white/5'}`}
-      >
-        <LayoutGrid size={20} />
-        <span className="font-medium hidden lg:block">Gallery</span>
-      </button> */}
-
       <button
         onClick={() => setActiveTab('settings')}
         className={`w-full flex items-center gap-3 px-3 py-3 rounded-xl transition-colors ${activeTab === 'settings' ? 'bg-primary/10 text-primary' : 'text-zinc-400 hover:text-white hover:bg-white/5'}`}
@@ -314,6 +305,12 @@ function App() {
   const processRequestRef = useRef({ generation: 0, requestId: null });
   const [processingMedia, setProcessingMedia] = useState(null);
   const [activeTab, setActiveTab] = useState('dashboard'); // dashboard, settings
+  // AI Shorts and YouTube Studio stay mounted (hidden) once opened. Unmounting
+  // them on a tab switch threw away a running, paid generation and its result.
+  const [openedTabs, setOpenedTabs] = useState(() => new Set());
+  useEffect(() => {
+    setOpenedTabs((prev) => (prev.has(activeTab) ? prev : new Set(prev).add(activeTab)));
+  }, [activeTab]);
 
   const [sessionRecovered, setSessionRecovered] = useState(false);
 
@@ -419,11 +416,14 @@ function App() {
       return;
     }
     try {
+      // Without the logs and the result copy: recovery re-fetches the status
+      // anyway, and up to 4000 log lines (three times) were rewritten every 2 s.
+      const { raw_logs: _rawLogs, important_logs: _importantLogs, logs: _logs, result: _result, ...slimMeta } = jobMeta || {};
       const sessionData = {
         jobId,
         status,
         results,
-        jobMeta,
+        jobMeta: jobMeta ? slimMeta : null,
         processingMedia: processingMedia?.type === 'url' ? processingMedia : null,
         activeTab,
         timestamp: Date.now()
@@ -463,9 +463,11 @@ function App() {
   }, [falKey]);
 
   useEffect(() => {
-    if (uploadPostKey && userProfiles.length === 0) {
-      fetchUserProfiles({ silent: true });
-    }
+    if (!uploadPostKey || userProfiles.length > 0) return undefined;
+    // Wait until typing stops. A request per keystroke sent every partial key
+    // through the backend to Upload-Post.
+    const timer = setTimeout(() => fetchUserProfiles({ silent: true }), 800);
+    return () => clearTimeout(timer);
     // Intentionally only re-fetch when the key changes; adding
     // fetchUserProfiles/userProfiles.length would re-trigger every render.
     // eslint-disable-next-line react-hooks/exhaustive-deps
@@ -531,7 +533,7 @@ function App() {
           terminal = true;
         } else if (data.status === 'failed') {
           setStatus('error');
-          const errorMsg = data.error || (data.logs && data.logs.length > 0 ? data.logs[data.logs.length - 1] : "Process failed");
+          const errorMsg = data.error_summary || (data.logs && data.logs.length > 0 ? data.logs[data.logs.length - 1] : "Process failed");
           setLogs(prev => [...prev, "Error: " + errorMsg]);
           terminal = true;
         } else if (data.status === 'stalled') {
@@ -582,11 +584,12 @@ function App() {
     };
   }, [status, jobId]);
 
-  // Completed sessions do not poll continuously, but they do refresh once on
-  // recovery so persisted edit/subtitle/hook/translation versions win over a
-  // stale localStorage snapshot.
+  // Completed and failed sessions do not poll continuously, but they do
+  // refresh once on recovery so persisted edit/subtitle/hook/translation
+  // versions win over a stale localStorage snapshot. The saved session holds
+  // no logs, so a failed job also needs this to show its log again.
   useEffect(() => {
-    if (status !== 'complete' || !jobId) return undefined;
+    if ((status !== 'complete' && status !== 'error') || !jobId) return undefined;
     const controller = new AbortController();
     pollJob(jobId, controller.signal)
       .then((data) => {
@@ -616,8 +619,10 @@ function App() {
       const data = await res.json();
       if (data.profiles && data.profiles.length > 0) {
         setUserProfiles(data.profiles);
-        // Auto select first if none selected
-        if (!uploadUserId) {
+        // Auto select the first profile if none is selected, or if the stored
+        // one belongs to a previous key. The selector would show the first
+        // profile while posts still went to the stale name.
+        if (!data.profiles.some((profile) => profile.username === uploadUserId)) {
           setUploadUserId(data.profiles[0].username);
         }
       } else if (!silent) {
@@ -684,7 +689,7 @@ function App() {
         body,
       });
 
-      if (!res.ok) throw new Error(await res.text());
+      if (!res.ok) throw new Error(await readApiError(res));
       const resData = await res.json();
 
       if (isStale() || resData.status === 'cancelled') {
@@ -840,10 +845,7 @@ function App() {
           'X-Gemini-Key': apiKey,
         },
       });
-      if (!res.ok) {
-        const text = await res.text();
-        throw new Error(text || 'Resume failed');
-      }
+      if (!res.ok) throw new Error(await readApiError(res));
       setStatus('queued');
       setConnectionIssue(null);
       setLogs((prev) => [...prev, 'Job resumed.']);
@@ -866,6 +868,8 @@ function App() {
   }));
 
   const renderedLogs = displayLogs.length > 0 ? displayLogs : fallbackLogs;
+  // handleBulkSubtitles skips long edits, so the button must not count them.
+  const bulkShortCount = (results?.clips || []).filter((clip) => clip?.video_type !== 'long').length;
   const progressPercent = Number(jobMeta?.progress_percent || 0);
   const phaseLabel = jobMeta?.phase_label || (status === 'queued' ? 'Queued' : status === 'processing' ? 'Processing' : 'Idle');
   const isTerminalJob = status === 'complete' || status === 'error' || status === 'archived';
@@ -1170,11 +1174,13 @@ function App() {
             </div>
           )}
 
-          {/* View: SaaS Shorts */}
-          {activeTab === 'saasshorts' && (
-            <Suspense fallback={<TabFallback />}>
-              <SaaShortsTab geminiApiKey={apiKey} elevenLabsKey={elevenLabsKey} falKey={falKey} uploadPostKey={uploadPostKey} uploadUserId={uploadUserId} />
-            </Suspense>
+          {/* View: SaaS Shorts (stays mounted once opened, see openedTabs) */}
+          {(activeTab === 'saasshorts' || openedTabs.has('saasshorts')) && (
+            <div className={activeTab === 'saasshorts' ? 'h-full' : 'hidden'}>
+              <Suspense fallback={<TabFallback />}>
+                <SaaShortsTab geminiApiKey={apiKey} elevenLabsKey={elevenLabsKey} falKey={falKey} uploadPostKey={uploadPostKey} uploadUserId={uploadUserId} isActive={activeTab === 'saasshorts'} />
+              </Suspense>
+            </div>
           )}
 
           {/* View: UGC Gallery */}
@@ -1184,17 +1190,14 @@ function App() {
             </Suspense>
           )}
 
-          {/* View: Thumbnails */}
-          {activeTab === 'thumbnails' && (
-            <Suspense fallback={<TabFallback />}>
-              <ThumbnailStudio geminiApiKey={apiKey} uploadPostKey={uploadPostKey} uploadUserId={uploadUserId} />
-            </Suspense>
+          {/* View: Thumbnails (stays mounted once opened, see openedTabs) */}
+          {(activeTab === 'thumbnails' || openedTabs.has('thumbnails')) && (
+            <div className={activeTab === 'thumbnails' ? 'h-full' : 'hidden'}>
+              <Suspense fallback={<TabFallback />}>
+                <ThumbnailStudio geminiApiKey={apiKey} uploadPostKey={uploadPostKey} uploadUserId={uploadUserId} onOpenSettings={() => setActiveTab('settings')} />
+              </Suspense>
+            </div>
           )}
-
-          {/* View: Gallery */}
-          {/* {activeTab === 'gallery' && (
-            <Gallery />
-          )} */}
 
           {/* View: Dashboard (Idle) */}
           {activeTab === 'dashboard' && status === 'idle' && (
@@ -1532,18 +1535,21 @@ function App() {
         </div>
       </main>
 
-      {/* Bulk Subtitles Modal: one style, applied to every clip */}
-      <SubtitleModal
-        isOpen={showBulkSubtitles}
-        onClose={() => { setShowBulkSubtitles(false); setBulkSubResult(null); }}
-        onGenerate={handleBulkSubtitles}
-        isProcessing={bulkSubProgress.running}
-        videoUrl={results?.clips?.[0]?.video_url ? getApiUrl(results.clips[0].video_url) : undefined}
-        bulkCount={results?.clips?.length || 0}
-        bulkProgress={bulkSubProgress}
-        bulkResult={bulkSubResult}
-        onCancelBulk={() => { bulkCancelRef.current = true; }}
-      />
+      {/* Bulk Subtitles Modal: one style, applied to every short. Mounted only
+          while open so it starts from the last remembered style. */}
+      {showBulkSubtitles && (
+        <SubtitleModal
+          isOpen
+          onClose={() => { setShowBulkSubtitles(false); setBulkSubResult(null); }}
+          onGenerate={handleBulkSubtitles}
+          isProcessing={bulkSubProgress.running}
+          videoUrl={results?.clips?.[0]?.video_url ? getApiUrl(results.clips[0].video_url) : undefined}
+          bulkCount={bulkShortCount}
+          bulkProgress={bulkSubProgress}
+          bulkResult={bulkSubResult}
+          onCancelBulk={() => { bulkCancelRef.current = true; }}
+        />
+      )}
 
       {/* Low Quality Confirmation Modal (quality gate) */}
       {lowQualityPrompt && (

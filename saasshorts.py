@@ -13,6 +13,7 @@ Pipeline:
 """
 
 import os
+from security import public_text, download_public_media
 import re
 import json
 import time
@@ -20,7 +21,7 @@ import hashlib
 import subprocess
 import httpx
 from urllib.parse import urljoin
-from typing import Optional, List, Dict, Callable
+from typing import List, Dict, Callable
 from concurrent.futures import ThreadPoolExecutor, as_completed
 
 import video_encoding
@@ -164,11 +165,7 @@ def scrape_website(url: str) -> dict:
         "User-Agent": "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36"
     }
 
-    with httpx.Client(timeout=30.0, follow_redirects=True) as client:
-        response = client.get(url, headers=headers)
-        response.raise_for_status()
-
-    soup = BeautifulSoup(response.text, "html.parser")
+    soup = BeautifulSoup(public_text(url, timeout=30, headers=headers), "html.parser")
 
     # Remove non-content elements
     for tag in soup(["script", "style", "nav", "footer", "header", "noscript", "svg", "iframe"]):
@@ -218,14 +215,11 @@ def scrape_website(url: str) -> dict:
     for sub_url in list(subpages)[:3]:
         try:
             print(f"[SaaSShorts]   → Subpage: {sub_url}")
-            with httpx.Client(timeout=20.0, follow_redirects=True) as client:
-                resp = client.get(sub_url, headers=headers)
-                if resp.status_code == 200:
-                    sub_soup = BeautifulSoup(resp.text, "html.parser")
-                    for tag in sub_soup(["script", "style", "nav", "footer", "header", "noscript"]):
-                        tag.decompose()
-                    sub_text = sub_soup.get_text(separator="\n", strip=True)[:5000]
-                    additional += f"\n\n--- {sub_url} ---\n{sub_text}"
+            sub_soup = BeautifulSoup(public_text(sub_url, timeout=20, headers=headers), "html.parser")
+            for tag in sub_soup(["script", "style", "nav", "footer", "header", "noscript"]):
+                tag.decompose()
+            sub_text = sub_soup.get_text(separator="\n", strip=True)[:5000]
+            additional += f"\n\n--- {sub_url} ---\n{sub_text}"
         except Exception as e:
             print(f"[SaaSShorts]   ⚠️ Failed: {e}")
 
@@ -591,6 +585,10 @@ def _fal_run(model_id: str, input_data: dict, fal_key: str, timeout: int = 600) 
     # Use the URLs from the submit response (guaranteed correct per docs)
     status_url = submit_data.get("status_url", f"{FAL_QUEUE_BASE}/{model_id}/requests/{request_id}/status")
     response_url = submit_data.get("response_url", f"{FAL_QUEUE_BASE}/{model_id}/requests/{request_id}")
+    for provider_url in (status_url, response_url):
+        parsed = httpx.URL(provider_url)
+        if parsed.scheme != "https" or parsed.host != "queue.fal.run" or parsed.port not in (None, 443) or parsed.userinfo:
+            raise ValueError("Unexpected fal.ai queue URL; refusing to forward credentials")
 
     print(f"[fal.ai] Queued: {request_id}")
     print(f"[fal.ai] Status URL: {status_url}")
@@ -604,8 +602,17 @@ def _fal_run(model_id: str, input_data: dict, fal_key: str, timeout: int = 600) 
         try:
             with httpx.Client(timeout=30.0) as client:
                 poll_resp = client.get(f"{status_url}?logs=1", headers=poll_headers)
-            status_data = poll_resp.json()
         except Exception as e:
+            print(f"[fal.ai] Poll error (retrying): {e}")
+            time.sleep(5)
+            continue
+        # A client error (bad key, unknown request) never heals. Before this
+        # check it read as status UNKNOWN and was polled until the timeout.
+        if 400 <= poll_resp.status_code < 500 and poll_resp.status_code != 429:
+            raise Exception(f"fal.ai status check failed ({poll_resp.status_code}): {poll_resp.text[:300]}")
+        try:
+            status_data = poll_resp.json()
+        except ValueError as e:
             print(f"[fal.ai] Poll error (retrying): {e}")
             time.sleep(5)
             continue
@@ -616,7 +623,11 @@ def _fal_run(model_id: str, input_data: dict, fal_key: str, timeout: int = 600) 
             print(f"[fal.ai] ✅ Completed in {elapsed}s! Fetching result...")
             with httpx.Client(timeout=120.0) as client:
                 result_resp = client.get(response_url, headers=poll_headers)
-                return result_resp.json()
+            # A failed job answers here with an error body. Returned as a
+            # result, it surfaced later as a bare KeyError ("Error: 'video'").
+            if result_resp.status_code >= 400:
+                raise Exception(f"fal.ai job failed ({result_resp.status_code}): {result_resp.text[:300]}")
+            return result_resp.json()
 
         elif status in ("FAILED", "CANCELLED"):
             error = status_data.get("error", "unknown error")
@@ -684,23 +695,7 @@ def _download_media(url: str, output_path: str, kind: str = "media", timeout: fl
     Guards against an HTTP error page (HTML/JSON body) being written to disk as a
     "media file", which would otherwise cause a misleading FFmpeg crash later.
     """
-    with httpx.Client(timeout=timeout, follow_redirects=True) as client:
-        resp = client.get(url)
-
-    if resp.status_code != 200:
-        raise Exception(f"Failed to download {kind} ({resp.status_code}) from {url[:200]}")
-
-    content_type = resp.headers.get("content-type", "").lower()
-    if kind == "image" and not content_type.startswith("image/"):
-        raise Exception(f"Expected image but got content-type '{content_type}' from {url[:200]}")
-    if kind == "video" and not (content_type.startswith("video/") or "octet-stream" in content_type):
-        raise Exception(f"Expected video but got content-type '{content_type}' from {url[:200]}")
-    if len(resp.content) < 1024:
-        raise Exception(f"Downloaded {kind} too small ({len(resp.content)} bytes) from {url[:200]}")
-
-    with open(output_path, "wb") as f:
-        f.write(resp.content)
-    return output_path
+    return download_public_media(url, output_path, kind=kind, timeout=timeout)
 
 
 def generate_actor_images(
@@ -708,6 +703,8 @@ def generate_actor_images(
     product_description: str = None,
 ) -> List[str]:
     """Generate multiple hyper-realistic actor portrait options using Flux 2 Pro."""
+    if not isinstance(num_options, int) or isinstance(num_options, bool) or not 1 <= num_options <= 6:
+        raise ValueError("Actor option count must be between 1 and 6")
     print(f"[SaaSShorts] 🎨 Generating {num_options} actor image options (Flux 2 Pro)...")
 
     # Clean description: strip scene/actions, keep only physical appearance
@@ -958,7 +955,7 @@ def generate_broll(
     prompt: str, fal_key: str, output_path: str, duration: str = "5"
 ) -> str:
     """
-    Generate b-roll: Recraft V4 image + Ken Burns zoom effect via FFmpeg.
+    Generate b-roll: Flux 2 Pro image + Ken Burns zoom effect via FFmpeg.
     """
     print(f"[SaaSShorts] 🎬 Generating b-roll image + Ken Burns effect...")
 
@@ -990,7 +987,9 @@ def generate_broll(
     total_frames = dur_secs * fps
     # Zoom from 1.0x to 1.15x over duration (subtle, cinematic)
     zoompan_filter = (
-        f"scale=2160:3840,"
+        # The image is 3:4. Fill 9:16 and crop the sides; a plain scale
+        # squeezed it by 25 %.
+        f"scale=2160:3840:force_original_aspect_ratio=increase,crop=2160:3840,"
         f"zoompan=z='1+0.15*on/{total_frames}':"
         f"x='iw/2-(iw/zoom/2)+10*on/{total_frames}':"
         f"y='ih/2-(ih/zoom/2)':"
@@ -1014,7 +1013,7 @@ def generate_broll(
 
     video_encoding.run_encode(
         _build, tier=video_encoding.STANDARD, label="SaaS b-roll",
-        output_path=output_path, capture_output=True,
+        output_path=output_path, capture_output=True, timeout=1800,
     )
 
     # Cleanup temp image
@@ -1038,7 +1037,7 @@ def _get_media_duration(path: str) -> float:
         path,
     ]
     try:
-        result = subprocess.run(cmd, capture_output=True, text=True)
+        result = subprocess.run(cmd, capture_output=True, text=True, timeout=30)
         output = result.stdout.strip()
         if output:
             return float(output)
@@ -1138,33 +1137,6 @@ Format: Layer, Start, End, Style, Name, MarginL, MarginR, MarginV, Effect, Text
     return output_path
 
 
-def generate_srt_from_script(segments: list, output_path: str) -> str:
-    """Fallback: generate basic SRT from script segments (used if no audio available)."""
-    srt_content = ""
-    index = 1
-    for seg in segments:
-        text = seg.get("subtitle_text") or seg.get("narration", "")
-        if not text:
-            continue
-        words = text.split()
-        chunk_size = 3
-        start_time = seg["start"]
-        end_time = seg["end"]
-        duration = end_time - start_time
-        chunks = [words[i : i + chunk_size] for i in range(0, len(words), chunk_size)]
-        chunk_dur = duration / max(len(chunks), 1)
-        for i, chunk in enumerate(chunks):
-            cs = start_time + i * chunk_dur
-            ce = min(start_time + (i + 1) * chunk_dur, end_time)
-            h, m, s, ms = int(cs//3600), int((cs%3600)//60), int(cs%60), int((cs-int(cs))*1000)
-            h2, m2, s2, ms2 = int(ce//3600), int((ce%3600)//60), int(ce%60), int((ce-int(ce))*1000)
-            srt_content += f"{index}\n{h:02d}:{m:02d}:{s:02d},{ms:03d} --> {h2:02d}:{m2:02d}:{s2:02d},{ms2:03d}\n{' '.join(chunk).upper()}\n\n"
-            index += 1
-    with open(output_path, "w", encoding="utf-8") as f:
-        f.write(srt_content)
-    return output_path
-
-
 def composite_video(
     talking_head_path: str,
     broll_clips: List[Dict],
@@ -1205,7 +1177,7 @@ def composite_video(
             ]
 
         video_encoding.run_encode(
-            _build_simple, tier=video_encoding.STANDARD, label="SaaS final", output_path=output_path,
+            _build_simple, tier=video_encoding.STANDARD, label="SaaS final", output_path=output_path, timeout=1800,
         )
         print(f"[SaaSShorts] ✅ Final video (simple): {output_path}")
         return output_path
@@ -1299,7 +1271,7 @@ def composite_video(
         ]
 
     video_encoding.run_encode(
-        _build_composite, tier=video_encoding.STANDARD, label="SaaS final", output_path=output_path,
+        _build_composite, tier=video_encoding.STANDARD, label="SaaS final", output_path=output_path, timeout=1800,
     )
     print(f"[SaaSShorts] ✅ Final video (composite): {output_path}")
     return output_path
@@ -1342,7 +1314,8 @@ def generate_full_video(
     # Include a short stable hash of the FULL title so similar/empty titles that
     # truncate to the same 30-char slug don't collide and return foreign cached assets.
     raw_title = (script.get("title") or "").strip()
-    title_hash = hashlib.sha1(raw_title.encode("utf-8")).hexdigest()[:8]
+    # Stable filename disambiguation, never an authentication/integrity digest.
+    title_hash = hashlib.sha1(raw_title.encode("utf-8"), usedforsecurity=False).hexdigest()[:8]
     base_slug = re.sub(r"[^a-z0-9]+", "_", raw_title.lower()).strip("_")[:30] or "video"
     title_slug = f"{base_slug}_{title_hash}"
 

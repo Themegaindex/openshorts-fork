@@ -1,0 +1,4 @@
+$ git diff --cached --check
+exit_code=2
+stdout_json="docs/security-evidence/baseline-frontend-lint.txt:4: new blank line at EOF.\ndocs/security-evidence/baseline-security-tests.txt:42: trailing whitespace.\n+E     \ndocs/security-evidence/baseline-security-tests.txt:49: trailing whitespace.\n+E     \ndocs/security-evidence/final-frontend-lint.txt:4: new blank line at EOF.\n"
+stderr_json=""

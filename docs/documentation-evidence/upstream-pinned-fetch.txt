@@ -1,0 +1,4 @@
+$ git fetch --no-tags --no-write-fetch-head --no-recurse-submodules upstream 894514049a3c6210a7cd65676344f44371b3717a:refs/audit/security-20261105-upstream
+exit_code=0
+From https://github.com/mutonby/openshorts
+ * [new ref]         894514049a3c6210a7cd65676344f44371b3717a -> refs/audit/security-20261105-upstream

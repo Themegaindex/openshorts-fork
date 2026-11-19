@@ -1,0 +1,85 @@
+FFFFFFFFFFFFF                                                            [100%]
+================================== FAILURES ===================================
+_________________ test_publish_rejects_thumbnail_path_escape __________________
+tests\test_security.py:42: in test_publish_rejects_thumbnail_path_escape
+    with pytest.raises(HTTPException) as exc:
+E   Failed: DID NOT RAISE HTTPException
+__________________ test_thumbnail_rejects_traversal_session ___________________
+tests\test_security.py:50: in test_thumbnail_rejects_traversal_session
+    with pytest.raises(HTTPException) as exc:
+E   Failed: DID NOT RAISE HTTPException
+_______________________ test_status_rejects_path_job_id _______________________
+tests\test_security.py:60: in test_status_rejects_path_job_id
+    with pytest.raises(HTTPException) as exc:
+E   Failed: DID NOT RAISE HTTPException
+__________________ test_scraper_rejects_redirect_to_loopback __________________
+tests\test_security.py:79: in test_scraper_rejects_redirect_to_loopback
+    with pytest.raises(ValueError):
+E   Failed: DID NOT RAISE ValueError
+---------------------------- Captured stdout call -----------------------------
+[SaaSShorts] 🌐 Scraping https://public.example...
+[SaaSShorts] ✅ Scraped 1 pages, 17 chars
+______________ test_process_rejects_non_youtube_url_before_probe ______________
+tests\test_security.py:93: in test_process_rejects_non_youtube_url_before_probe
+    with pytest.raises(HTTPException) as exc:
+E   Failed: DID NOT RAISE HTTPException
+______________________ test_actor_options_are_bounded[0] ______________________
+tests\test_security.py:101: in test_actor_options_are_bounded
+    with pytest.raises(ValidationError):
+E   Failed: DID NOT RAISE ValidationError
+_____________________ test_actor_options_are_bounded[-1] ______________________
+tests\test_security.py:101: in test_actor_options_are_bounded
+    with pytest.raises(ValidationError):
+E   Failed: DID NOT RAISE ValidationError
+____________________ test_actor_options_are_bounded[1000] _____________________
+tests\test_security.py:101: in test_actor_options_are_bounded
+    with pytest.raises(ValidationError):
+E   Failed: DID NOT RAISE ValidationError
+_________________ test_video_page_encodes_untrusted_metadata __________________
+tests\test_security.py:114: in test_video_page_encodes_untrusted_metadata
+    assert payload not in html
+E   assert '</p><img sr...t_marker=1">' not in '<!DOCTYPE h...body></html>'
+E     
+E     '</p><img src=x one....__audit_marker=1">' is contained here:
+E       content=" </p><img src=x onerror="window.__audit_marker=1">">
+E       <meta property="og:type" content="video.other">
+E       <meta property="og:title" content="synthetic">
+E       <meta property="og:description" content="">
+E       <meta property="og:video" content="">...
+E     
+E     ...Full output truncated, use '-vv' to show
+________________________ test_api_rejects_remote_peer _________________________
+tests\test_security.py:132: in test_api_rejects_remote_peer
+    assert response.status_code == 403
+E   assert 200 == 403
+E    +  where 200 = <Response [200 OK]>.status_code
+___________________ test_api_rejects_foreign_browser_origin ___________________
+tests\test_security.py:139: in test_api_rejects_foreign_browser_origin
+    assert response.status_code == 403
+E   assert 200 == 403
+E    +  where 200 = <Response [200 OK]>.status_code
+_____________________ test_private_metadata_is_not_served _____________________
+tests\test_security.py:152: in test_private_metadata_is_not_served
+    assert response.status_code == 404
+E   assert 200 == 404
+E    +  where 200 = <Response [200 OK]>.status_code
+________________ test_thumbnail_analyze_enforces_upload_limit _________________
+tests\test_security.py:160: in test_thumbnail_analyze_enforces_upload_limit
+    with pytest.raises(HTTPException) as exc:
+E   Failed: DID NOT RAISE HTTPException
+=========================== short test summary info ===========================
+FAILED tests/test_security.py::test_publish_rejects_thumbnail_path_escape - F...
+FAILED tests/test_security.py::test_thumbnail_rejects_traversal_session - Fai...
+FAILED tests/test_security.py::test_status_rejects_path_job_id - Failed: DID ...
+FAILED tests/test_security.py::test_scraper_rejects_redirect_to_loopback - Fa...
+FAILED tests/test_security.py::test_process_rejects_non_youtube_url_before_probe
+FAILED tests/test_security.py::test_actor_options_are_bounded[0] - Failed: DI...
+FAILED tests/test_security.py::test_actor_options_are_bounded[-1] - Failed: D...
+FAILED tests/test_security.py::test_actor_options_are_bounded[1000] - Failed:...
+FAILED tests/test_security.py::test_video_page_encodes_untrusted_metadata - a...
+FAILED tests/test_security.py::test_api_rejects_remote_peer - assert 200 == 403
+FAILED tests/test_security.py::test_api_rejects_foreign_browser_origin - asse...
+FAILED tests/test_security.py::test_private_metadata_is_not_served - assert 2...
+FAILED tests/test_security.py::test_thumbnail_analyze_enforces_upload_limit
+13 failed, 53 deselected in 1.49s
+Audited baseline 98afa9ea5e9a842eb358834fe0cbd251d335573b: {'tests': 13, 'failures': 13, 'errors': 0, 'skipped': 0}

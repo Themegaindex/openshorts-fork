@@ -1,6 +1,5 @@
 import time
 import cv2
-import scenedetect
 import subprocess
 import argparse
 import glob
@@ -24,7 +23,6 @@ try:
 except ImportError:
     VideoManager = None
 from ultralytics import YOLO
-import torch
 import numpy as np
 from tqdm import tqdm
 # OpenShorts does not require third-party yt-dlp plugins. Disable globally
@@ -36,19 +34,16 @@ import yt_dlp
 import mediapipe as mp
 from mediapipe.tasks import python as mp_python
 from mediapipe.tasks.python import vision as mp_vision
-# import whisper (replaced by faster_whisper inside function)
-from google import genai
-from google.genai import types as genai_types
 from dotenv import load_dotenv
 import json
 import shutil
-from typing import List, Optional
+from typing import Optional
 import frame_sampler
 import longform
 import video_encoding
 import whisper_runtime
 from youtube_download import (
-    YouTubeDownloadError, open_youtube_dl, youtube_auth_attempts,
+    YouTubeDownloadError, max_download_bytes, open_youtube_dl, youtube_auth_attempts,
     youtube_base_options, youtube_failure_message,
 )
 
@@ -884,8 +879,30 @@ def _prevent_windows_sleep():
         print(f"⚠️ Could not disable standby: {e}")
 
 def _save_json_file(path, payload):
-    with open(path, 'w', encoding='utf-8') as f:
-        json.dump(payload, f, indent=2, ensure_ascii=False)
+    # Write a sibling file and swap it in. Writing in place left truncated JSON
+    # when the worker was killed mid-write (stall kill, cancel), and that broke
+    # every later resume of the job.
+    # The temp name must not grow with the target: ext4 allows 255 bytes per
+    # name, and a 100-character Cyrillic title already uses ~200 of them.
+    tmp_path = os.path.join(os.path.dirname(path), f".{os.urandom(8).hex()}.tmp")
+    try:
+        with open(tmp_path, 'x', encoding='utf-8') as f:
+            json.dump(payload, f, indent=2, ensure_ascii=False)
+        for attempt in range(5):
+            try:
+                os.replace(tmp_path, path)
+                return
+            except PermissionError:
+                # Windows refuses the swap while another process reads the
+                # file; the API polls the metadata every 2 s, and a read is short.
+                if attempt == 4:
+                    raise
+                time.sleep(0.2)
+    finally:
+        try:
+            os.remove(tmp_path)
+        except FileNotFoundError:
+            pass
 
 
 def _load_json_file(path, default=None):
@@ -928,13 +945,6 @@ def _save_json_checkpoint(output_dir, video_title, suffix, payload):
     path = os.path.join(output_dir, f"{video_title}_{suffix}.json")
     _save_json_file(path, payload)
     JOB_REPORTER.artifact(suffix, path)
-    return path
-
-
-def _save_text_checkpoint(output_dir, video_title, suffix, text):
-    path = os.path.join(output_dir, f"{video_title}_{suffix}.txt")
-    _save_text_file(path, text)
-    JOB_REPORTER.artifact(suffix, path, important=False)
     return path
 
 
@@ -1202,109 +1212,6 @@ def _run_gemini_worker(
     return worker_result
 
 
-def _strip_code_fences(text):
-    text = (text or "").strip()
-    if text.startswith("```"):
-        lines = text.splitlines()
-        if lines:
-            lines = lines[1:]
-        if lines and lines[-1].strip() == "```":
-            lines = lines[:-1]
-        text = "\n".join(lines).strip()
-    return text
-
-
-def _extract_json_candidate(text):
-    cleaned = _strip_code_fences(text)
-    start = cleaned.find("{")
-    end = cleaned.rfind("}")
-    if start != -1 and end != -1 and end > start:
-        return cleaned[start:end + 1]
-    return cleaned
-
-
-def _escape_invalid_unicode_escapes(text):
-    chars = []
-    i = 0
-    while i < len(text):
-        if text[i] == "\\" and i + 1 < len(text) and text[i + 1] == "u":
-            hex_digits = text[i + 2:i + 6]
-            if len(hex_digits) < 4 or any(ch not in "0123456789abcdefABCDEF" for ch in hex_digits):
-                chars.append("\\\\u")
-                i += 2
-                continue
-        chars.append(text[i])
-        i += 1
-    return "".join(chars)
-
-
-def _parse_json_response_text(text):
-    if not text:
-        raise ValueError("Gemini returned an empty response body.")
-
-    candidate = _extract_json_candidate(text).replace("\x00", "").strip()
-    if not candidate:
-        raise ValueError("Gemini response did not contain a JSON object.")
-
-    parse_attempts = [candidate]
-    sanitized_candidate = _escape_invalid_unicode_escapes(candidate)
-    if sanitized_candidate != candidate:
-        parse_attempts.append(sanitized_candidate)
-
-    last_error = None
-    for parse_candidate in parse_attempts:
-        try:
-            return json.loads(parse_candidate)
-        except json.JSONDecodeError as e:
-            last_error = e
-
-    raise ValueError(f"Failed to parse Gemini JSON response: {last_error}")
-
-
-def _get_response_text(response):
-    try:
-        text = response.text
-        if text:
-            return text
-    except Exception:
-        pass
-
-    parts = []
-    for candidate in getattr(response, "candidates", []) or []:
-        content = getattr(candidate, "content", None)
-        for part in getattr(content, "parts", []) or []:
-            part_text = getattr(part, "text", None)
-            if part_text:
-                parts.append(part_text)
-
-    return "\n".join(parts).strip()
-
-
-def _calculate_cost_analysis(response, model_name):
-    usage = getattr(response, "usage_metadata", None)
-    if not usage:
-        return None
-
-    input_price_per_million = 0.10
-    output_price_per_million = 0.40
-
-    prompt_tokens = usage.prompt_token_count
-    output_tokens = usage.candidates_token_count
-
-    input_cost = (prompt_tokens / 1_000_000) * input_price_per_million
-    output_cost = (output_tokens / 1_000_000) * output_price_per_million
-    total_cost = input_cost + output_cost
-
-    return {
-        "input_tokens": prompt_tokens,
-        "output_tokens": output_tokens,
-        "input_cost": input_cost,
-        "output_cost": output_cost,
-        "total_cost": total_cost,
-        "model": model_name,
-    }
-
-
 def _selection_limits(video_duration):
     """Keep normal jobs unchanged; inspect a wider pool only for 2h+ sources."""
     return selection_limits(
@@ -1434,10 +1341,25 @@ _FACE_MODEL_PATH = os.path.join(os.path.dirname(os.path.abspath(__file__)), 'bla
 if not os.path.exists(_FACE_MODEL_PATH):
     print("📥 Downloading MediaPipe face detection model...")
     import urllib.request
-    urllib.request.urlretrieve(
-        'https://storage.googleapis.com/mediapipe-models/face_detector/blaze_face_short_range/float16/latest/blaze_face_short_range.tflite',
-        _FACE_MODEL_PATH
-    )
+    # Temp file + rename, with a timeout: an interrupted download (or two
+    # workers starting at once) used to leave a truncated model behind, and
+    # every later import of this module failed on it.
+    _face_model_tmp = f"{_FACE_MODEL_PATH}.{os.getpid()}.tmp"
+    try:
+        with urllib.request.urlopen(
+            'https://storage.googleapis.com/mediapipe-models/face_detector/blaze_face_short_range/float16/latest/blaze_face_short_range.tflite',
+            timeout=60,
+        ) as _response, open(_face_model_tmp, 'wb') as _model_file:
+            shutil.copyfileobj(_response, _model_file)
+        try:
+            os.replace(_face_model_tmp, _FACE_MODEL_PATH)
+        except PermissionError:
+            # Windows: a parallel worker already placed and opened the model.
+            if not os.path.exists(_FACE_MODEL_PATH):
+                raise
+    finally:
+        if os.path.exists(_face_model_tmp):
+            os.remove(_face_model_tmp)
     print("✅ Model downloaded.")
 
 _face_detector_options = mp_vision.FaceDetectorOptions(
@@ -2068,6 +1990,24 @@ def _is_youtube_refusal(error):
     )
 
 
+_DOWNLOADED_VIDEO_SUFFIXES = (".mp4", ".mkv", ".webm", ".mov", ".m4v")
+
+
+def _find_downloaded_video(output_dir, sanitized_title):
+    """Return the merged or single-file download result, or None.
+
+    Per-format files (Title.f137.mp4, Title.f140.m4a) and fragments do not
+    count: yt-dlp leaves them behind when it skips one format of a pair.
+    """
+    expected = os.path.join(output_dir, f"{sanitized_title}.mp4")
+    if os.path.exists(expected):
+        return expected
+    for name in sorted(os.listdir(output_dir)):
+        if name.startswith(sanitized_title) and name[len(sanitized_title):].lower() in _DOWNLOADED_VIDEO_SUFFIXES:
+            return os.path.join(output_dir, name)
+    return None
+
+
 def download_youtube_video(url, output_dir=".", resume=False):
     """
     Downloads a YouTube video using yt-dlp.
@@ -2076,6 +2016,8 @@ def download_youtube_video(url, output_dir=".", resume=False):
     With resume=True already finished format files and .part fragments are kept
     so a re-download after an interrupted job continues instead of starting over.
     """
+    from security import validate_youtube_url
+    validate_youtube_url(url)
     print(f"🔍 Debug: yt-dlp version: {yt_dlp.version.__version__}")
     print("📥 Downloading video from YouTube...")
     step_start_time = time.time()
@@ -2209,7 +2151,6 @@ def download_youtube_video(url, output_dir=".", resume=False):
             ):
                 with open_youtube_dl(ydl_opts, yt_dlp.YoutubeDL) as ydl:
                     ydl.download([url])
-            break
         except Exception as e:
             is_last_attempt = index == len(download_attempts) - 1
             if is_last_attempt or not _is_youtube_refusal(e):
@@ -2225,16 +2166,30 @@ def download_youtube_video(url, output_dir=".", resume=False):
             )
             print(f"⚠️ YouTube refused the {attempt_label} download — falling back to {next_label}.")
             time.sleep(YTDLP_REFUSAL_BACKOFF_SECONDS)
+            continue
 
+        downloaded_file = _find_downloaded_video(output_dir, sanitized_title)
+        if downloaded_file:
+            break
+        # yt-dlp skips a format above max_filesize without raising and leaves
+        # only the other per-format file (often the audio track). Using that
+        # as the source would run the whole job on an audio file.
+        limit_gb = max_download_bytes() / 1024 ** 3
+        if index == len(download_attempts) - 1:
+            raise YouTubeDownloadError(
+                f"The download finished without a complete video file. The most likely cause "
+                f"is the {limit_gb:g} GB download limit: yt-dlp skips larger files without an "
+                "error. Use a shorter video, a lower-resolution source, or raise "
+                "OPENSHORTS_MAX_DOWNLOAD_GB."
+            )
+        next_label = download_attempts[index + 1][2]
+        JOB_REPORTER.warning(
+            f"The {attempt_label} download ended without a complete video file "
+            f"(most likely above the {limit_gb:g} GB limit). Retrying with {next_label}.",
+            category="download",
+        )
+        print(f"⚠️ {attempt_label} download incomplete — falling back to {next_label}.")
 
-    downloaded_file = os.path.join(output_dir, f'{sanitized_title}.mp4')
-    
-    if not os.path.exists(downloaded_file):
-        for f in os.listdir(output_dir):
-            if f.startswith(sanitized_title) and not f.endswith(('.part', '.ytdl', '.json', '.description')):
-                downloaded_file = os.path.join(output_dir, f)
-                break
-    
     step_end_time = time.time()
     JOB_REPORTER.progress(100.0, message="Download complete.", important=True, category="download")
     print(f"✅ Video downloaded in {step_end_time - step_start_time:.2f}s: {downloaded_file}")
@@ -3859,7 +3814,10 @@ def get_longform_plan(
     if not draft.get("viable"):
         return {
             "plan_data": draft,
-            "error": "Gemini found fewer than four strong minutes for a polished long video.",
+            "error": (
+                f"Gemini found fewer than {target_min / 60:g} strong minutes "
+                "for a polished long video."
+            ),
             "attempts": attempts,
             "cost_analysis": _merge_cost_analyses(all_costs),
             "analysis_coverage": _longform_analysis_coverage(
@@ -5510,7 +5468,8 @@ if __name__ == '__main__':
     input_group.add_argument('-i', '--input', type=str, help="Path to the input video file.")
     input_group.add_argument('-u', '--url', type=str, help="YouTube URL to download and process.")
     parser.add_argument('-o', '--output', type=str, help="Output directory or file (if processing whole video).")
-    parser.add_argument('--keep-original', action='store_true', help="Keep the downloaded YouTube video.")
+    parser.add_argument('--keep-original', action='store_true',
+                        help="No effect, kept for old scripts: the downloaded source is always kept for resume.")
     parser.add_argument('--skip-analysis', action='store_true', help="Skip AI analysis and convert the whole video (takes precedence over --video-type).")
     parser.add_argument('--resume-dir', type=str, help="Resume a previous job from its output directory.")
     parser.add_argument('--resume-phase', choices=['transcribe', 'analyze', 'render'], help="Force resume from a specific phase.")
@@ -5772,9 +5731,10 @@ if __name__ == '__main__':
                     )
 
         reporter.set_phase("finalize", "Finalizing output", message="Wrapping up artifacts...")
-        if args.url and not args.keep_original:
+        if args.url:
+            # Expected behaviour, not a problem: as a warning it flagged every
+            # successful URL job in the UI.
             print(f"🗂️  Keeping downloaded source for resume/retention: {input_video}")
-            reporter.warning("Downloaded source video kept for resume support and delayed cleanup.")
 
         total_time = time.time() - script_start_time
         print(f"\n⏱️  Total execution time: {total_time:.2f}s")

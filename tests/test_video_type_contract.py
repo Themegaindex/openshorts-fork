@@ -188,7 +188,7 @@ def test_process_endpoint_forwards_only_nonlegacy_video_type(
     monkeypatch.setattr(app, "jobs", {})
     monkeypatch.setattr(app, "job_queue", queue)
     request = _json_request({
-        "url": "https://example.com/video",
+        "url": "https://www.youtube.com/watch?v=abcdefghijk",
         "output_format": "vertical",
         "layout_style": "smart",
         "video_type": video_type,
@@ -249,8 +249,8 @@ def test_translate_can_resolve_and_commit_a_long_video(monkeypatch, tmp_path):
     assert saved["long_videos"][0]["video_url"].startswith(f"/videos/{job_id}/translated_de_")
 
 
-def test_subtitle_can_remap_and_remove_a_long_video_layer(monkeypatch, tmp_path):
-    job_id = "subtitle-long"
+def _install_long_subtitle_job(monkeypatch, tmp_path, job_id):
+    """One finished long video with a two-word transcript, ready for subtitles."""
     output_dir = tmp_path / job_id
     output_dir.mkdir()
     (output_dir / "long.mp4").write_bytes(b"video")
@@ -287,6 +287,16 @@ def test_subtitle_can_remap_and_remove_a_long_video_layer(monkeypatch, tmp_path)
             "important_logs": [],
         },
     })
+    return metadata_path
+
+
+def _fake_render(_output_dir, _entry, output_path):
+    Path(output_path).write_bytes(b"subtitled video")
+
+
+def test_subtitle_can_remap_and_remove_a_long_video_layer(monkeypatch, tmp_path):
+    job_id = "subtitle-long"
+    metadata_path = _install_long_subtitle_job(monkeypatch, tmp_path, job_id)
     captured = {}
 
     def fake_generate_srt(transcript, start, end, output_path):
@@ -295,11 +305,8 @@ def test_subtitle_can_remap_and_remove_a_long_video_layer(monkeypatch, tmp_path)
         Path(output_path).write_text("subtitle", encoding="utf-8")
         return True
 
-    def fake_render(_output_dir, _entry, output_path):
-        Path(output_path).write_bytes(b"subtitled video")
-
     monkeypatch.setattr(app, "generate_srt", fake_generate_srt)
-    monkeypatch.setattr(app, "_render_stored_layers", fake_render)
+    monkeypatch.setattr(app, "_render_stored_layers", _fake_render)
 
     response = asyncio.run(app._add_subtitles_locked(
         app.SubtitleRequest(job_id=job_id, clip_index=0),
@@ -324,6 +331,39 @@ def test_subtitle_can_remap_and_remove_a_long_video_layer(monkeypatch, tmp_path)
     assert saved["long_videos"][0]["video_url"] == f"/videos/{job_id}/long.mp4"
 
 
+@pytest.mark.parametrize("preset", ["neon_tube", "neon_sweep"])
+def test_only_neon_tube_is_sized_to_the_clean_source_frame(monkeypatch, tmp_path, preset):
+    """Without the probed size, Neon Tube smears its contour on 16:9 frames."""
+    job_id = f"subtitle-frame-{preset}"
+    _install_long_subtitle_job(monkeypatch, tmp_path, job_id)
+    probed, captured = [], {}
+
+    def fake_probe(path):
+        probed.append(Path(path).name)
+        return (3840, 2160)
+
+    def fake_generate_ass(_transcript, _start, _end, output_path, **opts):
+        captured.update(opts)
+        Path(output_path).write_text("subtitle", encoding="utf-8")
+        return True
+
+    monkeypatch.setattr(app, "probe_frame_size", fake_probe)
+    monkeypatch.setattr(app, "generate_ass", fake_generate_ass)
+    monkeypatch.setattr(app, "_render_stored_layers", _fake_render)
+
+    response = asyncio.run(app._add_subtitles_locked(
+        app.SubtitleRequest(job_id=job_id, clip_index=0, preset=preset),
+    ))
+
+    assert response["success"] is True
+    assert captured["preset"] == preset
+    if preset == "neon_tube":
+        assert probed == ["long.mp4"]  # the clean source the ASS is burned into
+        assert captured["frame_size"] == (3840, 2160)
+    else:
+        assert probed == [] and "frame_size" not in captured
+
+
 def test_long_result_card_offers_subtitles_instead_of_dubbing():
     result_card = (
         Path(__file__).parents[1] / "dashboard" / "src" / "components" / "ResultCard.jsx"
@@ -339,7 +379,7 @@ def _process_with_request_id(monkeypatch, tmp_path, queue, request_id):
     monkeypatch.setattr(app, "QUALITY_GATE_MIN_HEIGHT", 0)
     monkeypatch.setattr(app, "job_queue", queue)
     request = _json_request(
-        {"url": "https://example.com/video", "output_format": "vertical",
+        {"url": "https://www.youtube.com/watch?v=abcdefghijk", "output_format": "vertical",
          "layout_style": "smart", "video_type": "shorts"},
         extra_headers=[(b"x-process-request-id", request_id.encode())],
     )

@@ -12,12 +12,6 @@ import whisper_runtime
 
 _STDIO_CONFIGURED = False
 
-# CPU default model; the GPU default is whisper_runtime.DEFAULT_GPU_MODEL.
-# "small" is meaningfully better at German than "base" without being much
-# slower on CPU.
-DEFAULT_WHISPER_MODEL = whisper_runtime.DEFAULT_CPU_MODEL
-
-
 def get_whisper_config():
     """Resolved faster-whisper config shared by every transcription path.
 
@@ -472,8 +466,30 @@ _NEON_SWEEP_WHITE_GLOW_INDICES = (0, 1, 2, 3)
 # shows a marginally cooler corona around a fully saturated core.
 _RAINBOW_GLOW_SATURATIONS = (1.00, 0.98, 0.98, 1.00)
 
+# Neon Tube: pale hot core, thin colour rim, crisp dark contour, colour glow
+# outside that contour. Neon Sweep puts same-colour glow directly on the
+# letter edge, which flattens the edge contrast (measured luma step at the
+# edge: white 103 -> 40, cyan 57 -> 13). The dark contour here keeps that
+# step above 250 for white words while the active words still glow.
+# Bottom layer first. "spoken" = the cumulative active prefix, "idle" = the
+# remaining white words. Blur radii are tuned for a 1920 px high frame and
+# get rescaled, because libass applies \blur in output pixels (measured: the
+# same 17 px edge at 1080x1920 and 2160x3840). \bord already scales.
+_NEON_TUBE_LAYERS = (
+    # words, border, blur, fill, outline, fill alpha, outline alpha
+    ("all", "1.6", 4.0, "000000", "000000", "40", "40"),      # soft dark field
+    ("spoken", "1.2", 8.0, "colour", "colour", "30", "30"),   # neon glow
+    ("all", "0.85", 0.6, "000000", "000000", "00", "20"),     # crisp dark contour
+    ("spoken", "0.4", 0.4, "tint", "colour", "00", "00"),     # pale core, colour rim
+    ("idle", "0", 0.0, "FFFFFF", "FFFFFF", "00", "FF"),       # plain white words
+)
+_NEON_TUBE_BLUR_REFERENCE_HEIGHT = 1920
+# Share of white mixed into the core, so the letter reads as a lit tube.
+_NEON_TUBE_CORE_WHITE = 0.5
+
 # Horizontal glyph scaling per signature preset (ASS \fscx, in percent).
 _NEON_SWEEP_SCALE_X = 104
+_NEON_TUBE_SCALE_X = 104
 _RAINBOW_SCALE_X = 88
 
 # Signature script canvas. 162 x 288 is exactly 9:16 and scales cleanly to
@@ -526,12 +542,14 @@ def _write_ass_file(output_path, header, events):
     return True
 
 
-def _signature_ass_header(font_name, fontsize, alignment):
+def _signature_ass_header(font_name, fontsize, alignment,
+                          play_res_x=SIGNATURE_PLAY_RES_X):
     """ASS canvas/style shared by the CapCut-grade signature presets.
 
     PlayResX is explicit because libass otherwise chooses a landscape-oriented
     fallback on some installations. A 162x288 script canvas is exactly 9:16
     and scales cleanly to 1080x1920 as well as other vertical resolutions.
+    Neon Tube widens it to the frame aspect (see _signature_play_res_x).
     """
     align_map = {'top': 8, 'middle': 5, 'bottom': 2}
     ass_alignment = align_map.get(str(alignment).lower(), 2)
@@ -545,7 +563,7 @@ def _signature_ass_header(font_name, fontsize, alignment):
     return (
         "[Script Info]\n"
         "ScriptType: v4.00+\n"
-        f"PlayResX: {SIGNATURE_PLAY_RES_X}\n"
+        f"PlayResX: {play_res_x}\n"
         f"PlayResY: {SIGNATURE_PLAY_RES_Y}\n"
         "WrapStyle: 0\n"
         "ScaledBorderAndShadow: yes\n"
@@ -587,22 +605,8 @@ def _word_display_segments(word, max_segment_chars):
     return [text[index:index + segment_size] for index in range(0, len(text), segment_size)]
 
 
-def _group_display_width(words, max_line_chars):
-    """Maximum rendered line length after long-word visual wrapping."""
-    line_width = 0
-    maximum = 0
-    for word_index, word in enumerate(words):
-        segments = _word_display_segments(word, max_line_chars)
-        line_width += (1 if word_index and line_width else 0) + len(segments[0])
-        maximum = max(maximum, line_width)
-        for segment in segments[1:]:
-            line_width = len(segment)
-            maximum = max(maximum, line_width)
-    return maximum
-
-
 def _wrap_line_indices(words, limit, max_line_chars):
-    """Greedy line assignment; mirrors _group_display_width's accounting."""
+    """Greedy line assignment after long-word visual wrapping."""
     indices = []
     line = 0
     width = 0
@@ -678,11 +682,12 @@ def _join_ass_words(block, line_indices, max_line_chars,
     return "".join(rendered)
 
 
-def _neon_visible_prefix(color, fill_alpha="00", outline_alpha="00"):
+def _neon_visible_prefix(color, fill_alpha="00", outline_alpha="00", outline_color=None):
     ass_color = _hex_to_ass_inline_color(color)
+    ass_outline = _hex_to_ass_inline_color(outline_color) if outline_color else ass_color
     return (
         f"{{\\alpha&H00&\\1a&H{fill_alpha}&\\3a&H{outline_alpha}&"
-        f"\\c{ass_color}\\3c{ass_color}}}"
+        f"\\c{ass_color}\\3c{ass_outline}}}"
     )
 
 
@@ -759,6 +764,128 @@ def _generate_neon_sweep_ass(blocks, output_path, alignment, fontsize, font_name
                     f"Dialogue: {color_layer},{start},{end},Signature,,0,0,0,,"
                     f"{{\\fscx{_NEON_SWEEP_SCALE_X}\\bord{border}\\blur{blur}}}"
                     f"{colored_text}"
+                )
+
+    return _write_ass_file(output_path, header, events)
+
+
+def probe_frame_size(video_path):
+    """Displayed (width, height) of the first video stream, or None.
+
+    FFmpeg auto-rotates before the ass filter runs, so a 90/270 degree display
+    matrix swaps the stored size.
+    """
+    try:
+        output = subprocess.run(
+            ["ffprobe", "-v", "error", "-select_streams", "v:0",
+             "-show_entries", "stream=width,height", "-of", "csv=s=x:p=0",
+             video_path],
+            capture_output=True, text=True, timeout=30, check=True,
+        ).stdout
+        width, height = (int(value) for value in output.strip().splitlines()[0].split("x")[:2])
+    except Exception:
+        return None
+    if width <= 0 or height <= 0:
+        return None
+    if video_encoding.source_rotation(video_path) in (90, 270):
+        width, height = height, width
+    return width, height
+
+
+def _valid_frame_size(frame_size):
+    try:
+        width, height = (int(value) for value in frame_size)
+    except (TypeError, ValueError):
+        return None
+    return (width, height) if width > 0 and height > 0 else None
+
+
+def _signature_play_res_x(frame_size):
+    """Script width that matches the frame aspect at PlayResY 288.
+
+    On a 16:9 frame the 162 px vertical canvas scales \\bord 23.7x sideways but
+    only 7.5x vertically, which smears a dark contour into a horizontal
+    smudge. Matching the aspect (512 for 16:9) keeps outlines round. Never go
+    below 162: the line budget is computed on that width.
+    """
+    size = _valid_frame_size(frame_size)
+    if not size:
+        return SIGNATURE_PLAY_RES_X
+    width, height = size
+    return max(SIGNATURE_PLAY_RES_X, round(SIGNATURE_PLAY_RES_Y * width / height))
+
+
+def _scaled_blur(blur, frame_size):
+    size = _valid_frame_size(frame_size)
+    height = size[1] if size else _NEON_TUBE_BLUR_REFERENCE_HEIGHT
+    value = blur * height / _NEON_TUBE_BLUR_REFERENCE_HEIGHT
+    return f"{value:.2f}".rstrip("0").rstrip(".") or "0"
+
+
+def _mix_with_white(hex_color, amount):
+    return "".join(
+        f"{round(channel + (255 - channel) * amount):02X}"
+        for channel in (int(hex_color[index:index + 2], 16) for index in (0, 2, 4))
+    )
+
+
+def _generate_neon_tube_ass(blocks, output_path, alignment, fontsize, font_name,
+                            frame_size=None):
+    """Neon Sweep's cumulative line reveal, drawn as crisp neon tubes."""
+    header = _signature_ass_header(
+        font_name, fontsize, alignment, play_res_x=_signature_play_res_x(frame_size),
+    )
+    # Same wrapping as Neon Sweep on every frame shape: the budget stays on
+    # the 162 px vertical canvas even when the script canvas is wider.
+    line_budget = _signature_line_budget(
+        _signature_final_fontsize(fontsize), _NEON_TUBE_SCALE_X,
+    )
+    layers = [
+        (words, border, _scaled_blur(blur, frame_size), fill, outline, fill_alpha, outline_alpha)
+        for words, border, blur, fill, outline, fill_alpha, outline_alpha in _NEON_TUBE_LAYERS
+    ]
+    events = []
+
+    for block_index, block in enumerate(blocks):
+        if not block:
+            continue
+        boundaries = _quantized_block_boundaries(block)
+        line_indices = _balanced_line_indices(block, line_budget)
+        colour = _NEON_SWEEP_PALETTE[block_index % len(_NEON_SWEEP_PALETTE)]
+        tint = _mix_with_white(colour, _NEON_TUBE_CORE_WHITE)
+        for active_index, _word in enumerate(block):
+            start_cs = boundaries[active_index]
+            end_cs = boundaries[active_index + 1]
+            if end_cs <= start_cs:
+                continue
+
+            active_line = line_indices[active_index]
+            spoken_mask = [
+                line_indices[index] == active_line and index <= active_index
+                for index in range(len(block))
+            ]
+            start = _format_ass_centiseconds(start_cs)
+            end = _format_ass_centiseconds(end_cs)
+
+            for layer, (words, border, blur, fill, outline, fill_alpha, outline_alpha) in enumerate(layers):
+                visible = _neon_visible_prefix(
+                    {"colour": colour, "tint": tint}.get(fill, fill),
+                    fill_alpha, outline_alpha,
+                    outline_color=colour if outline == "colour" else outline,
+                )
+                prefixes = [
+                    visible
+                    if words == "all" or (words == "spoken") == is_spoken
+                    else "{\\alpha&HFF&}"
+                    for is_spoken in spoken_mask
+                ]
+                text = _join_ass_words(
+                    block, line_indices, line_budget,
+                    word_prefixes=prefixes, uppercase=True,
+                )
+                events.append(
+                    f"Dialogue: {layer},{start},{end},Signature,,0,0,0,,"
+                    f"{{\\fscx{_NEON_TUBE_SCALE_X}\\bord{border}\\blur{blur}}}{text}"
                 )
 
     return _write_ass_file(output_path, header, events)
@@ -879,7 +1006,7 @@ def generate_ass(transcript, clip_start, clip_end, output_path,
                  border_color="#000000", border_width=2,
                  highlight_color="#FFD700", bg_color="#000000", bg_opacity=0.0,
                  effect="none", base_opacity=1.0, uppercase=False,
-                 preset="custom"):
+                 preset="custom", frame_size=None):
     """
     Generates a karaoke-style ASS file: each block is shown like the SRT path,
     but the currently spoken word is rendered in highlight_color (modern
@@ -891,9 +1018,18 @@ def generate_ass(transcript, clip_start, clip_end, output_path,
             "bounce" (subtle spring: overshoot past target, settle back).
     base_opacity: opacity of the non-active words — dimmed base text is the
     modern captioneer look (e.g. 0.4).
+    frame_size: (width, height) of the video the file gets burned into. Only
+    Neon Tube uses it, to keep its contour round and its glow the same size
+    on every resolution; without it the preset assumes 1080x1920.
     """
     preset = str(preset or "custom").lower()
-    if preset == "neon_sweep":
+    if preset == "neon_tube":
+        # Same wrapping as Neon Sweep (identical font scaling and budget).
+        max_chars = 2 * _signature_line_budget(
+            _signature_final_fontsize(fontsize), _NEON_TUBE_SCALE_X,
+        )
+        max_duration = max(max_duration, 2.6)
+    elif preset == "neon_sweep":
         # Keep a block down to roughly two budgeted lines. How much actually
         # fits depends on the font size the user picked, so deriving it is the
         # point: the previous fixed 34 characters produced 20-character lines
@@ -916,6 +1052,10 @@ def generate_ass(transcript, clip_start, clip_end, output_path,
     if not blocks:
         return False
 
+    if preset == "neon_tube":
+        return _generate_neon_tube_ass(
+            blocks, output_path, alignment, fontsize, font_name, frame_size=frame_size,
+        )
     if preset == "neon_sweep":
         return _generate_neon_sweep_ass(
             blocks, output_path, alignment, fontsize, font_name
@@ -1186,16 +1326,19 @@ def build_layer_command(video_path, output_path, subtitle_filter=None,
     elif hook_png:
         cmd.extend(['-i', hook_png])
 
-    # Compose subtitle colours in 4:4:4 so saturated cyan/green/red edges are
-    # not subsampled before libass has finished drawing them. The deliverable
-    # remains broadly compatible yuv420p; accurate chroma downsampling happens
-    # only once, after every presentation layer has been composed.
+    # libass draws straight into the source's 4:2:0 frame. A yuv444p round
+    # trip used to run here. On a 4K60 Neon Sweep burn it changed caption-
+    # region VMAF by nothing and chroma PSNR by about 1 dB at 54-55 dB, which
+    # is invisible even at 3x zoom, but its two full-frame lanczos
+    # conversions became the bottleneck once the encoder got fast (cheaper
+    # scaler flags were slower than dropping it and lost more chroma). The
+    # accurate flags stay for sources that still need a conversion (10-bit,
+    # 4:2:2, full range).
     if subtitle_filter:
         cmd.extend([
             '-sws_flags',
             'lanczos+accurate_rnd+full_chroma_int+full_chroma_inp',
         ])
-    subtitle_prefix = "format=yuv444p," if subtitle_filter else ""
     subtitle_suffix = ",format=yuv420p" if subtitle_filter else ""
 
     hook_src = "[1:v]"
@@ -1216,7 +1359,7 @@ def build_layer_command(video_path, output_path, subtitle_filter=None,
     if subtitle_filter and hook_png:
         cmd.extend([
             '-filter_complex',
-            f"{hook_pre}[0:v]{subtitle_prefix}{subtitle_filter}[v0];"
+            f"{hook_pre}[0:v]{subtitle_filter}[v0];"
             f"[v0]{hook_src}overlay={int(hook_x)}:{y_value}{overlay_opts}[v1];"
             f"[v1]{EVEN_PAD_FILTER}{subtitle_suffix}[vout]",
             '-map', '[vout]', '-map', '0:a?',
@@ -1231,7 +1374,7 @@ def build_layer_command(video_path, output_path, subtitle_filter=None,
     else:
         cmd.extend([
             '-vf',
-            f"{subtitle_prefix}{subtitle_filter},{EVEN_PAD_FILTER}{subtitle_suffix}",
+            f"{subtitle_filter},{EVEN_PAD_FILTER}{subtitle_suffix}",
         ])
 
     # The approved neon reference was rendered at CRF 18 / slow. Burned text
@@ -1251,6 +1394,31 @@ def build_layer_command(video_path, output_path, subtitle_filter=None,
     return cmd
 
 
+# A fixed 30 min limit failed 4K60 videos longer than ~25 min. The libx264
+# fallback needs ~5.5 s per second of 4K60, so allow 10x the duration.
+LAYER_BURN_MIN_TIMEOUT_SECONDS = 1800
+LAYER_BURN_TIMEOUT_PER_SECOND = 10
+
+
+def _media_duration_seconds(video_path):
+    """Container duration in seconds, or 0.0 when ffprobe cannot tell."""
+    try:
+        output = subprocess.run(
+            ["ffprobe", "-v", "error", "-show_entries", "format=duration",
+             "-of", "default=noprint_wrappers=1:nokey=1", video_path],
+            capture_output=True, text=True, timeout=30, check=True,
+        ).stdout
+        duration = float(output.strip().splitlines()[0])
+    except Exception:
+        return 0.0
+    return duration if 0 < duration < float("inf") else 0.0
+
+
+def _layer_burn_timeout(video_path):
+    return max(LAYER_BURN_MIN_TIMEOUT_SECONDS,
+               math.ceil(_media_duration_seconds(video_path) * LAYER_BURN_TIMEOUT_PER_SECOND))
+
+
 def burn_layers(video_path, output_path, subtitle_path=None, burn_opts=None,
                 hook_png=None, hook_x=0, hook_y=0, hook_entrance=False):
     """Render subtitles and/or a hook overlay onto video_path in one pass."""
@@ -1267,6 +1435,7 @@ def burn_layers(video_path, output_path, subtitle_path=None, burn_opts=None,
         _log(f"🎬 Burning layers (single pass): {' '.join(cmd)}")
         return cmd
 
+    timeout = _layer_burn_timeout(video_path)
     try:
         result = video_encoding.run_encode(
             _build,
@@ -1276,25 +1445,20 @@ def burn_layers(video_path, output_path, subtitle_path=None, burn_opts=None,
             warn=_log,
             stdout=subprocess.DEVNULL,
             stderr=subprocess.PIPE,
+            timeout=timeout,
         )
+    except subprocess.TimeoutExpired as exc:
+        # run_encode never retries a timeout. FFmpeg was killed mid-write, so
+        # the output is a broken MP4 that must not be served.
+        try:
+            os.remove(output_path)
+        except OSError:
+            pass
+        _log(f"❌ FFmpeg Layer Burn: timed out after {timeout} s")
+        raise Exception(f"FFmpeg layer burn timed out after {timeout} s") from exc
     except subprocess.CalledProcessError as exc:
         stderr_text = (exc.stderr or b"").decode(errors='replace')
         _log(f"❌ FFmpeg Layer Error: {stderr_text}")
         raise Exception(f"FFmpeg failed: {stderr_text}")
 
     return True
-
-
-def burn_subtitles(video_path, srt_path, output_path, alignment=2, fontsize=16,
-                   font_name="Verdana", font_color="#FFFFFF",
-                   border_color="#000000", border_width=2,
-                   bg_color="#000000", bg_opacity=0.0):
-    """Burns subtitles into the video using FFmpeg (single subtitle layer)."""
-    return burn_layers(
-        video_path, output_path,
-        subtitle_path=srt_path,
-        burn_opts=dict(alignment=alignment, fontsize=fontsize, font_name=font_name,
-                       font_color=font_color, border_color=border_color,
-                       border_width=border_width, bg_color=bg_color,
-                       bg_opacity=bg_opacity),
-    )

@@ -1,0 +1,13 @@
+{
+  "documents": [
+    "README.md",
+    "README.en.md",
+    "README.de.md",
+    "docs/FORK_CONTRIBUTIONS.md",
+    "docs/SECURITY_TESTING.md",
+    "docs/DOCUMENTATION_REVIEW.md",
+    "docs/documentation-evidence/README.md"
+  ],
+  "relative_links_checked": 100,
+  "failures": []
+}

@@ -1,0 +1,2 @@
+$ git diff --cached --check -- . :(exclude)docs/security-evidence/** :(exclude)docs/fork-evidence/**
+exit_code=0

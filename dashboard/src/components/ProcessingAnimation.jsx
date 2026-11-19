@@ -1,5 +1,5 @@
 import React, { useEffect, useState, useRef } from 'react';
-import { Scan, Scissors, Activity, Radio, CheckCircle, Play } from 'lucide-react';
+import { Scan, Scissors, Activity, Radio, CheckCircle } from 'lucide-react';
 
 const ProcessingAnimation = ({ media, isComplete, syncedTime, isSyncedPlaying, syncTrigger }) => {
   const [videoSrc, setVideoSrc] = useState(null);
@@ -27,79 +27,19 @@ const ProcessingAnimation = ({ media, isComplete, syncedTime, isSyncedPlaying, s
       if (isSyncedPlaying) {
         // Sync Mode: Seek to time and Play
         videoRef.current.currentTime = syncedTime;
-        videoRef.current.play().catch(e => console.log("Auto-play prevented", e));
+        videoRef.current.play().catch(() => {}); // autoplay may be blocked
         videoRef.current.loop = false;
         videoRef.current.muted = true; // Keep muted to avoid double audio with clip
       } else {
         // Stop Sync: Pause
         videoRef.current.pause();
 
-        // If Analysis Complete and we just stopped syncing (paused clip), we might want to return to ambient loop?
-        // User issue: "ahora el video loop original que sale oscurito ahora bien pero es una imagen estatica no se está reproduciendo el video en bucle como antes"
-        // This means when NOT synced, it should loop.
-        
-        // HOWEVER, previously user asked: "si pauso el video preview y lo reanudo el video original se vuelve al princpio en vez de contnuar igual"
-        // This implies: 
-        // 1. If I PAUSE the clip -> Left video should PAUSE (static image) so it can resume.
-        // 2. If I STOP (or it finishes? or just idle state?) -> It should LOOP.
-        
-        // The problem is we only have onPause from the clip.
-        // Maybe we need to distinguish "Pause" vs "Idle/Stop".
-        // But currently we just get `isSyncedPlaying = false`.
-        
-        // If the user wants "resume from where left off", it MUST be static (paused).
-        // If the user wants "loop when not playing", it MUST play.
-        // These are contradictory for the "Paused" state.
-        
-        // BUT, maybe the "loop original" refers to the initial state BEFORE any clip is played?
-        // OR when the clip finishes?
-        
-        // Let's look at the logic:
-        // isSyncedPlaying is true ONLY when a clip is playing.
-        // When clip pauses, isSyncedPlaying becomes false.
-        
-        // If we want it to loop "como antes", we should set it to loop.
-        // But then we lose the "resume" position because it starts looping.
-        // Unless... we only loop if we haven't started syncing yet? Or if explicitly reset?
-        
-        // Wait, the user said: "ahora el video loop original que sale oscurito ahora bien pero es una imagen estatica"
-        // This likely refers to the state AFTER analysis is complete but BEFORE (or after) playing a clip.
-        // If I haven't touched a clip yet, `isSyncedPlaying` is false.
-        // In that case, it SHOULD be looping.
-        
-        // My previous change removed the "else { play loop }" block entirely.
-        // I need to restore the loop for the IDLE state, but keep the PAUSE for the "paused clip" state?
-        // That requires knowing WHY `isSyncedPlaying` is false.
-        
-        // Actually, if `isSyncedPlaying` is false, it means no clip is controlling it.
-        // If I want it to loop in the background, I can just let it loop.
-        // BUT if I play a clip later, it will jump to the sync time anyway (handled by the `if (isSyncedPlaying)` block).
-        // The only issue is if I PAUSE the clip, `isSyncedPlaying` becomes false, and if I immediately start looping,
-        // visually it might jump or start moving when it should be "paused".
-        
-        // Let's try this:
-        // If `syncedTime` is 0 (or we track if we ever started syncing?), we loop.
-        // But `syncedTime` updates on play.
-        
-        // Alternative interpretation: The user sees it static because I removed `videoRef.current.play()` in the else block.
-        // If I put it back, it fixes the "loop" issue.
-        // Does it break the "resume" issue?
-        // "si pauso el video preview y lo reanudo el video original se vuelve al princpio en vez de contnuar igual"
-        // If I pause the clip -> `isSyncedPlaying` = false.
-        // If logic says -> Loop from 0.
-        // Then I resume -> `isSyncedPlaying` = true -> Jump to `syncedTime`.
-        // This actually SHOULD work fine for "resume", because `syncedTime` comes from the clip's current time.
-        // The only visual glitch is that while paused, the left video is looping instead of frozen on the frame.
-        
-        // If the user accepts that "Paused Clip" = "Background Loop", then we are good.
-        // If the user wants "Paused Clip" = "Frozen Frame" AND "Idle" = "Background Loop", we need more state.
-        // But typically "Idle" implies we aren't focusing on a clip.
-        
-        // Let's restore the loop behavior because "video loop original... es una imagen estatica" sounds like a bug to them.
-        
+        // No clip controls the preview any more. After analysis it loops in
+        // the background again; a later clip play seeks to its own time, so
+        // "resume" still works.
         if (isComplete) {
              videoRef.current.loop = true;
-             videoRef.current.play().catch(e => console.log("Ambient play prevented", e));
+             videoRef.current.play().catch(() => {}); // autoplay may be blocked
         }
       }
     }
@@ -124,7 +64,7 @@ const ProcessingAnimation = ({ media, isComplete, syncedTime, isSyncedPlaying, s
 
 
   const getYouTubeId = (url) => {
-    const regExp = /^.*(youtu.be\/|v\/|u\/\w\/|embed\/|watch\?v=|&v=)([^#&?]*).*/;
+    const regExp = /^.*(youtu.be\/|v\/|u\/\w\/|embed\/|shorts\/|live\/|watch\?v=|&v=)([^#&?/]*).*/;
     const match = url.match(regExp);
     return (match && match[2].length === 11) ? match[2] : null;
   };
@@ -196,7 +136,7 @@ const ProcessingAnimation = ({ media, isComplete, syncedTime, isSyncedPlaying, s
       
       {!isSyncedPlaying && !isComplete && (
           <div className="absolute top-4 right-4 z-30 flex items-center gap-2 px-3 py-1.5 bg-black/60 backdrop-blur-md rounded-lg border border-white/10 text-white/50 text-[10px] font-mono">
-            AI_MODEL: GEMINI-2.5-PRO
+            AI_MODEL: GEMINI
           </div>
       )}
       

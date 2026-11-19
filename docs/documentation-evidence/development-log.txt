@@ -1,0 +1,81 @@
+$ git log --no-merges "--format=%h %ad %an %s" --date=short 0ffe730ce12443e4fc2638113372bb1f18b05b96..98afa9ea5e9a842eb358834fe0cbd251d335573b
+exit_code=0
+48892c9 2026-11-02 Themegaindex ci: use current toolchain paths and never fail on housekeeping
+294027a 2026-11-02 Themegaindex ci: free runner disk space before the Docker builds
+1cbe96f 2026-11-02 Themegaindex fix: close the third review of the GPU and Full-HD pipeline
+8102acb 2026-11-02 Themegaindex test: keep the cv2 stub intact under pytest 9.2 monkeypatch
+8b4817f 2026-11-02 Themegaindex fix: close the second review of the GPU and Full-HD fixes
+ec1ee50 2026-11-02 Themegaindex docs: changelog for GPU speedups and Full-HD shorts
+9965072 2026-11-02 Themegaindex fix(gemini): switch Gemini 3.8 Flash to the regular price after the promo
+25a1d0a 2026-11-02 Themegaindex fix(download): keep the browser-cookie advice when a bot check follows
+d6e3872 2026-11-02 Themegaindex fix(render): deliver rotated phone clips upright and ignore infinite widths
+888c20a 2026-11-02 Themegaindex fix(transcribe): repair partial model downloads and keep GPU stats honest
+1414ba2 2026-11-02 Themegaindex fix(reframe): keep re-acquiring a walking person while the face is lost
+8e5ceb8 2026-11-02 Themegaindex fix(encode): latch a dead GPU at once and skip NVENC for oversized cuts
+61c64e1 2026-11-02 Themegaindex feat(render): deliver shorts at exactly 1080x1920 and 1080x1080
+3161921 2026-11-02 Themegaindex perf(reframe): read samples in one pass and track faces less often
+754e6af 2026-11-02 Themegaindex feat(render): encode on the GPU with NVENC and fall back to libx264
+ff36d96 2026-11-02 Themegaindex feat(transcribe): run Whisper on the GPU with automatic CPU fallback
+6ad8dd9 2026-11-02 Themegaindex feat(download): shared yt-dlp sessions with opt-in browser cookies
+4d35c40 2026-11-02 Themegaindex feat(longform): raise the long-video minimum to 8 minutes
+b494ae8 2026-11-02 Themegaindex fix(longform): let the review gate finish valid best-of plans
+e1e6886 2026-11-02 Themegaindex feat(gemini): price Gemini 3.6-3.8 Flash and accept medium thinking
+a980dd8 2026-09-05 Themegaindex fix: address review findings on the P1-P3 fixes
+4a04d3d 2026-09-05 Themegaindex test: patch numpy.mean on the CI stub
+dcedab2 2026-09-05 Themegaindex fix: close review findings P1-P3
+7de35ea 2026-08-22 Themegaindex feat: improve smart longform editing
+d3d416b 2026-08-22 Themegaindex fix: enable long video subtitles
+236c1f4 2026-08-22 Themegaindex fix: clean partial render artifacts
+e15aa61 2026-08-22 Themegaindex fix: reset render phase before fallback
+f0602bb 2026-08-22 Themegaindex fix: preserve completed auto clips
+67bd522 2026-08-22 Themegaindex fix: isolate auto output renders
+8669805 2026-08-22 Themegaindex fix: recover unknown duration with ffprobe
+a901b6e 2026-08-22 Themegaindex test: isolate lightweight dependency stubs
+f76e7c0 2026-08-22 Themegaindex fix: keep successful fallback status clean
+9687a69 2026-08-22 Themegaindex fix: reject unknown-duration Auto fallback
+88fbef2 2026-08-22 Themegaindex fix: keep Auto recovery and CI network-free
+47d8688 2026-08-22 Themegaindex fix: finalize fallback and CI safeguards
+5c6a9a9 2026-08-22 Themegaindex fix: isolate lightweight pipeline test stubs
+3525e49 2026-08-22 Themegaindex fix: harden video mode fallbacks and CI coverage
+03c5a54 2026-08-22 Themegaindex fix: keep auto analysis fallbacks nonterminal
+d341cdc 2026-08-22 Themegaindex feat: add Long Video and Smart/Auto modes (#7)
+b5c495b 2026-08-21 Themegaindex fix: retry YouTube-refused downloads
+5a2a4f0 2026-08-15 Themegaindex ci: harden Claude dependency setup (#6)
+a1b3d0e 2026-08-15 Themegaindex ci: update setup actions to Node 24 runtimes (#3)
+bf534e7 2026-08-15 Themegaindex ci: add bounded Claude issue and PR automation
+54772f2 2026-08-05 Themegaindex Never treat an unknown ffprobe result as a broken source
+1844b73 2026-08-05 Themegaindex Track unknown-size download bytes per file
+3226dbe 2026-08-05 Themegaindex Resume stalled uploads with their original input file
+67c28d7 2026-08-05 Themegaindex Count unknown-size download bytes as watchdog work
+556928c 2026-08-05 Themegaindex Add ETA calibration from measured local benchmarks
+c8202d8 2026-08-05 Themegaindex Contain Windows workers in kill-on-close job objects
+95bea78 2026-08-05 Themegaindex Replace the job-stats lockfile with OS advisory locks
+63e7442 2026-08-05 Themegaindex Scope Gemini watchdog to each request
+503365e 2026-08-05 Themegaindex Sharpen neon subtitle rendering
+5cb2c0c 2026-08-04 Themegaindex fix stalled job recovery and ETA
+0f26afd 2026-07-25 Themegaindex fix: keep layer state across the remount a version change triggers
+062463a 2026-07-25 Themegaindex docs: mark every roadmap finding as fixed, partial or open
+3d2ad75 2026-07-25 Themegaindex docs: add the analysis roadmap this work came from
+64d6858 2026-07-25 Themegaindex fix: make an active signature preset clickable to turn it off
+793d7a5 2026-07-25 Themegaindex feat: let users take burned-in layers back off a clip
+32a8665 2026-07-25 Themegaindex feat: signature caption presets, plus honest feedback when things fail
+d0e67ae 2026-07-25 Themegaindex fix: stop Neon Sweep captions running off the frame edges
+56fa675 2026-07-25 Themegaindex chore: normalize line endings to LF and add .gitattributes
+2e903ea 2026-07-12 Themegaindex fix null Gemini rescue payload
+aaaa09e 2026-07-12 Themegaindex fix live timing and long-video clip quality
+ac0d87b 2026-07-12 Themegaindex docs: Unreleased-Changelog auf Deutsch übersetzen
+403485b 2026-07-12 Themegaindex fix: top subtitle alignment and job-wide state lost updates from PR review
+5a2d65c 2026-07-12 Themegaindex stabilize smart layouts and rendering
+eedd140 2026-07-11 Themegaindex fix: reliable split detection on wide podcast shots; jump cuts instead of camera pans
+8fb59d6 2026-07-11 Themegaindex feat: Opus-style split layout for two-person shots with selectable layout style
+7e67458 2026-07-11 Themegaindex fix: resolve relative WATERMARK_IMAGE paths against the project folder
+8404984 2026-07-11 Themegaindex fix: stop layout flicker and camera pendulum in two-person footage
+ac39d4f 2026-07-11 Themegaindex feat: live-converging total estimate and per-phase ETA learning
+34b3697 2026-07-11 Themegaindex fix: stop stall monitor from killing healthy downloads; resume re-downloads lost sources
+2d7de8c 2026-07-10 Themegaindex fix(tests): skip backend reliability tests when fastapi is unavailable
+fed6610 2026-07-10 Themegaindex fix(ci): install backend test dependencies
+8229743 2026-07-10 Themegaindex fix: harden job recovery and clip version persistence
+947db1f 2026-07-08 Themegaindex feat: bounce caption effect and animated hook entrance
+3b3ed12 2026-07-08 Themegaindex feat: single-pass layer rendering for subtitles + hooks
+030d9fb 2026-07-08 Themegaindex fix: survive PySceneDetect 0.6/0.7 API change and strip '#' from filenames
+46a4102 2026-07-08 Themegaindex feat: v2.0.0 — output formats, watermark, Auto-Edit v2, karaoke subtitles, reliability overhaul

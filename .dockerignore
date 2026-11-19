@@ -22,6 +22,9 @@ __pycache__
 *.so
 .Python
 .venv
+.venv-security/
+docs/security-evidence/
+.claude/settings.local.json
 venv/
 ENV/
 .eggs/

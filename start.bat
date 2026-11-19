@@ -7,14 +7,14 @@ echo.
 
 :: Start Backend in a new window
 echo [1/2] Starting Backend (FastAPI on port 8000)...
-start "OpenShorts Backend" cmd /k "cd /d %~dp0 && .\venv\Scripts\uvicorn app:app --host 0.0.0.0 --port 8000"
+start "OpenShorts Backend" /D "%~dp0" cmd /k ".\venv\Scripts\uvicorn app:app --host 127.0.0.1 --port 8000"
 
 :: Wait a moment for backend to initialize
 timeout /t 3 /nobreak >nul
 
 :: Start Frontend in a new window
 echo [2/2] Starting Frontend (Vite on port 5173)...
-start "OpenShorts Frontend" cmd /k "cd /d %~dp0\dashboard && npm run dev"
+start "OpenShorts Frontend" /D "%~dp0dashboard" cmd /k "npm run dev"
 
 :: Wait a moment then open browser
 timeout /t 3 /nobreak >nul

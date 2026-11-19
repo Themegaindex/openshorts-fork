@@ -46,6 +46,29 @@ def test_auto_uses_full_nvenc_profile_when_probe_passes(gpu):
     assert args[-2:] == ["-pix_fmt", "yuv420p"]
 
 
+def test_master_tier_is_p4_without_multipass(gpu):
+    """p7 + fullres multipass halved subtitle render speed for no VMAF gain
+    on a 4K60 neon burn; the master tier must stay on the measured p4."""
+    args = ve.video_encode_args(ve.MASTER)
+    assert args[args.index("-preset") + 1] == "p4"
+    assert args[args.index("-multipass") + 1] == "disabled"
+
+
+def test_full_probe_still_covers_multipass(monkeypatch):
+    """MASTER no longer sends multipass, but HIGH does; the probe that grants
+    the full profile has to try it, or HIGH encodes fail at render time."""
+    seen = []
+
+    def fake_run(command, **_kwargs):
+        seen.append(command)
+        return subprocess.CompletedProcess(command, 0)
+
+    monkeypatch.setattr(ve.subprocess, "run", fake_run)
+    assert ve._run_probe("full") is True
+    command = seen[0]
+    assert command[command.index("-multipass") + 1] == "qres"
+
+
 def test_compat_profile_when_only_basic_nvenc_works(gpu):
     gpu["state"]["full"] = False
     args = " ".join(ve.video_encode_args(ve.HIGH))

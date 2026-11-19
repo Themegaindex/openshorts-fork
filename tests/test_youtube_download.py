@@ -123,6 +123,19 @@ def test_node_is_enabled_for_youtube_challenges(monkeypatch):
     assert 'extractor_args' not in options
 
 
+@pytest.mark.parametrize('configured,expected_gb', [
+    (None, 2), ('8', 8), ('0.5', 0.5), ('0', 2), ('-1', 2), ('lots', 2), ('inf', 2), ('nan', 2),
+])
+def test_download_limit_is_configurable_with_a_safe_default(monkeypatch, configured, expected_gb):
+    # A fixed 2 GB cap broke long 4K sources with no way to raise it.
+    if configured is None:
+        monkeypatch.delenv('OPENSHORTS_MAX_DOWNLOAD_GB', raising=False)
+    else:
+        monkeypatch.setenv('OPENSHORTS_MAX_DOWNLOAD_GB', configured)
+    assert youtube.max_download_bytes() == int(expected_gb * 1024 ** 3)
+    assert youtube.youtube_base_options()['max_filesize'] == int(expected_gb * 1024 ** 3)
+
+
 @pytest.mark.parametrize('message,expected', [
     ("Sign in to confirm you’re not a bot", 'YouTube requires sign-in'),
     ('Could not copy Chrome cookie database', 'Fully close'),

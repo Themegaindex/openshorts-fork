@@ -14,6 +14,28 @@ import time
 
 import advisory_lock
 
+
+def configure_ctranslate2_allocator(environ=None, platform=None):
+    """Use CTranslate2's caching CUDA allocator on Windows unless one is set.
+
+    With the default cuda_malloc_async allocator, destroying a GPU Whisper
+    model aborts the whole process on Windows (exit code 0xC0000409) once a
+    temperature fallback has run. Crash dumps show a CTranslate2 worker thread
+    freeing device memory in its thread-exit cleanup; CudaAsyncAllocator::free
+    throws there, and an exception in that cleanup calls std::terminate.
+    Python cannot catch it, so the finished transcript was lost
+    (faster-whisper issue #1293, ctranslate2 4.7.1). The cub_caching allocator
+    does not throw on free. Reproduced 3/3 with the default and 0/3 with
+    cub_caching; no measurable speed difference.
+    Must run before the first CUDA allocation, hence at import time.
+    """
+    environ = os.environ if environ is None else environ
+    if (platform or os.name) == "nt":
+        environ.setdefault("CT2_CUDA_ALLOCATOR", "cub_caching")
+
+
+configure_ctranslate2_allocator()
+
 if os.name == "nt":
     # Windows without Developer Mode cannot symlink in the Hugging Face cache;
     # files are stored as copies and the warning is cosmetic.

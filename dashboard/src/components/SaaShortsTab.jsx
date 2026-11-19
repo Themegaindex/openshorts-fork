@@ -1,6 +1,7 @@
-import React, { useState, useEffect } from 'react';
+import React, { useState, useEffect, useRef } from 'react';
 import { Globe, Sparkles, Download, Copy, Check, ChevronRight, ChevronLeft, Loader2, AlertCircle, Volume2, User, Film, Terminal, ChevronDown, RefreshCw, Zap, Target, TrendingUp, MessageSquare, Eye, Share2, Calendar, Upload } from 'lucide-react';
 import { getApiUrl } from '../config';
+import { readApiError } from '../apiError';
 
 const STYLE_OPTIONS = [
   { id: 'ugc', label: 'UGC Natural', desc: 'Authentic, talking to camera' },
@@ -26,15 +27,61 @@ function loadCache() {
   } catch { return null; }
 }
 
-function saveCache(url, analysis, webResearch, scripts) {
+// Language and actor gender travel with the scripts: after a reload the voice
+// filter and labels used to fall back to English/female for any cached script.
+function saveCache(url, analysis, webResearch, scripts, language, actorGender) {
   try {
     localStorage.setItem(CACHE_KEY, JSON.stringify({
-      url, analysis, webResearch, scripts, timestamp: Date.now(),
+      url, analysis, webResearch, scripts, language, actorGender, timestamp: Date.now(),
     }));
   } catch { /* localStorage full */ }
 }
 
-export default function SaaShortsTab({ geminiApiKey, elevenLabsKey, falKey, uploadPostKey, uploadUserId }) {
+const DEFAULT_VOICE_OPTIONS = {
+  'en-female': [
+    { id: '21m00Tcm4TlvDq8ikWAM', name: 'Rachel (calm)' },
+    { id: 'EXAVITQu4vr4xnSDxMaL', name: 'Bella (soft)' },
+  ],
+  'en-male': [
+    { id: '29vD33N1CtxCmqQRPOHJ', name: 'Drew (confident)' },
+    { id: 'TxGEqnHWrfWFTfGW9XjX', name: 'Josh (deep)' },
+    { id: 'yoZ06aMxZJJ28mfd3POQ', name: 'Sam (raspy)' },
+  ],
+  'es-female': [
+    { id: 'EXAVITQu4vr4xnSDxMaL', name: 'Bella (suave)' },
+    { id: '21m00Tcm4TlvDq8ikWAM', name: 'Rachel (calmada)' },
+  ],
+  'es-male': [
+    { id: 'ErXwobaYiN019PkySvjV', name: 'Antoni (cálido)' },
+    { id: '29vD33N1CtxCmqQRPOHJ', name: 'Drew (confiado)' },
+  ],
+};
+
+// Account voices of the actor's gender, preferred accents first. Empty when
+// the account list has none; the UI then offers DEFAULT_VOICE_OPTIONS.
+function matchingAccountVoices(voices, gender, language) {
+  const preferred = language === 'es' ? ['spanish', 'latin'] : ['american', 'british'];
+  const score = (voice) => {
+    const accent = (voice.labels?.accent || '').toLowerCase();
+    return preferred.some((name) => accent.includes(name)) ? 0 : 1;
+  };
+  return voices
+    .filter((voice) => (voice.labels?.gender || '').toLowerCase() === gender)
+    .sort((a, b) => score(a) - score(b));
+}
+
+function defaultVoiceOptions(gender, language) {
+  return DEFAULT_VOICE_OPTIONS[`${language}-${gender}`] || DEFAULT_VOICE_OPTIONS['en-female'];
+}
+
+export default function SaaShortsTab({ geminiApiKey, elevenLabsKey, falKey, uploadPostKey, uploadUserId, isActive = true }) {
+  // The tab stays mounted while hidden; the result video must not keep
+  // playing sound in the background.
+  const resultVideoRef = useRef(null);
+  useEffect(() => {
+    if (!isActive) resultVideoRef.current?.pause();
+  }, [isActive]);
+
   // Wizard state
   const [step, setStep] = useState(() => {
     const cache = loadCache();
@@ -46,8 +93,8 @@ export default function SaaShortsTab({ geminiApiKey, elevenLabsKey, falKey, uplo
   const [videoMode, setVideoMode] = useState('lowcost'); // "lowcost" or "premium"
   const [description, setDescription] = useState('');
   const [style, setStyle] = useState('ugc');
-  const [language, setLanguage] = useState('en');
-  const [actorGender, setActorGender] = useState('female');
+  const [language, setLanguage] = useState(() => loadCache()?.language || 'en');
+  const [actorGender, setActorGender] = useState(() => loadCache()?.actorGender || 'female');
   const [numScripts, setNumScripts] = useState(3);
   const [analyzing, setAnalyzing] = useState(false);
   const [analyzeError, setAnalyzeError] = useState('');
@@ -177,6 +224,17 @@ export default function SaaShortsTab({ geminiApiKey, elevenLabsKey, falKey, uplo
     return () => { cancelled = true; clearInterval(interval); };
   }, [jobId, genStatus]);
 
+  // Keep the voice in line with the chosen actor. The start value is the
+  // female "Rachel", and it used to stay selected for a male actor while the
+  // list showed nothing selected (or a male name in the fallback select).
+  useEffect(() => {
+    const accountVoices = matchingAccountVoices(voices, actorGender, language);
+    const ids = accountVoices.length > 0
+      ? accountVoices.map((voice) => voice.voice_id)
+      : defaultVoiceOptions(actorGender, language).map((option) => option.id);
+    if (!ids.includes(selectedVoice)) setSelectedVoice(ids[0]);
+  }, [voices, actorGender, language, selectedVoice]);
+
   // Revoke the uploaded-actor preview blob URL when it changes or on unmount.
   useEffect(() => {
     const preview = uploadedActorPreview?.localPreview;
@@ -224,11 +282,7 @@ export default function SaaShortsTab({ geminiApiKey, elevenLabsKey, falKey, uplo
         }),
       });
 
-      if (!res.ok) {
-        let msg = 'Analysis failed';
-        try { const err = await res.json(); msg = err.detail || msg; } catch { msg = await res.text() || msg; }
-        throw new Error(msg);
-      }
+      if (!res.ok) throw new Error(await readApiError(res));
 
       const data = await res.json();
       setAnalysis(data.analysis);
@@ -238,7 +292,7 @@ export default function SaaShortsTab({ geminiApiKey, elevenLabsKey, falKey, uplo
       setFromCache(false);
 
       // Cache results
-      saveCache(url.trim(), data.analysis, data.web_research, data.scripts);
+      saveCache(url.trim(), data.analysis, data.web_research, data.scripts, language, actorGender);
 
       // Pre-fill actor description and narration from first script
       if (data.scripts.length > 0) {
@@ -272,6 +326,10 @@ export default function SaaShortsTab({ geminiApiKey, elevenLabsKey, falKey, uplo
       return;
     }
 
+    // Forget the previous job first. Otherwise the poll picked up the old,
+    // failed job and showed FAILED while the new paid job was running.
+    setJobId(null);
+    setPublishResult(null);
     setGenerating(true);
     setGenLogs(['Starting video generation...']);
     setGenStatus('processing');
@@ -303,11 +361,7 @@ export default function SaaShortsTab({ geminiApiKey, elevenLabsKey, falKey, uplo
         }),
       });
 
-      if (!res.ok) {
-        let msg = 'Generation failed';
-        try { const err = await res.json(); msg = err.detail || msg; } catch { msg = await res.text() || msg; }
-        throw new Error(msg);
-      }
+      if (!res.ok) throw new Error(await readApiError(res));
 
       const data = await res.json();
       setJobId(data.job_id);
@@ -319,7 +373,12 @@ export default function SaaShortsTab({ geminiApiKey, elevenLabsKey, falKey, uplo
   };
 
   const handleRetry = async () => {
-    if (!jobId) return;
+    // The start request itself failed (queue full, bad actor, network), so
+    // there is nothing to resume: start a new job instead of doing nothing.
+    if (!jobId) {
+      handleGenerate();
+      return;
+    }
     setGenerating(true);
     setGenLogs(['Retrying from cached assets...']);
     setGenStatus('processing');
@@ -349,11 +408,7 @@ export default function SaaShortsTab({ geminiApiKey, elevenLabsKey, falKey, uplo
         }),
       });
 
-      if (!res.ok) {
-        let msg = 'Retry failed';
-        try { const err = await res.json(); msg = err.detail || msg; } catch { msg = await res.text() || msg; }
-        throw new Error(msg);
-      }
+      if (!res.ok) throw new Error(await readApiError(res));
 
       const data = await res.json();
       setJobId(data.job_id);
@@ -385,6 +440,7 @@ export default function SaaShortsTab({ geminiApiKey, elevenLabsKey, falKey, uplo
     setGenStatus('idle');
     setGenResult(null);
     setGenerating(false);
+    setPublishResult(null);
     setActorDescription('');
     setEditedNarration('');
   };
@@ -875,28 +931,7 @@ export default function SaaShortsTab({ geminiApiKey, elevenLabsKey, falKey, uplo
                   <Volume2 size={14} /> Voice {language === 'es' ? '(Spanish)' : '(English)'}
                 </label>
                 {(() => {
-                  // Filter voices by language/accent
-                  const filtered = voices.length > 0
-                    ? voices.filter((v) => {
-                        const gender = (v.labels?.gender || '').toLowerCase();
-                        // Only show voices that match the selected gender
-                        return gender === actorGender;
-                      })
-                      .sort((a, b) => {
-                        const aAccent = (a.labels?.accent || '').toLowerCase();
-                        const bAccent = (b.labels?.accent || '').toLowerCase();
-                        if (language === 'es') {
-                          // Spanish/latin accents first, then everything else
-                          const aScore = (aAccent.includes('spanish') || aAccent.includes('latin')) ? 0 : 1;
-                          const bScore = (bAccent.includes('spanish') || bAccent.includes('latin')) ? 0 : 1;
-                          return aScore - bScore;
-                        }
-                        // English: american/british first
-                        const aScore = (aAccent.includes('american') || aAccent.includes('british')) ? 0 : 1;
-                        const bScore = (bAccent.includes('american') || bAccent.includes('british')) ? 0 : 1;
-                        return aScore - bScore;
-                      })
-                    : [];
+                  const filtered = matchingAccountVoices(voices, actorGender, language);
 
                   if (filtered.length > 0) {
                     return (
@@ -933,31 +968,9 @@ export default function SaaShortsTab({ geminiApiKey, elevenLabsKey, falKey, uplo
                     );
                   }
 
-                  // Fallback defaults by gender + language
-                  const defaults = {
-                    'en-female': [
-                      { id: '21m00Tcm4TlvDq8ikWAM', name: 'Rachel (calm)' },
-                      { id: 'EXAVITQu4vr4xnSDxMaL', name: 'Bella (soft)' },
-                    ],
-                    'en-male': [
-                      { id: '29vD33N1CtxCmqQRPOHJ', name: 'Drew (confident)' },
-                      { id: 'TxGEqnHWrfWFTfGW9XjX', name: 'Josh (deep)' },
-                      { id: 'yoZ06aMxZJJ28mfd3POQ', name: 'Sam (raspy)' },
-                    ],
-                    'es-female': [
-                      { id: 'EXAVITQu4vr4xnSDxMaL', name: 'Bella (suave)' },
-                      { id: '21m00Tcm4TlvDq8ikWAM', name: 'Rachel (calmada)' },
-                    ],
-                    'es-male': [
-                      { id: 'ErXwobaYiN019PkySvjV', name: 'Antoni (cálido)' },
-                      { id: '29vD33N1CtxCmqQRPOHJ', name: 'Drew (confiado)' },
-                    ],
-                  };
-                  const key = `${language}-${actorGender}`;
-                  const opts = defaults[key] || defaults['en-female'];
                   return (
                     <select value={selectedVoice} onChange={(e) => setSelectedVoice(e.target.value)} className="input-field">
-                      {opts.map((o) => <option key={o.id} value={o.id}>{o.name}</option>)}
+                      {defaultVoiceOptions(actorGender, language).map((o) => <option key={o.id} value={o.id}>{o.name}</option>)}
                     </select>
                   );
                 })()}
@@ -1027,14 +1040,17 @@ export default function SaaShortsTab({ geminiApiKey, elevenLabsKey, falKey, uplo
                               method: 'POST',
                               body: formData,
                             });
-                            if (res.ok) {
-                              const data = await res.json();
-                              if (data.url) {
-                                setUploadedActorPreview({ localPreview, serverUrl: data.url });
-                                setSelectedActor(data.url);
-                              }
-                            }
-                          } catch (err) { console.error('Upload failed:', err); }
+                            if (!res.ok) throw new Error(await readApiError(res));
+                            const data = await res.json();
+                            if (!data.url) throw new Error('The server returned no image URL.');
+                            setUploadedActorPreview({ localPreview, serverUrl: data.url });
+                            setSelectedActor(data.url);
+                          } catch (err) {
+                            // Too large, too many pixels, HEIC or offline: the
+                            // preview used to show a spinner forever.
+                            setUploadedActorPreview(null);
+                            alert(`Photo upload failed: ${err.message}`);
+                          }
                           e.target.value = '';
                         }}
                       />
@@ -1322,10 +1338,12 @@ export default function SaaShortsTab({ geminiApiKey, elevenLabsKey, falKey, uplo
                 {/* Video Player */}
                 <div className="aspect-[9/16] max-h-[500px] bg-black rounded-xl overflow-hidden relative">
                   <video
+                    ref={resultVideoRef}
                     src={getApiUrl(genResult.video_url)}
                     controls
                     className="w-full h-full object-contain"
-                    autoPlay
+                    // A job that finishes while the tab is hidden must not start playing.
+                    autoPlay={isActive}
                   />
                 </div>
 
@@ -1485,10 +1503,7 @@ export default function SaaShortsTab({ geminiApiKey, elevenLabsKey, falKey, uplo
                                 headers: { 'Content-Type': 'application/json' },
                                 body: JSON.stringify(payload),
                               });
-                              if (!res.ok) {
-                                const err = await res.json().catch(() => ({ detail: 'Failed' }));
-                                throw new Error(err.detail || 'Failed');
-                              }
+                              if (!res.ok) throw new Error(await readApiError(res));
                               setPublishResult({ ok: true, msg: isScheduling ? 'Scheduled!' : 'Published!' });
                             } catch (e) {
                               setPublishResult({ ok: false, msg: e.message });
