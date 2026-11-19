@@ -4,8 +4,11 @@ import subprocess
 import sys
 import math
 import colorsys
+import unicodedata
 from decimal import Decimal, InvalidOperation, ROUND_HALF_UP
 from video_formats import EVEN_PAD_FILTER
+import caption_fonts
+import caption_placement
 import video_encoding
 import whisper_runtime
 
@@ -218,10 +221,14 @@ def transcribe_audio(video_path):
 
 
 def generate_srt_from_video(video_path, output_path, max_chars=20, max_duration=2.0,
-                            style="classic", **style_opts):
+                            style="classic", hook_variant_paths=None, **style_opts):
     """
     Transcribe a video and generate a subtitle file directly (SRT, or karaoke
     ASS when style="karaoke"). Used for dubbed videos without a transcript.
+    A Classic style with a ``placement`` (portrait frame) is written as ASS,
+    because SRT cannot carry per-block positions. ``hook_variant_paths``
+    ({slot: path}) also writes, from the same transcription, the variants
+    that keep a slot free for a hook there.
     """
     transcript = transcribe_audio(video_path)
 
@@ -233,16 +240,32 @@ def generate_srt_from_video(video_path, output_path, max_chars=20, max_duration=
     duration = frame_count / fps if fps else 0
     cap.release()
 
-    if style == "karaoke":
-        return generate_ass(transcript, 0, duration, output_path, max_chars, max_duration, **style_opts)
-    return generate_srt(transcript, 0, duration, output_path, max_chars, max_duration)
+    def write(path, opts):
+        if style == "karaoke":
+            return generate_ass(transcript, 0, duration, path, max_chars, max_duration, **opts)
+        if opts.get("placement") is not None:
+            return generate_classic_ass(
+                transcript, 0, duration, path, max_chars, max_duration, **opts,
+            )
+        return generate_srt(transcript, 0, duration, path, max_chars, max_duration)
+
+    written = write(output_path, style_opts)
+    placement = style_opts.get("placement")
+    if written and placement is not None:
+        for slot, path in (hook_variant_paths or {}).items():
+            write(path, {**style_opts, "placement": placement.with_hook(slot)})
+    return written
 
 
-def _collect_word_blocks(transcript, clip_start, clip_end, max_chars=20, max_duration=2.0):
+def _collect_word_blocks(transcript, clip_start, clip_end, max_chars=20, max_duration=2.0,
+                         fits=None):
     """
     Flatten transcript words for a clip range and group them into short blocks
     suitable for vertical video. Returns a list of blocks; each block is a list
     of {'word', 'start', 'end'} dicts with times relative to the clip.
+
+    ``fits`` (portrait) starts a new block when the next word would make the
+    block more lines high than the layout allows.
 
     Continuation fragments are merged defensively here too, because transcripts
     from old jobs on disk store unmerged tokens (the leading space is still
@@ -339,7 +362,8 @@ def _collect_word_blocks(transcript, clip_start, clip_end, max_chars=20, max_dur
         current_text_len = sum(len(w['word']) + 1 for w in current_block)
         duration = word['end'] - block_start
 
-        if current_text_len + len(word['word']) > max_chars or duration > max_duration:
+        if (current_text_len + len(word['word']) > max_chars or duration > max_duration
+                or (fits is not None and not fits(current_block + [word]))):
             blocks.append(current_block)
             current_block = [word]
             block_start = word['start']
@@ -487,6 +511,16 @@ _NEON_TUBE_BLUR_REFERENCE_HEIGHT = 1920
 # Share of white mixed into the core, so the letter reads as a lit tube.
 _NEON_TUBE_CORE_WHITE = 0.5
 
+# How far each preset draws past its glyphs: the widest outline in script
+# units and the widest blur in output pixels (Neon Tube's at 1920 px height).
+# Portrait placement keeps outline and glow inside the safe zone too.
+_SIGNATURE_INK = max(float(layer[0]) for layer in _SIGNATURE_GLOW_LAYERS)
+_SIGNATURE_BLUR = max(float(layer[1]) for layer in _SIGNATURE_GLOW_LAYERS)
+_NEON_TUBE_INK = max(float(layer[1]) for layer in _NEON_TUBE_LAYERS)
+_NEON_TUBE_BLUR = max(float(layer[2]) for layer in _NEON_TUBE_LAYERS)
+# Karaoke's Glow effect blurs the active word's outline by this much.
+_KARAOKE_GLOW_BLUR = 4
+
 # Horizontal glyph scaling per signature preset (ASS \fscx, in percent).
 _NEON_SWEEP_SCALE_X = 104
 _NEON_TUBE_SCALE_X = 104
@@ -533,6 +567,217 @@ def _signature_line_budget(final_fontsize, horizontal_scale=100):
     return max(SIGNATURE_MIN_LINE_CHARS, int(usable / per_char))
 
 
+# Portrait captions keep their words whole: a word too wide for the line
+# shrinks its whole block evenly, down to PORTRAIT_MIN_BLOCK_SCALE. A word
+# that still does not fit is split into two pieces, and the block shrinks
+# further until both fit, but never below PORTRAIT_FLOOR_BLOCK_SCALE: only
+# below that does a word take a third line (it stays inside the safe zone).
+# A word of a joined or right-to-left script is never split; below the floor
+# it reaches into the side margin. A block is at most this many lines high.
+PORTRAIT_MIN_BLOCK_SCALE = 0.70
+PORTRAIT_FLOOR_BLOCK_SCALE = 0.35
+PORTRAIT_MAX_BLOCK_LINES = 2
+
+
+class _PortraitLayout:
+    """Width-based line breaking and block scale for portrait captions.
+
+    Widths are script x-units of the header canvas, from the real advance
+    widths of the face libass draws (caption_fonts), so a word that fits the
+    line at the chosen size stays whole. ``peak`` is how much an effect
+    briefly widens the active word (Pop, Bounce).
+    """
+
+    def __init__(self, font_name, fontsize, usable, glyph_scale, scale_x=100,
+                 peak=1.0, uppercase=False, band_height=0.0):
+        self.font_name = font_name
+        self.usable = usable
+        self.unit = fontsize * glyph_scale * scale_x / 100.0
+        self.peak = peak
+        self.uppercase = uppercase
+        # Height of a full block as a share of the frame (the face rule).
+        self.band_height = band_height
+
+    def display(self, word):
+        """The text libass draws for one transcript word."""
+        text = _escape_ass_text(word)
+        return text.upper() if self.uppercase else text
+
+    def width(self, text, scale=1.0):
+        return caption_fonts.text_width(text, self.font_name) * self.unit * scale
+
+    def _word_width(self, text, scale):
+        return self.width(text, scale) * self.peak
+
+    def scale_for(self, texts):
+        """Block scale: 1.0 when every word fits, else just small enough for
+        the widest one, down to PORTRAIT_MIN_BLOCK_SCALE. A word too wide even
+        then fits as two pieces (or whole, if it must not be split) at a
+        smaller scale, never below PORTRAIT_FLOOR_BLOCK_SCALE."""
+        widest = max((self._word_width(text, 1.0) for text in texts), default=0.0)
+        if widest <= self.usable:
+            return 1.0
+        scale = _floor_scale(self.usable / widest)
+        if scale >= PORTRAIT_MIN_BLOCK_SCALE:
+            return scale
+        needed = PORTRAIT_MIN_BLOCK_SCALE
+        for text in texts:
+            if self._word_width(text, PORTRAIT_MIN_BLOCK_SCALE) <= self.usable:
+                continue
+            pieces = self._halves(text) if caption_fonts.can_split(text) else [text]
+            widest_piece = max(self._word_width(piece, 1.0) for piece in pieces)
+            needed = min(needed, _floor_scale(self.usable / widest_piece))
+        return max(PORTRAIT_FLOOR_BLOCK_SCALE, needed)
+
+    def _halves(self, text):
+        """Two pieces of about equal width, never cut before a combining mark
+        or a format character, or after a zero-width joiner."""
+        cuts = [
+            index for index in range(1, len(text))
+            if unicodedata.category(text[index]) not in ("Mn", "Me", "Cf")
+            and text[index - 1] != "\u200d"
+        ]
+        if not cuts:
+            return [text]
+        best = min(cuts, key=lambda index: max(self.width(text[:index]), self.width(text[index:])))
+        return [text[:best], text[best:]]
+
+    def segments(self, text, scale):
+        """A word as one piece, or two pieces of about equal width when it is
+        wider than the line at ``scale``. A word of a joined or right-to-left
+        script stays whole. Only below PORTRAIT_FLOOR_BLOCK_SCALE does a word
+        need more pieces."""
+        if self._word_width(text, scale) <= self.usable or not caption_fonts.can_split(text):
+            return [text]
+        halves = self._halves(text)
+        if all(self._word_width(part, scale) <= self.usable for part in halves):
+            return halves
+        for count in range(3, len(text) + 1):
+            size = math.ceil(len(text) / count)
+            parts = [text[index:index + size] for index in range(0, len(text), size)]
+            if all(self._word_width(part, scale) <= self.usable for part in parts):
+                return parts
+        return list(text)
+
+    def line_indices(self, texts, scale, limit=None):
+        """Greedy line per word, like _wrap_line_indices. The later pieces of
+        a split word take extra lines of their own."""
+        limit = self.usable if limit is None else limit
+        space = self.width(" ", scale)
+        indices = []
+        line = 0
+        current = 0.0
+        for text in texts:
+            parts = self.segments(text, scale)
+            first = self._word_width(parts[0], scale)
+            gap = space if current else 0.0
+            if current and current + gap + first > limit:
+                line += 1
+                current = first
+            else:
+                current += gap + first
+            indices.append(line)
+            for part in parts[1:]:
+                current = self._word_width(part, scale)
+        return indices
+
+    def balanced_line_indices(self, texts, scale):
+        """The tightest line width that still needs the same number of lines,
+        so "full / leftover" becomes two even lines (see
+        _balanced_line_indices)."""
+        indices = self.line_indices(texts, scale)
+        if not indices or indices[-1] == 0:
+            return indices
+        low, high = 0.0, self.usable
+        for _ in range(24):
+            middle = (low + high) / 2
+            candidate = self.line_indices(texts, scale, limit=middle)
+            if candidate[-1] == indices[-1]:
+                indices, high = candidate, middle
+            else:
+                low = middle
+        return indices
+
+    def line_count(self, texts, scale):
+        if not texts:
+            return 0
+        extra = sum(len(self.segments(text, scale)) - 1 for text in texts)
+        return self.line_indices(texts, scale)[-1] + 1 + extra
+
+    def fits(self, words):
+        """Whether these transcript words make a block of at most
+        PORTRAIT_MAX_BLOCK_LINES lines (for _collect_word_blocks)."""
+        texts = [self.display(word['word']) for word in words]
+        return self.line_count(texts, self.scale_for(texts)) <= PORTRAIT_MAX_BLOCK_LINES
+
+    def block_scale(self, block):
+        return self.scale_for([self.display(word['word']) for word in block])
+
+
+def _band_height(geometry, safe_zone, fontsize, play_res_y):
+    """Share of the frame height a block of PORTRAIT_MAX_BLOCK_LINES lines
+    covers, outline and glow included (the bottom margin holds their reach)."""
+    reach = max(0.0, geometry[caption_placement.SLOT_BOTTOM].margin_v - safe_zone.bottom * play_res_y)
+    return (PORTRAIT_MAX_BLOCK_LINES * fontsize + 2 * reach) / play_res_y
+
+
+def _floor_scale(value):
+    """A block scale rounded down to thousandths, so the text still fits."""
+    return math.floor(value * 1000) / 1000
+
+
+def _scale_percent(scale, base=100):
+    """\\fscx/\\fscy value for ``base`` percent shrunk by a block scale."""
+    return f"{base * scale:.1f}".rstrip("0").rstrip(".")
+
+
+def _signature_portrait(placement, font_name, fontsize, horizontal_scale, play_res_x,
+                        ink, blur_px):
+    """Slot geometry and layout of a signature preset on a portrait frame.
+
+    The layout measures lines between the safe side margins on the header's
+    own canvas, so libass never re-wraps the lines we break. None without a
+    placement (not portrait): the legacy budget then applies.
+    """
+    if placement is None:
+        return None
+    geometry = caption_placement.slot_geometry(
+        placement.safe_zone, play_res_x, SIGNATURE_PLAY_RES_Y, ink,
+        blur_px=blur_px, frame_size=placement.frame_size,
+    )
+    final_fontsize = _signature_final_fontsize(fontsize)
+    layout = _PortraitLayout(
+        _sanitize_font_name(font_name), final_fontsize,
+        caption_placement.usable_width(geometry, play_res_x),
+        caption_placement.glyph_scale_x(placement.frame_size, play_res_x, SIGNATURE_PLAY_RES_Y),
+        scale_x=horizontal_scale, uppercase=True,
+        band_height=_band_height(geometry, placement.safe_zone, final_fontsize, SIGNATURE_PLAY_RES_Y),
+    )
+    return geometry, layout
+
+
+def _slot_style_lines(style_body, geometry, encoding=1):
+    """One ASS style per caption slot, identical except for alignment and
+    margins. ``style_body`` holds every field from Fontname to Shadow."""
+    return "".join(
+        f"Style: {caption_placement.SLOT_STYLE_NAMES[slot]},{style_body},"
+        f"{slot_geometry.alignment},{slot_geometry.margin_l},{slot_geometry.margin_r},"
+        f"{slot_geometry.margin_v},{encoding}\n"
+        for slot, slot_geometry in geometry.items()
+    )
+
+
+def _block_style(placement, block, default_style, layout=None):
+    """Style name for every event of one block: its slot, fixed for the
+    whole block so it never jumps mid-sentence."""
+    if placement is None or not block:
+        return default_style
+    slot = placement.slot_for_block(
+        block[0]['start'], block[-1]['end'], layout.band_height if layout else 0.0,
+    )
+    return caption_placement.SLOT_STYLE_NAMES[slot]
+
+
 def _write_ass_file(output_path, header, events):
     """Write a complete ASS document with Windows-friendly Unicode encoding."""
     if not events:
@@ -543,18 +788,32 @@ def _write_ass_file(output_path, header, events):
 
 
 def _signature_ass_header(font_name, fontsize, alignment,
-                          play_res_x=SIGNATURE_PLAY_RES_X):
+                          play_res_x=SIGNATURE_PLAY_RES_X, geometry=None):
     """ASS canvas/style shared by the CapCut-grade signature presets.
 
     PlayResX is explicit because libass otherwise chooses a landscape-oriented
     fallback on some installations. A 162x288 script canvas is exactly 9:16
     and scales cleanly to 1080x1920 as well as other vertical resolutions.
     Neon Tube widens it to the frame aspect (see _signature_play_res_x).
+    ``geometry`` (portrait placement) replaces the one Signature style with
+    one style per caption slot.
     """
     align_map = {'top': 8, 'middle': 5, 'bottom': 2}
     ass_alignment = align_map.get(str(alignment).lower(), 2)
     safe_font = _sanitize_font_name(font_name)
     final_fontsize = _signature_final_fontsize(fontsize)
+    style_body = (
+        f"{safe_font},{final_fontsize},&H00FFFFFF,&H00FFFFFF,"
+        f"&H00000000,&H00000000,1,0,0,0,100,100,0,0,1,1.2,0"
+    )
+    if geometry is None:
+        styles = (
+            f"Style: Signature,{style_body},"
+            f"{ass_alignment},{SIGNATURE_SIDE_MARGIN},{SIGNATURE_SIDE_MARGIN},"
+            f"{SIGNATURE_BOTTOM_MARGIN},1\n"
+        )
+    else:
+        styles = _slot_style_lines(style_body, geometry)
     # WrapStyle 0 (smart wrapping) is a safety net, not the primary mechanism:
     # the renderers still emit their own \N breaks so the per-line highlight
     # mask stays deterministic. But should a line still overflow — an unusually
@@ -574,10 +833,7 @@ def _signature_ass_header(font_name, fontsize, alignment,
         "OutlineColour, BackColour, Bold, Italic, Underline, StrikeOut, "
         "ScaleX, ScaleY, Spacing, Angle, BorderStyle, Outline, Shadow, "
         "Alignment, MarginL, MarginR, MarginV, Encoding\n"
-        f"Style: Signature,{safe_font},{final_fontsize},&H00FFFFFF,&H00FFFFFF,"
-        f"&H00000000,&H00000000,1,0,0,0,100,100,0,0,1,1.2,0,"
-        f"{ass_alignment},{SIGNATURE_SIDE_MARGIN},{SIGNATURE_SIDE_MARGIN},"
-        f"{SIGNATURE_BOTTOM_MARGIN},1\n"
+        f"{styles}"
         "\n"
         "[Events]\n"
         "Format: Layer, Start, End, Style, Name, MarginL, MarginR, MarginV, Effect, Text\n"
@@ -661,8 +917,12 @@ def _balanced_line_indices(block, max_line_chars):
 
 
 def _join_ass_words(block, line_indices, max_line_chars,
-                    word_prefixes=None, uppercase=True):
-    """Serialize a block with explicit line breaks and optional per-word tags."""
+                    word_prefixes=None, uppercase=True, segments=None):
+    """Serialize a block with explicit line breaks and optional per-word tags.
+
+    ``segments`` (portrait) splits a word by width instead of by
+    ``max_line_chars``.
+    """
     rendered = []
     previous_line = line_indices[0] if line_indices else 0
     for index, word in enumerate(block):
@@ -671,15 +931,38 @@ def _join_ass_words(block, line_indices, max_line_chars,
         text = str(word['word'])
         if uppercase:
             text = text.upper()
-        text = r"\N".join(
-            _escape_ass_text(part)
-            for part in _word_display_segments(text, max_line_chars)
-        )
+        parts = segments(text) if segments else _word_display_segments(text, max_line_chars)
+        text = r"\N".join(_escape_ass_text(part) for part in parts)
         if word_prefixes is not None:
             rendered.append(word_prefixes[index])
         rendered.append(text)
         previous_line = line_indices[index]
     return "".join(rendered)
+
+
+def _signature_block_layout(block, line_budget, portrait):
+    """Lines, word splitting and block scale of one signature block.
+
+    Legacy: the character budget, no scale. Portrait: real widths, and the
+    whole block shrinks before any word is split.
+    """
+    if portrait is None:
+        return _balanced_line_indices(block, line_budget), None, 1.0
+    layout = portrait[1]
+    texts = [layout.display(word['word']) for word in block]
+    scale = layout.scale_for(texts)
+    return (
+        layout.balanced_line_indices(texts, scale),
+        lambda text: layout.segments(text, scale),
+        scale,
+    )
+
+
+def _signature_scale_tags(scale_x, scale):
+    """The preset's \\fscx, shrunk together with \\fscy by a block scale."""
+    if scale >= 1.0:
+        return f"\\fscx{scale_x}"
+    return f"\\fscx{_scale_percent(scale, scale_x)}\\fscy{_scale_percent(scale)}"
 
 
 def _neon_visible_prefix(color, fill_alpha="00", outline_alpha="00", outline_color=None):
@@ -691,19 +974,28 @@ def _neon_visible_prefix(color, fill_alpha="00", outline_alpha="00", outline_col
     )
 
 
-def _generate_neon_sweep_ass(blocks, output_path, alignment, fontsize, font_name):
+def _generate_neon_sweep_ass(blocks, output_path, alignment, fontsize, font_name,
+                             placement=None):
     """Render cumulative, line-aware neon karaoke with CapCut's four-stage glow."""
-    header = _signature_ass_header(font_name, fontsize, alignment)
     line_budget = _signature_line_budget(
         _signature_final_fontsize(fontsize), _NEON_SWEEP_SCALE_X,
+    )
+    portrait = _signature_portrait(
+        placement, font_name, fontsize, _NEON_SWEEP_SCALE_X, SIGNATURE_PLAY_RES_X,
+        _SIGNATURE_INK, _SIGNATURE_BLUR,
+    )
+    header = _signature_ass_header(
+        font_name, fontsize, alignment, geometry=portrait[0] if portrait else None,
     )
     events = []
 
     for block_index, block in enumerate(blocks):
         if not block:
             continue
+        style = _block_style(placement, block, "Signature", portrait[1] if portrait else None)
         boundaries = _quantized_block_boundaries(block)
-        line_indices = _balanced_line_indices(block, line_budget)
+        line_indices, segments, scale = _signature_block_layout(block, line_budget, portrait)
+        scale_tags = _signature_scale_tags(_NEON_SWEEP_SCALE_X, scale)
         color = _NEON_SWEEP_PALETTE[block_index % len(_NEON_SWEEP_PALETTE)]
         for active_index, _word in enumerate(block):
             start_cs = boundaries[active_index]
@@ -743,11 +1035,11 @@ def _generate_neon_sweep_ass(blocks, output_path, alignment, fontsize, font_name
                     ]
                     white_text = _join_ass_words(
                         block, line_indices, line_budget,
-                        word_prefixes=white_prefixes, uppercase=True,
+                        word_prefixes=white_prefixes, uppercase=True, segments=segments,
                     )
                     events.append(
-                        f"Dialogue: {white_layer},{start},{end},Signature,,0,0,0,,"
-                        f"{{\\fscx{_NEON_SWEEP_SCALE_X}\\bord{border}\\blur{blur}}}"
+                        f"Dialogue: {white_layer},{start},{end},{style},,0,0,0,,"
+                        f"{{{scale_tags}\\bord{border}\\blur{blur}}}"
                         f"{white_text}"
                     )
 
@@ -758,11 +1050,11 @@ def _generate_neon_sweep_ass(blocks, output_path, alignment, fontsize, font_name
                 ]
                 colored_text = _join_ass_words(
                     block, line_indices, line_budget,
-                    word_prefixes=color_prefixes, uppercase=True,
+                    word_prefixes=color_prefixes, uppercase=True, segments=segments,
                 )
                 events.append(
-                    f"Dialogue: {color_layer},{start},{end},Signature,,0,0,0,,"
-                    f"{{\\fscx{_NEON_SWEEP_SCALE_X}\\bord{border}\\blur{blur}}}"
+                    f"Dialogue: {color_layer},{start},{end},{style},,0,0,0,,"
+                    f"{{{scale_tags}\\bord{border}\\blur{blur}}}"
                     f"{colored_text}"
                 )
 
@@ -830,15 +1122,22 @@ def _mix_with_white(hex_color, amount):
 
 
 def _generate_neon_tube_ass(blocks, output_path, alignment, fontsize, font_name,
-                            frame_size=None):
+                            frame_size=None, placement=None):
     """Neon Sweep's cumulative line reveal, drawn as crisp neon tubes."""
-    header = _signature_ass_header(
-        font_name, fontsize, alignment, play_res_x=_signature_play_res_x(frame_size),
-    )
+    play_res_x = _signature_play_res_x(frame_size)
     # Same wrapping as Neon Sweep on every frame shape: the budget stays on
-    # the 162 px vertical canvas even when the script canvas is wider.
+    # the 162 px vertical canvas even when the script canvas is wider. A
+    # portrait placement measures the line between its own side margins.
     line_budget = _signature_line_budget(
         _signature_final_fontsize(fontsize), _NEON_TUBE_SCALE_X,
+    )
+    portrait = _signature_portrait(
+        placement, font_name, fontsize, _NEON_TUBE_SCALE_X, play_res_x,
+        _NEON_TUBE_INK, float(_scaled_blur(_NEON_TUBE_BLUR, frame_size)),
+    )
+    header = _signature_ass_header(
+        font_name, fontsize, alignment, play_res_x=play_res_x,
+        geometry=portrait[0] if portrait else None,
     )
     layers = [
         (words, border, _scaled_blur(blur, frame_size), fill, outline, fill_alpha, outline_alpha)
@@ -849,8 +1148,10 @@ def _generate_neon_tube_ass(blocks, output_path, alignment, fontsize, font_name,
     for block_index, block in enumerate(blocks):
         if not block:
             continue
+        style = _block_style(placement, block, "Signature", portrait[1] if portrait else None)
         boundaries = _quantized_block_boundaries(block)
-        line_indices = _balanced_line_indices(block, line_budget)
+        line_indices, segments, scale = _signature_block_layout(block, line_budget, portrait)
+        scale_tags = _signature_scale_tags(_NEON_TUBE_SCALE_X, scale)
         colour = _NEON_SWEEP_PALETTE[block_index % len(_NEON_SWEEP_PALETTE)]
         tint = _mix_with_white(colour, _NEON_TUBE_CORE_WHITE)
         for active_index, _word in enumerate(block):
@@ -881,11 +1182,11 @@ def _generate_neon_tube_ass(blocks, output_path, alignment, fontsize, font_name,
                 ]
                 text = _join_ass_words(
                     block, line_indices, line_budget,
-                    word_prefixes=prefixes, uppercase=True,
+                    word_prefixes=prefixes, uppercase=True, segments=segments,
                 )
                 events.append(
-                    f"Dialogue: {layer},{start},{end},Signature,,0,0,0,,"
-                    f"{{\\fscx{_NEON_TUBE_SCALE_X}\\bord{border}\\blur{blur}}}{text}"
+                    f"Dialogue: {layer},{start},{end},{style},,0,0,0,,"
+                    f"{{{scale_tags}\\bord{border}\\blur{blur}}}{text}"
                 )
 
     return _write_ass_file(output_path, header, events)
@@ -897,9 +1198,14 @@ def _hsv_hex(hue, saturation=1.0, value=1.0):
 
 
 def _rainbow_word_text(word, start_hue, end_hue, duration_ms,
-                       saturation, fill_alpha, outline_alpha, max_line_chars):
-    """Animate CapCut's spectrum plus its white light sweep across a word."""
-    segments = _word_display_segments(str(word).upper(), max_line_chars)
+                       saturation, fill_alpha, outline_alpha, max_line_chars,
+                       split_word=None):
+    """Animate CapCut's spectrum plus its white light sweep across a word.
+
+    ``split_word`` (portrait) splits by width instead of by ``max_line_chars``.
+    """
+    text = str(word).upper()
+    segments = split_word(text) if split_word else _word_display_segments(text, max_line_chars)
     character_count = max(1, sum(len(segment) for segment in segments))
 
     def character_color(hue, character_fraction, time_fraction):
@@ -949,17 +1255,27 @@ def _rainbow_word_text(word, start_hue, end_hue, duration_ms,
     return "".join(rendered)
 
 
-def _generate_rainbow_word_ass(blocks, output_path, alignment, fontsize, font_name):
+def _generate_rainbow_word_ass(blocks, output_path, alignment, fontsize, font_name,
+                               placement=None):
     """Render one current word with the measured 1.72 s CapCut spectrum flow."""
-    header = _signature_ass_header(font_name, fontsize, alignment)
     line_budget = _signature_line_budget(
         _signature_final_fontsize(fontsize), _RAINBOW_SCALE_X,
+    )
+    portrait = _signature_portrait(
+        placement, font_name, fontsize, _RAINBOW_SCALE_X, SIGNATURE_PLAY_RES_X,
+        _SIGNATURE_INK, _SIGNATURE_BLUR,
+    )
+    header = _signature_ass_header(
+        font_name, fontsize, alignment, geometry=portrait[0] if portrait else None,
     )
     events = []
 
     for block_index, block in enumerate(blocks):
         if not block:
             continue
+        style = _block_style(placement, block, "Signature", portrait[1] if portrait else None)
+        _lines, split_word, scale = _signature_block_layout(block, line_budget, portrait)
+        scale_tags = _signature_scale_tags(_RAINBOW_SCALE_X, scale)
         boundaries = _quantized_block_boundaries(block)
         block_duration = max(1, boundaries[-1] - boundaries[0])
         hue_origin = (350.0 + block_index * 47.0) % 360.0
@@ -990,10 +1306,11 @@ def _generate_rainbow_word_ass(blocks, output_path, alignment, fontsize, font_na
                 colored_word = _rainbow_word_text(
                     word['word'], start_hue, end_hue, duration_ms,
                     saturation, fill_alpha, outline_alpha, line_budget,
+                    split_word=split_word,
                 )
                 events.append(
-                    f"Dialogue: {layer},{start},{end},Signature,,0,0,0,,"
-                    f"{{\\fscx{_RAINBOW_SCALE_X}\\bord{border}\\blur{blur}"
+                    f"Dialogue: {layer},{start},{end},{style},,0,0,0,,"
+                    f"{{{scale_tags}\\bord{border}\\blur{blur}"
                     f"\\fad({fade_ms},{fade_ms})}}{colored_word}"
                 )
 
@@ -1006,7 +1323,7 @@ def generate_ass(transcript, clip_start, clip_end, output_path,
                  border_color="#000000", border_width=2,
                  highlight_color="#FFD700", bg_color="#000000", bg_opacity=0.0,
                  effect="none", base_opacity=1.0, uppercase=False,
-                 preset="custom", frame_size=None):
+                 preset="custom", frame_size=None, placement=None):
     """
     Generates a karaoke-style ASS file: each block is shown like the SRT path,
     but the currently spoken word is rendered in highlight_color (modern
@@ -1021,14 +1338,24 @@ def generate_ass(transcript, clip_start, clip_end, output_path,
     frame_size: (width, height) of the video the file gets burned into. Only
     Neon Tube uses it, to keep its contour round and its glow the same size
     on every resolution; without it the preset assumes 1080x1920.
+    placement: a caption_placement.CaptionPlacement for a portrait frame.
+    Every block then sits in one slot inside the safe zone and ``alignment``
+    is ignored. None keeps the legacy output byte for byte.
     """
     preset = str(preset or "custom").lower()
+    if placement is not None and frame_size is None:
+        frame_size = placement.frame_size
+    portrait = None
     if preset == "neon_tube":
         # Same wrapping as Neon Sweep (identical font scaling and budget).
         max_chars = 2 * _signature_line_budget(
             _signature_final_fontsize(fontsize), _NEON_TUBE_SCALE_X,
         )
         max_duration = max(max_duration, 2.6)
+        portrait = _signature_portrait(
+            placement, font_name, fontsize, _NEON_TUBE_SCALE_X, _signature_play_res_x(frame_size),
+            _NEON_TUBE_INK, float(_scaled_blur(_NEON_TUBE_BLUR, frame_size)),
+        )
     elif preset == "neon_sweep":
         # Keep a block down to roughly two budgeted lines. How much actually
         # fits depends on the font size the user picked, so deriving it is the
@@ -1040,6 +1367,10 @@ def generate_ass(transcript, clip_start, clip_end, output_path,
             _signature_final_fontsize(fontsize), _NEON_SWEEP_SCALE_X,
         )
         max_duration = max(max_duration, 2.6)
+        portrait = _signature_portrait(
+            placement, font_name, fontsize, _NEON_SWEEP_SCALE_X, SIGNATURE_PLAY_RES_X,
+            _SIGNATURE_INK, _SIGNATURE_BLUR,
+        )
     elif preset == "rainbow_word":
         # Rainbow Word shows a single word, so the budget only has to stop one
         # word from overflowing; long words are split across visual segments.
@@ -1047,22 +1378,39 @@ def generate_ass(transcript, clip_start, clip_end, output_path,
             _signature_final_fontsize(fontsize), _RAINBOW_SCALE_X,
         )
         max_duration = max(max_duration, 2.4)
+        portrait = _signature_portrait(
+            placement, font_name, fontsize, _RAINBOW_SCALE_X, SIGNATURE_PLAY_RES_X,
+            _SIGNATURE_INK, _SIGNATURE_BLUR,
+        )
+    elif placement is not None:
+        portrait = _caption_portrait(
+            placement, font_name, fontsize, border_width, bg_opacity, effect, uppercase,
+        )
 
-    blocks = _collect_word_blocks(transcript, clip_start, clip_end, max_chars, max_duration)
+    fits = None
+    if portrait is not None:
+        # Portrait blocks are built from real line widths, two lines at most.
+        fits = portrait[1].fits
+        if preset in ("neon_tube", "neon_sweep", "rainbow_word"):
+            max_chars = math.inf
+    blocks = _collect_word_blocks(
+        transcript, clip_start, clip_end, max_chars, max_duration, fits=fits,
+    )
     if not blocks:
         return False
 
     if preset == "neon_tube":
         return _generate_neon_tube_ass(
             blocks, output_path, alignment, fontsize, font_name, frame_size=frame_size,
+            placement=placement,
         )
     if preset == "neon_sweep":
         return _generate_neon_sweep_ass(
-            blocks, output_path, alignment, fontsize, font_name
+            blocks, output_path, alignment, fontsize, font_name, placement=placement,
         )
     if preset == "rainbow_word":
         return _generate_rainbow_word_ass(
-            blocks, output_path, alignment, fontsize, font_name
+            blocks, output_path, alignment, fontsize, font_name, placement=placement,
         )
 
     # Match the SRT burn path: PlayResY 288 keeps font sizes consistent.
@@ -1097,29 +1445,49 @@ def generate_ass(transcript, clip_start, clip_end, output_path,
     # (dimmed) style so the rest of the block stays untouched. Scale effects
     # are duration-aware: restarting a 180 ms spring on a 20 ms word caused
     # the visible micro-strobe reported for Bounce subtitles.
-    def active_prefix_for(duration_ms):
+    def active_prefix_for(duration_ms, scale=1.0):
+        # Pop and Bounce set \fscx/\fscy absolutely, so a shrunken block
+        # (portrait) scales their values too.
+        size = lambda value: _scale_percent(scale, value)
         if effect == "glow":
             glow_bord = max(3, int(outline_width) + 2)
             return (f"{{\\c&HFFFFFF&\\3c{highlight_inline}"
-                    f"\\bord{glow_bord}\\blur4}}")
+                    f"\\bord{glow_bord}\\blur{_KARAOKE_GLOW_BLUR}}}")
         if effect == "box":
             box_bord = max(4, int(outline_width) + 3)
             return (f"{{\\c&HFFFFFF&\\3c{highlight_inline}"
                     f"\\bord{box_bord}\\blur0}}")
         if effect == "pop" and duration_ms >= 120:
             return (f"{{\\c{highlight_inline}"
-                    f"\\fscx75\\fscy75\\t(0,120,\\fscx112\\fscy112)}}")
+                    f"\\fscx{size(75)}\\fscy{size(75)}"
+                    f"\\t(0,120,\\fscx{size(112)}\\fscy{size(112)})}}")
         if effect == "bounce" and duration_ms >= 180:
             return (f"{{\\c{highlight_inline}"
-                    f"\\fscx85\\fscy85"
-                    f"\\t(0,90,\\fscx108\\fscy108)"
-                    f"\\t(90,180,\\fscx100\\fscy100)}}")
+                    f"\\fscx{size(85)}\\fscy{size(85)}"
+                    f"\\t(0,90,\\fscx{size(108)}\\fscy{size(108)})"
+                    f"\\t(90,180,\\fscx{size(100)}\\fscy{size(100)})}}")
         return f"{{\\c{highlight_inline}}}"
+
+    style_body = (
+        f"{safe_font},{final_fontsize},{primary_colour},{primary_colour},"
+        f"{outline_colour},{back_colour},1,0,0,0,100,100,0,0,{border_style},"
+        f"{outline_width},0"
+    )
+    layout = None
+    if portrait is None:
+        play_res = "PlayResY: 288\n"
+        styles = f"Style: Default,{style_body},{ass_alignment},10,10,25,1\n"
+    else:
+        # The canvas libass assumes for PlayResY 288 without PlayResX, now
+        # written out because the margins are measured on it.
+        geometry, layout = portrait
+        play_res = f"PlayResX: {CAPTION_PLAY_RES_X}\nPlayResY: {CAPTION_PLAY_RES_Y}\n"
+        styles = _slot_style_lines(style_body, geometry)
 
     header = (
         "[Script Info]\n"
         "ScriptType: v4.00+\n"
-        "PlayResY: 288\n"
+        f"{play_res}"
         "WrapStyle: 0\n"
         "ScaledBorderAndShadow: yes\n"
         "\n"
@@ -1128,9 +1496,7 @@ def generate_ass(transcript, clip_start, clip_end, output_path,
         "OutlineColour, BackColour, Bold, Italic, Underline, StrikeOut, "
         "ScaleX, ScaleY, Spacing, Angle, BorderStyle, Outline, Shadow, "
         "Alignment, MarginL, MarginR, MarginV, Encoding\n"
-        f"Style: Default,{safe_font},{final_fontsize},{primary_colour},{primary_colour},"
-        f"{outline_colour},{back_colour},1,0,0,0,100,100,0,0,{border_style},"
-        f"{outline_width},0,{ass_alignment},10,10,25,1\n"
+        f"{styles}"
         "\n"
         "[Events]\n"
         "Format: Layer, Start, End, Style, Name, MarginL, MarginR, MarginV, Effect, Text\n"
@@ -1138,6 +1504,14 @@ def generate_ass(transcript, clip_start, clip_end, output_path,
 
     events = []
     for block in blocks:
+        style = _block_style(placement, block, "Default", layout)
+        # Portrait: a word too wide for the line shrinks the whole block.
+        # {\r} resets to the style, so the reset carries the scale again.
+        scale = layout.block_scale(block) if layout else 1.0
+        line_prefix, reset = "", "{\\r}"
+        if scale < 1.0:
+            line_prefix = f"{{\\fscx{_scale_percent(scale)}\\fscy{_scale_percent(scale)}}}"
+            reset = f"{{\\r\\fscx{_scale_percent(scale)}\\fscy{_scale_percent(scale)}}}"
         # Quantize each boundary once. Adjacent events therefore share the
         # exact same integer tick and can never overlap after formatting.
         boundaries = [_ass_centiseconds(block[0]['start'])]
@@ -1151,21 +1525,23 @@ def generate_ass(transcript, clip_start, clip_end, output_path,
             end_cs = boundaries[i + 1]
             if end_cs <= start_cs:
                 continue
-            active_prefix = active_prefix_for((end_cs - start_cs) * 10)
+            active_prefix = active_prefix_for((end_cs - start_cs) * 10, scale)
 
             parts = []
             for j, other in enumerate(block):
                 text = _escape_ass_text(other['word'])
                 if uppercase:
                     text = text.upper()
+                if layout:
+                    text = r"\N".join(layout.segments(text, scale))
                 if j == i:
-                    parts.append(f"{active_prefix}{text}{{\\r}}")
+                    parts.append(f"{active_prefix}{text}{reset}")
                 else:
                     parts.append(text)
 
             events.append(
                 f"Dialogue: 0,{_format_ass_centiseconds(start_cs)},"
-                f"{_format_ass_centiseconds(end_cs)},Default,,0,0,0,,{' '.join(parts)}"
+                f"{_format_ass_centiseconds(end_cs)},{style},,0,0,0,,{line_prefix}{' '.join(parts)}"
             )
 
     if not events:
@@ -1175,6 +1551,130 @@ def generate_ass(transcript, clip_start, clip_end, output_path,
         f.write(header + "\n".join(events) + "\n")
 
     return True
+
+
+# Classic and Karaoke share libass' default canvas: PlayResY 288 and, without
+# an explicit PlayResX, 384. FFmpeg's SRT decoder writes the same 384x288.
+CAPTION_PLAY_RES_X = 384
+CAPTION_PLAY_RES_Y = 288
+
+
+def _caption_portrait(placement, font_name, fontsize, border_width, bg_opacity,
+                      effect="none", uppercase=False):
+    """Slot geometry and layout of Classic or Karaoke on a portrait frame.
+
+    The margins hold the outline (or box), plus the wider outline and blur of
+    the Glow and Box effects. Pop and Bounce widen the active word for a
+    moment, so the layout measures every word at that peak.
+    """
+    style = _classic_style(fontsize, font_name, "#FFFFFF", "#000000", border_width,
+                           "#000000", bg_opacity)
+    outline_width = style["outline_width"]
+    ink = outline_width
+    if effect == "glow":
+        ink = max(ink, max(3, int(outline_width) + 2))
+    elif effect == "box":
+        ink = max(ink, max(4, int(outline_width) + 3))
+    geometry = caption_placement.slot_geometry(
+        placement.safe_zone, CAPTION_PLAY_RES_X, CAPTION_PLAY_RES_Y, ink,
+        blur_px=_KARAOKE_GLOW_BLUR if effect == "glow" else 0,
+        frame_size=placement.frame_size,
+    )
+    layout = _PortraitLayout(
+        style["font_name"], style["fontsize"],
+        caption_placement.usable_width(geometry, CAPTION_PLAY_RES_X),
+        caption_placement.glyph_scale_x(placement.frame_size, CAPTION_PLAY_RES_X, CAPTION_PLAY_RES_Y),
+        peak={"pop": 1.12, "bounce": 1.08}.get(effect, 1.0), uppercase=uppercase,
+        band_height=_band_height(geometry, placement.safe_zone, style["fontsize"], CAPTION_PLAY_RES_Y),
+    )
+    return geometry, layout
+
+
+def generate_classic_ass(transcript, clip_start, clip_end, output_path,
+                         max_chars=20, max_duration=2.0, placement=None,
+                         alignment="bottom", fontsize=16, font_name="Verdana",
+                         font_color="#FFFFFF", border_color="#000000", border_width=2,
+                         bg_color="#000000", bg_opacity=0.0):
+    """Classic captions as ASS, for portrait frames.
+
+    SRT holds one alignment and one set of margins per file, so it cannot put
+    one block on the seam and the next at the bottom. This writes the same
+    blocks as generate_srt with the same look the SRT burn gets from
+    build_subtitle_filter (font, size, colours, outline or box) on the same
+    384x288 canvas FFmpeg's SRT decoder uses.
+
+    With ``placement`` every block gets one slot inside the safe zone. Without
+    it the file reproduces the legacy SRT burn (``alignment``, MarginV 25),
+    which is what the equivalence test compares against.
+    """
+    portrait = None
+    if placement is not None:
+        portrait = _caption_portrait(placement, font_name, fontsize, border_width, bg_opacity)
+    blocks = _collect_word_blocks(
+        transcript, clip_start, clip_end, max_chars, max_duration,
+        fits=portrait[1].fits if portrait else None,
+    )
+    if not blocks:
+        return False
+
+    style = _classic_style(
+        fontsize, font_name, font_color, border_color, border_width, bg_color, bg_opacity,
+    )
+    style_body = (
+        f"{style['font_name']},{style['fontsize']},{style['primary_colour']},&H00FFFFFF,"
+        f"{style['outline_colour']},{style['back_colour']},1,0,0,0,100,100,0,0,"
+        f"{style['border_style']},{style['outline_width']},0"
+    )
+    layout = None
+    if portrait is None:
+        align_map = {'top': 8, 'middle': 5, 'bottom': 2}
+        ass_alignment = align_map.get(str(alignment).lower(), 2)
+        styles = f"Style: Default,{style_body},{ass_alignment},10,10,25,1\n"
+    else:
+        geometry, layout = portrait
+        styles = _slot_style_lines(style_body, geometry)
+
+    # Script Info mirrors the header FFmpeg generates for an SRT input.
+    header = (
+        "[Script Info]\n"
+        "ScriptType: v4.00+\n"
+        f"PlayResX: {CAPTION_PLAY_RES_X}\n"
+        f"PlayResY: {CAPTION_PLAY_RES_Y}\n"
+        "ScaledBorderAndShadow: yes\n"
+        "YCbCr Matrix: None\n"
+        "\n"
+        "[V4+ Styles]\n"
+        "Format: Name, Fontname, Fontsize, PrimaryColour, SecondaryColour, "
+        "OutlineColour, BackColour, Bold, Italic, Underline, StrikeOut, "
+        "ScaleX, ScaleY, Spacing, Angle, BorderStyle, Outline, Shadow, "
+        "Alignment, MarginL, MarginR, MarginV, Encoding\n"
+        f"{styles}"
+        "\n"
+        "[Events]\n"
+        "Format: Layer, Start, End, Style, Name, MarginL, MarginR, MarginV, Effect, Text\n"
+    )
+
+    events = []
+    for block in blocks:
+        start_cs, end_cs = _ass_centiseconds(block[0]['start']), _ass_centiseconds(block[-1]['end'])
+        if end_cs <= start_cs:
+            continue
+        scale = layout.block_scale(block) if layout else 1.0
+        words = []
+        for word in block:
+            text = _escape_ass_text(word['word'])
+            if layout:
+                text = r"\N".join(layout.segments(text, scale))
+            words.append(text)
+        prefix = ""
+        if scale < 1.0:
+            prefix = f"{{\\fscx{_scale_percent(scale)}\\fscy{_scale_percent(scale)}}}"
+        events.append(
+            f"Dialogue: 0,{_format_ass_centiseconds(start_cs)},{_format_ass_centiseconds(end_cs)},"
+            f"{_block_style(placement, block, 'Default', layout)},,0,0,0,,{prefix}{' '.join(words)}"
+        )
+    return _write_ass_file(output_path, header, events)
+
 
 def format_srt_block(index, start, end, text):
     def format_time(seconds):
@@ -1223,6 +1723,46 @@ def _sanitize_font_name(name):
     return cleaned or "Verdana"
 
 
+def _classic_style(fontsize, font_name, font_color, border_color, border_width,
+                   bg_color, bg_opacity):
+    """Font, colours and outline/box of the Classic style.
+
+    Shared by the SRT burn (force_style) and the portrait ASS file, so both
+    look the same:
+    - Outline mode (bg_opacity=0): Text with colored outline/border
+    - Box mode (bg_opacity>0): Text with semi-transparent background box
+    """
+    # Font size scaling for ASS virtual resolution (PlayResY=288 default)
+    # For vertical 1080x1920 video, we need larger text for readability
+    final_fontsize = int(_clamp_number(fontsize, 10, 200, 16) * 0.85)
+    if final_fontsize < 10:
+        final_fontsize = 10
+
+    bg_opacity = _clamp_number(bg_opacity, 0.0, 1.0, 0.0)
+    border_width = _clamp_number(border_width, 0, 10, 2)
+
+    if bg_opacity > 0:
+        # Box mode: opaque background box
+        border_style = 3
+        outline_colour = hex_to_ass_color(bg_color, bg_opacity, fallback="000000")
+        outline_width = 1
+    else:
+        # Outline mode: text border/outline
+        border_style = 1
+        outline_colour = hex_to_ass_color(border_color, 1.0, fallback="000000")
+        outline_width = max(1, int(border_width))
+
+    return {
+        "font_name": _sanitize_font_name(font_name),
+        "fontsize": final_fontsize,
+        "primary_colour": hex_to_ass_color(font_color, 1.0),
+        "outline_colour": outline_colour,
+        "back_colour": hex_to_ass_color("#000000", 0.0),
+        "border_style": border_style,
+        "outline_width": outline_width,
+    }
+
+
 def build_subtitle_filter(srt_path, alignment=2, fontsize=16,
                           font_name="Verdana", font_color="#FFFFFF",
                           border_color="#000000", border_width=2,
@@ -1243,44 +1783,22 @@ def build_subtitle_filter(srt_path, alignment=2, fontsize=16,
     elif align_lower == 'bottom':
         ass_alignment = 2
 
-    # Font size scaling for ASS virtual resolution (PlayResY=288 default)
-    # For vertical 1080x1920 video, we need larger text for readability
-    final_fontsize = int(_clamp_number(fontsize, 10, 200, 16) * 0.85)
-    if final_fontsize < 10:
-        final_fontsize = 10
-
-    safe_font_name = _sanitize_font_name(font_name)
-    bg_opacity = _clamp_number(bg_opacity, 0.0, 1.0, 0.0)
-    border_width = _clamp_number(border_width, 0, 10, 2)
+    style = _classic_style(
+        fontsize, font_name, font_color, border_color, border_width, bg_color, bg_opacity,
+    )
 
     # Path handling for FFmpeg filter syntax
     safe_srt_path = _escape_ffmpeg_filter_value(srt_path)
 
-    # Convert colors to ASS format and build style
-    primary_colour = hex_to_ass_color(font_color, 1.0)
-
-    if bg_opacity > 0:
-        # Box mode: opaque background box
-        border_style = 3
-        outline_colour = hex_to_ass_color(bg_color, bg_opacity, fallback="000000")
-        outline_width = 1
-    else:
-        # Outline mode: text border/outline
-        border_style = 1
-        outline_colour = hex_to_ass_color(border_color, 1.0, fallback="000000")
-        outline_width = max(1, int(border_width))
-
-    back_colour = hex_to_ass_color("#000000", 0.0)
-
     style_string = (
         f"Alignment={ass_alignment},"
-        f"Fontname={safe_font_name},"
-        f"Fontsize={final_fontsize},"
-        f"PrimaryColour={primary_colour},"
-        f"OutlineColour={outline_colour},"
-        f"BackColour={back_colour},"
-        f"BorderStyle={border_style},"
-        f"Outline={outline_width},"
+        f"Fontname={style['font_name']},"
+        f"Fontsize={style['fontsize']},"
+        f"PrimaryColour={style['primary_colour']},"
+        f"OutlineColour={style['outline_colour']},"
+        f"BackColour={style['back_colour']},"
+        f"BorderStyle={style['border_style']},"
+        f"Outline={style['outline_width']},"
         f"Shadow=0,"
         f"MarginV=25,"
         f"Bold=1"

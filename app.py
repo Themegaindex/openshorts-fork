@@ -1153,6 +1153,15 @@ def _relocate_root_job_artifacts(job_id: str, job_output_dir: str) -> bool:
                 dest_clip = os.path.join(job_output_dir, os.path.basename(clip_path))
                 if os.path.abspath(clip_path) != os.path.abspath(dest_clip):
                     shutil.move(clip_path, dest_clip)
+                    # The clip's layout timeline (caption placement) travels
+                    # with it. Without it captions only lose auto placement,
+                    # so a failed move must not stop the rescue.
+                    sidecar = caption_placement.layout_sidecar_path(clip_path)
+                    try:
+                        if os.path.isfile(sidecar):
+                            shutil.move(sidecar, caption_placement.layout_sidecar_path(dest_clip))
+                    except Exception as exc:
+                        print(f"⚠️ Could not move the layout timeline {sidecar}: {exc}")
 
         # Also relocate interrupted Shorts and long-form render intermediates.
         # Long jobs can leave segment mp4s, a joined mp4 and a concat manifest.
@@ -2507,9 +2516,11 @@ async def resume_job(job_id: str, request: Request, body: Optional[ResumeRequest
     )
 
 from editor import VideoEditor
+import caption_placement
 from subtitles import (
     burn_layers,
     generate_ass,
+    generate_classic_ass,
     generate_srt,
     generate_srt_from_video,
     probe_frame_size,
@@ -2903,6 +2914,8 @@ def _referenced_files(store: dict) -> set:
         remember(entry.get("current_render"))
         remember(entry.get("clean_source"))
         remember((entry.get("subtitle") or {}).get("path"))
+        for variant in ((entry.get("subtitle") or {}).get("hook_variants") or {}).values():
+            remember(variant)
     return referenced
 
 
@@ -2921,9 +2934,13 @@ def _prune_replaced_clip_files(output_dir: str, previous_entry, store: dict) -> 
         return
 
     still_referenced = _referenced_files(store)
+    previous_subtitle = previous_entry.get("subtitle") or {}
     candidates = [
         os.path.basename(str(previous_entry.get("current_render") or "")),
-        os.path.basename(str((previous_entry.get("subtitle") or {}).get("path") or "")),
+        os.path.basename(str(previous_subtitle.get("path") or "")),
+    ] + [
+        os.path.basename(str(variant or ""))
+        for variant in (previous_subtitle.get("hook_variants") or {}).values()
     ]
 
     for filename in candidates:
@@ -2953,13 +2970,53 @@ def _clean_source_path(output_dir: str, entry: dict) -> str:
     return path
 
 
+def _hook_slot(hook) -> Optional[str]:
+    """The caption slot a stored hook covers: prepare_hook_overlay puts a
+    center hook in the middle and every other one except bottom at 20 % of
+    the height. A bottom hook is not handled (legacy behaviour)."""
+    if not isinstance(hook, dict) or not hook.get("text"):
+        return None
+    position = hook.get("position")
+    if position == "center":
+        return caption_placement.SLOT_MIDDLE
+    if position == "bottom":
+        return None
+    return caption_placement.SLOT_TOP
+
+
 def _stored_subtitle_layer(output_dir: str, entry: dict):
     subtitle = entry.get("subtitle") or {}
-    filename = os.path.basename(str(subtitle.get("path") or ""))
-    path = _storage_path(output_dir, filename) if filename else ""
-    if filename and os.path.exists(path):
-        return path, subtitle.get("burn_opts") or {}
+    names = [subtitle.get("path")]
+    # Auto captions that use a slot a hook can cover also come as a file that
+    # keeps that slot free. The hook takes it, whichever layer came first.
+    variant = (subtitle.get("hook_variants") or {}).get(_hook_slot(entry.get("hook")))
+    if variant:
+        names.insert(0, variant)
+    for name in names:
+        filename = os.path.basename(str(name or ""))
+        path = _storage_path(output_dir, filename) if filename else ""
+        if filename and os.path.exists(path):
+            return path, subtitle.get("burn_opts") or {}
     return None, None
+
+
+def _drop_identical_variant(output_dir: str, filename: str, variant: Optional[str]) -> Optional[str]:
+    """Keep a hook variant only when it differs, i.e. when the auto captions
+    really use the hook's slot somewhere."""
+    if not variant:
+        return None
+    variant_path = os.path.join(output_dir, variant)
+    try:
+        with open(os.path.join(output_dir, filename), "rb") as first, open(variant_path, "rb") as second:
+            if first.read() != second.read():
+                return variant
+    except OSError:
+        pass
+    try:
+        os.remove(variant_path)
+    except OSError:
+        pass
+    return None
 
 
 def _render_stored_layers(output_dir: str, entry: dict, output_path: str):
@@ -3071,10 +3128,30 @@ def _prepare_hook_layer(input_path: str, hook_layer: Optional[dict]):
         return None, 0, 0
 
 
+def _clip_layout_timeline(output_dir: str, clip_data: dict):
+    """The layout timeline the renderer recorded for this clip, or None.
+
+    It sits next to the clip's original render (metadata ``output_filename``),
+    so edited_/translated_/hook_ derivatives and restarts still find it; they
+    all keep the clip's timing.
+    """
+    original = os.path.basename(str(clip_data.get("output_filename") or ""))
+    if not original:
+        return None
+    try:
+        clip_path = _storage_path(output_dir, original)
+    except HTTPException:
+        return None
+    return caption_placement.load_layout_timeline(clip_path)
+
+
 class SubtitleRequest(BaseModel):
     job_id: str = Field(pattern=r"^[A-Za-z0-9][A-Za-z0-9_-]{0,127}$")
     clip_index: int = Field(ge=0)
-    position: Literal["top", "middle", "bottom"] = "bottom"
+    # auto: per caption block, the seam on stacked two-person scenes and the
+    # bottom elsewhere. top/middle/bottom pin one place for the whole clip.
+    # Portrait frames keep every place inside the Shorts safe zone.
+    position: Literal["auto", "top", "middle", "bottom"] = "auto"
     font_size: int = Field(default=16, ge=10, le=200)
     font_name: str = Field(default="Verdana", min_length=1, max_length=100)
     font_color: str = Field(default="#FFFFFF", pattern=r"^#[0-9A-Fa-f]{6}$")
@@ -3142,12 +3219,48 @@ async def _add_subtitles_locked(req: SubtitleRequest):
     # Signature presets are ASS renderers by definition. Keeping this defensive
     # guard makes direct API clients safe even if they leave style at "classic".
     is_karaoke = req.style == "karaoke" or req.preset != "custom"
-    srt_filename = f"subs_{req.clip_index}_{generation_id}.{'ass' if is_karaoke else 'srt'}"
+
+    # The ass filter runs on the clean source at its own size, so that file
+    # decides. A portrait Short keeps its captions inside the safe zone. Long
+    # videos play in the normal player and keep today's captions, so only
+    # Neon Tube needs their size.
+    frame_size = None
+    if req.preset == "neon_tube" or video_type != "long":
+        frame_size = await asyncio.get_event_loop().run_in_executor(
+            None, probe_frame_size, input_path,
+        )
+    placement = None
+    if video_type != "long" and caption_placement.is_portrait(frame_size):
+        placement = caption_placement.placement_for(
+            frame_size, req.position,
+            timeline=(
+                _clip_layout_timeline(output_dir, clip_data)
+                if req.position == caption_placement.POSITION_AUTO else None
+            ),
+        )
+    # Square, landscape and long videos keep the legacy files; auto is the
+    # bottom there.
+    alignment = caption_placement.legacy_alignment(req.position)
+    # The placement lives in the stored file: a later hook or edit re-burns
+    # that same file. SRT cannot hold per-block places, so portrait is ASS.
+    is_ass = is_karaoke or placement is not None
+    srt_filename = f"subs_{req.clip_index}_{generation_id}.{'ass' if is_ass else 'srt'}"
     srt_path = os.path.join(output_dir, srt_filename)
+    # Auto may put captions at the top or on the seam, where a hook can sit.
+    # One more file per hook slot keeps that slot free, so a hook added now or
+    # later never covers them; the burn picks the file that matches the
+    # clip's hook (_stored_subtitle_layer).
+    hook_variants = {}
+    if placement is not None and placement.position == caption_placement.POSITION_AUTO:
+        hook_variants = {
+            slot: f"subs_{req.clip_index}_{generation_id}-hook-{slot}.ass"
+            for slot in caption_placement.HOOK_SLOTS
+        }
+    hook_variant_paths = {slot: os.path.join(output_dir, name) for slot, name in hook_variants.items()}
 
     # Style options shared by the karaoke ASS generator paths.
     karaoke_opts = dict(
-        alignment=req.position, fontsize=req.font_size, font_name=req.font_name,
+        alignment=alignment, fontsize=req.font_size, font_name=req.font_name,
         font_color=req.font_color, border_color=req.border_color,
         border_width=req.border_width, highlight_color=req.highlight_color,
         bg_color=req.bg_color, bg_opacity=req.bg_opacity,
@@ -3156,10 +3269,16 @@ async def _add_subtitles_locked(req: SubtitleRequest):
     )
     if req.preset == "neon_tube":
         # The tube contour and glow are sized for the frame they get burned
-        # into; the ass filter runs on the clean source at its own size.
-        karaoke_opts["frame_size"] = await asyncio.get_event_loop().run_in_executor(
-            None, probe_frame_size, input_path,
-        )
+        # into.
+        karaoke_opts["frame_size"] = frame_size
+    if placement is not None:
+        karaoke_opts["placement"] = placement
+    # The Classic look, for the portrait ASS file (the SRT gets it at burn time).
+    classic_opts = dict(
+        placement=placement, fontsize=req.font_size, font_name=req.font_name,
+        font_color=req.font_color, border_color=req.border_color,
+        border_width=req.border_width, bg_color=req.bg_color, bg_opacity=req.bg_opacity,
+    )
 
     try:
         # 1. Generate subtitle file (SRT, or karaoke ASS with word highlight)
@@ -3189,24 +3308,39 @@ async def _add_subtitles_locked(req: SubtitleRequest):
             print(f"🎙️ Dubbed video detected, transcribing audio for subtitles...")
             def run_transcribe_srt():
                 if is_karaoke:
-                    return generate_srt_from_video(input_path, srt_path, style="karaoke", **karaoke_opts)
+                    return generate_srt_from_video(
+                        input_path, srt_path, style="karaoke",
+                        hook_variant_paths=hook_variant_paths, **karaoke_opts,
+                    )
+                if placement is not None:
+                    return generate_srt_from_video(
+                        input_path, srt_path, hook_variant_paths=hook_variant_paths, **classic_opts,
+                    )
                 return generate_srt_from_video(input_path, srt_path)
 
             loop = asyncio.get_event_loop()
             success = await loop.run_in_executor(None, run_transcribe_srt)
-        elif is_karaoke:
-            success = generate_ass(
-                subtitle_transcript, subtitle_start, subtitle_end, srt_path, **karaoke_opts,
-            )
+        elif is_karaoke or placement is not None:
+            generate = generate_ass if is_karaoke else generate_classic_ass
+            opts = karaoke_opts if is_karaoke else classic_opts
+            success = generate(subtitle_transcript, subtitle_start, subtitle_end, srt_path, **opts)
+            if success:
+                for slot, path in hook_variant_paths.items():
+                    generate(subtitle_transcript, subtitle_start, subtitle_end, path,
+                             **{**opts, "placement": placement.with_hook(slot)})
         else:
             success = generate_srt(subtitle_transcript, subtitle_start, subtitle_end, srt_path)
 
         if not success:
              raise HTTPException(status_code=400, detail="No words found for this clip range.")
+        hook_variants = {
+            slot: name for slot, name in hook_variants.items()
+            if _drop_identical_variant(output_dir, srt_filename, name)
+        }
 
         # 2. Compose ALL presentation layers from the clean source in one pass.
         # State is only committed after FFmpeg succeeds.
-        burn_opts = dict(alignment=req.position, fontsize=req.font_size,
+        burn_opts = dict(alignment=alignment, fontsize=req.font_size,
                          font_name=req.font_name, font_color=req.font_color,
                          border_color=req.border_color, border_width=req.border_width,
                          bg_color=req.bg_color, bg_opacity=req.bg_opacity)
@@ -3218,6 +3352,8 @@ async def _add_subtitles_locked(req: SubtitleRequest):
             "effect": req.effect,
             "preset": req.preset,
         }
+        if hook_variants:
+            candidate_entry["subtitle"]["hook_variants"] = hook_variants
         output_filename = _layered_filename(candidate_entry, generation_id)
         output_path = os.path.join(output_dir, output_filename)
 
